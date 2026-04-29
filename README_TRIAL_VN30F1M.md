@@ -66,6 +66,17 @@ Khi đó:
 
 Đây là bản dùng thử nội bộ, chưa ký số code signing.
 
+## Nếu mở `/setup` mà thấy `{"success":false,"error":"not found"}`
+Nguyên nhân thường là bridge chưa chạy đúng hoặc cổng `8080` đang bị một ứng dụng khác sử dụng.
+
+Các bước xử lý:
+1. Chạy `stop_trial.bat`
+2. Đóng các cửa sổ đang dùng `127.0.0.1:8080`
+3. Chạy lại `start_trial.bat`
+4. Mở thử `http://127.0.0.1:8080/ping`
+
+Nếu `/ping` không lên, hãy kiểm tra Windows Security / SmartScreen có đang chặn `bridge.exe` hay không.
+
 ## Các file cho người dùng
 - `start_trial.bat`: chạy bridge
 - `stop_trial.bat`: dừng bridge

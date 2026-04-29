@@ -1,6 +1,7 @@
 param(
     [string]$OutputRoot = "dist",
-    [string]$PackageName = "DNSE-MT5-Connector-VN30F1M-Trial"
+    [string]$PackageName = "DNSE-MT5-Connector-VN30F1M-Trial",
+    [switch]$SkipBridgeBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,9 +10,14 @@ $root = $PSScriptRoot
 $bundleRoot = Join-Path $root $OutputRoot
 $packageRoot = Join-Path $bundleRoot $PackageName
 $zipPath = Join-Path $bundleRoot ($PackageName + ".zip")
+$bridgePath = Join-Path $root "bridge.exe"
+
+if (-not $SkipBridgeBuild) {
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "build_bridge.ps1") -Output $bridgePath
+}
 
 $requiredFiles = @(
-    (Join-Path $root "bridge.exe"),
+    $bridgePath,
     (Join-Path $root "deploy_mt5.ps1"),
     (Join-Path $root "deploy_mt5.bat"),
     (Join-Path $root "mql5\DNSE_MarketData_Bridge.mq5"),
@@ -38,7 +44,7 @@ New-Item -ItemType Directory -Path (Join-Path $packageRoot "data") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $packageRoot "mql5") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $packageRoot "cpp\build\Release") -Force | Out-Null
 
-Copy-Item (Join-Path $root "bridge.exe") (Join-Path $packageRoot "bridge.exe") -Force
+Copy-Item $bridgePath (Join-Path $packageRoot "bridge.exe") -Force
 Copy-Item (Join-Path $root "deploy_mt5.ps1") (Join-Path $packageRoot "deploy_mt5.ps1") -Force
 Copy-Item (Join-Path $root "deploy_mt5.bat") (Join-Path $packageRoot "deploy_mt5.bat") -Force
 Copy-Item (Join-Path $root "mql5\DNSE_MarketData_Bridge.mq5") (Join-Path $packageRoot "mql5\DNSE_MarketData_Bridge.mq5") -Force

@@ -39,3 +39,4 @@ Bản `.zip` là lựa chọn ổn định nhất cho giai đoạn dùng thử h
 - Nếu MT5 chưa bật `Allow DLL imports`, cần bật trong `Tools -> Options -> Expert Advisors`
 - Bản này phù hợp để demo và thử nghiệm nội bộ
 - Nếu Windows cảnh báo với file `.exe`, hãy dùng bản `.zip`
+- Nếu `http://127.0.0.1:8080/setup` báo `not found`, hãy dừng bridge và chạy lại `start_trial.bat`
