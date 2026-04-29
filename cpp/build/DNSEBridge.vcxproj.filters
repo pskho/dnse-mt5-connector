@@ -1,0 +1,16 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="C:\Users\Admin\Documents\Codex\2026-04-28\you-are-a-senior-software-engineer\cpp\DNSEBridge.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\Admin\Documents\Codex\2026-04-28\you-are-a-senior-software-engineer\cpp\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{3AEF70D4-85C9-39BE-9A5C-16CC335C77B6}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

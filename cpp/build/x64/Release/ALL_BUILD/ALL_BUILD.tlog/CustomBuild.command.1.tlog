@@ -1,0 +1,10 @@
+^C:\USERS\ADMIN\DOCUMENTS\CODEX\2026-04-28\YOU-ARE-A-SENIOR-SOFTWARE-ENGINEER\CPP\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/Admin/Documents/Codex/2026-04-28/you-are-a-senior-software-engineer/cpp -BC:/Users/Admin/Documents/Codex/2026-04-28/you-are-a-senior-software-engineer/cpp/build --check-stamp-file C:/Users/Admin/Documents/Codex/2026-04-28/you-are-a-senior-software-engineer/cpp/build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

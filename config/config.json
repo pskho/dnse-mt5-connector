@@ -1,0 +1,27 @@
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "databasePath": "data/connector.db",
+  "logFile": "logs/app.jsonl",
+  "risk": {
+    "maxQuantity": 10,
+    "maxOpenPosition": 10,
+    "duplicateWindowSeconds": 3
+  },
+  "dnse": {
+    "baseUrl": "https://openapi.dnse.com.vn",
+    "apiKey": "",
+    "secretKey": "",
+    "tradingToken": "",
+    "mock": true
+  },
+  "marketData": {
+    "enabled": true,
+    "symbol": "VN30F1M",
+    "bridgeAddress": "127.0.0.1:9090",
+    "webSocketUrl": "wss://ws-openapi.dnse.com.vn/v1/stream?encoding=json",
+    "channels": ["trades.json", "quotes.json", "ohlc_closed.1.json"],
+    "mock": true,
+    "reconnectSeconds": 5
+  }
+}

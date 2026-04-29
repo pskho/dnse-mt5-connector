@@ -1,0 +1,43 @@
+host: "127.0.0.1"
+port: 8080
+database_path: "data/connector.db"
+log_file: "logs/app.jsonl"
+
+risk:
+  max_quantity: 10
+  max_open_position: 10
+  duplicate_window_seconds: 3
+
+dnse:
+  base_url: "https://openapi.dnse.com.vn"
+  api_key: "PASTE_DNSE_API_KEY_HERE"
+  api_secret: "PASTE_DNSE_API_SECRET_HERE"
+  account_no: "PASTE_ACCOUNT_NO_HERE"
+  mock: false
+
+market_data:
+  enabled: true
+  symbol: "VN30F1M"
+  symbols: ["VN30F1M", "VNINDEX", "VN30", "HPG"]
+  bridge_address: "127.0.0.1:9090"
+  websocket_url: "wss://ws-openapi.dnse.com.vn/v1/stream?encoding=json"
+  channels: ["trades.json", "quotes.json"]
+  mock: false
+  reconnect_seconds: 5
+
+history:
+  enabled: true
+  symbol: "VN30F1M"
+  market_type: "DERIVATIVE"
+  resolution: 1
+  initial_lookback_days: 365
+  incremental_sync: true
+  full_rebuild: false
+  max_batch_days: 30
+
+gmail_otp:
+  enabled: false
+  credentials_file: "config/credentials.json"
+  token_file: "config/token.json"
+  poll_interval_seconds: 3
+  email_domain_filter: "dnse.com.vn"

@@ -1,0 +1,10 @@
+data/
+logs/
+*.exe
+dist/
+bridge.pid
+bridge_err.txt
+bridge_out.txt
+config/config.yaml
+config/credentials.json
+config/token.json
