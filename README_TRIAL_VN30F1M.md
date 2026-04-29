@@ -1,69 +1,78 @@
-# DNSE MT5 Connector - Ban dung thu VN30F1M
+# DNSE MT5 Connector - Bản dùng thử VN30F1M
 
-Ban nay duoc dong goi de khach hang xem gia `VN30F1M` tren MT5 truoc.
+Bản này được đóng gói để khách hàng xem giá `VN30F1M` trên MT5 trước.
 
-## Muc tieu
-- Cai nhanh vao MT5
-- Chay local tren Windows
-- Xem duoc realtime `VN30F1M`
-- Khong can build Go hay C++ lai
+## Mục tiêu
+- Cài nhanh vào MT5
+- Chạy local trên Windows
+- Xem được realtime `VN30F1M`
+- Không cần build Go hay C++ lại
 
-## Cac buoc nhanh nhat
+## Các bước nhanh nhất
 
-### 1. Dien DNSE API key
-Mo file:
+### 1. Điền DNSE API key
+Mở file:
 
 `config\config.yaml`
 
-Tim 2 dong:
+Tìm 2 dòng:
 
 ```yaml
 api_key: "PASTE_DNSE_API_KEY_HERE"
 api_secret: "PASTE_DNSE_API_SECRET_HERE"
 ```
 
-va thay bang thong tin DNSE thuc te.
+và thay bằng thông tin DNSE thực tế.
 
-### 2. Chay bridge
-Chay file:
+### 2. Chạy bridge
+Chạy file:
 
 `start_trial.bat`
 
-Bridge se mo local tai:
+Bridge sẽ mở local tại:
 
 `http://127.0.0.1:8080/setup`
 
-### 3. Cai vao MT5
-Chay file:
+### 3. Cài vào MT5
+Chạy file:
 
 `deploy_mt5.bat`
 
-Script se:
+Script sẽ:
 - copy `DNSEBridge.dll`
 - copy `DNSE_MarketData_Bridge.mq5`
-- xoa ban EA cu bi trung o thu muc root `Experts`
-- neu tim thay MetaEditor se tu compile luon
+- xóa bản EA cũ bị trùng ở thư mục root `Experts`
+- nếu tìm thấy MetaEditor sẽ tự compile luôn
 
 ### 4. Trong MT5
-- Mo `Tools -> Options -> Expert Advisors`
-- Bat `Allow DLL imports`
-- Vao `Navigator -> Expert Advisors -> DNSE`
-- Gan `DNSE_MarketData_Bridge` vao chart
+- Mở `Tools -> Options -> Expert Advisors`
+- Bật `Allow DLL imports`
+- Vào `Navigator -> Expert Advisors -> DNSE`
+- Gắn `DNSE_MarketData_Bridge` vào chart
 
-### 5. Kiem tra gia
+### 5. Kiểm tra giá
 Chart custom symbol:
 
 `VN30F1M_DNSE`
 
-Neu bridge dang chay dung, chart se cap nhat gia `VN30F1M`.
+Nếu bridge đang chạy đúng, chart sẽ cập nhật giá `VN30F1M`.
 
-## Cac file cho nguoi dung
-- `start_trial.bat`: chay bridge
-- `stop_trial.bat`: dung bridge
-- `open_setup.bat`: mo trang setup neu bridge dang chay
-- `deploy_mt5.bat`: cai vao MT5
+## Nếu Windows hiện cảnh báo
+Trong một số máy, Windows SmartScreen có thể cảnh báo khi chạy `bridge.exe`.
 
-## Ghi chu
-- Ban dung thu nay uu tien xem gia `VN30F1M`
-- Trading va OTP chua phai muc tieu chinh cua goi demo nay
-- Neu muon dong bo history, vao dashboard sau khi bridge chay
+Khi đó:
+1. Chọn `More info`
+2. Chọn `Run anyway`
+
+Đây là bản dùng thử nội bộ, chưa ký số code signing.
+
+## Các file cho người dùng
+- `start_trial.bat`: chạy bridge
+- `stop_trial.bat`: dừng bridge
+- `open_setup.bat`: mở trang setup nếu bridge đang chạy
+- `deploy_mt5.bat`: cài vào MT5
+
+## Ghi chú
+- Bản dùng thử này ưu tiên xem giá `VN30F1M`
+- Trading và OTP chưa phải mục tiêu chính của gói demo này
+- Nếu muốn đồng bộ history, vào dashboard sau khi bridge chạy
