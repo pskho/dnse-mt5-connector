@@ -72,7 +72,7 @@ func main() {
 	dnseClient.SetOTPFetcher(otpService)
 
 	marketDataEngine := marketdata.NewEngine(cfg.MarketData, cfg.DNSE.APIKey, cfg.DNSE.APISecret, dnseClient, historyService, appLog)
-	handler := api.NewHandler(orderService, positionService, signalService, symbolCatalogService, marketDataEngine.Profiles(), dnseClient, historyService, otpService, appLog)
+	handler := api.NewHandler(orderService, positionService, signalService, symbolCatalogService, marketDataEngine.Profiles(), marketDataEngine, dnseClient, historyService, otpService, appLog)
 	marketDataEngine.Start(appCtx)
 
 	server := &http.Server{
@@ -90,7 +90,7 @@ func main() {
 		log.Printf("Market data bridge listening on tcp://%s for primary %s", cfg.MarketData.BridgeAddress, cfg.MarketData.Symbol)
 		log.Printf("Monitoring symbols: %s", strings.Join(cfg.MarketData.Symbols, ", "))
 		log.Printf("Mode: manual. Use /status for health, /signal for MT5 signals, and /confirm for user-approved orders.")
-		
+
 		go func() {
 			time.Sleep(1 * time.Second)
 			exec.Command("rundll32", "url.dll,FileProtocolHandler", "http://127.0.0.1:8080/setup").Start()
@@ -101,6 +101,45 @@ func main() {
 			log.Fatalf("server failed: %v", err)
 		}
 	}()
+
+	if cfg.History.Enabled && cfg.DNSE.HasUsableCredentials() {
+		go func() {
+			time.Sleep(2 * time.Second)
+			if !historyService.NeedsBootstrap(appCtx, cfg.History.Symbol, cfg.History.MarketType, cfg.History.Resolution) {
+				appLog.Info("history_bootstrap_skipped", map[string]any{
+					"reason":     "cache_present",
+					"symbol":     cfg.History.Symbol,
+					"marketType": cfg.History.MarketType,
+					"resolution": cfg.History.Resolution,
+				})
+				return
+			}
+
+			appLog.Info("history_bootstrap_started", map[string]any{
+				"symbol":       cfg.History.Symbol,
+				"marketType":   cfg.History.MarketType,
+				"resolution":   cfg.History.Resolution,
+				"lookbackDays": cfg.History.InitialLookbackDays,
+			})
+
+			if _, err := historyService.BackfillBeforeToday(appCtx, cfg.History.InitialLookbackDays); err != nil {
+				appLog.Error("history_bootstrap_backfill_failed", map[string]any{"error": err.Error()})
+				return
+			}
+			if _, err := historyService.SyncToday(appCtx); err != nil {
+				appLog.Error("history_bootstrap_today_failed", map[string]any{"error": err.Error()})
+				return
+			}
+			appLog.Info("history_bootstrap_completed", map[string]any{
+				"symbol": cfg.History.Symbol,
+			})
+		}()
+	} else {
+		appLog.Info("history_bootstrap_waiting_for_setup", map[string]any{
+			"historyEnabled": cfg.History.Enabled,
+			"hasCredentials": cfg.DNSE.HasUsableCredentials(),
+		})
+	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)

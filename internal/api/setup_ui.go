@@ -138,7 +138,7 @@ pre { white-space: pre-wrap; word-wrap: break-word; }
 `
 
 const layoutTop = `<!DOCTYPE html>
-<html lang="en">
+<html lang="vi">
 <head>
   <meta charset="UTF-8">
   <title>DNSE MT5 Connector</title>
@@ -147,13 +147,13 @@ const layoutTop = `<!DOCTYPE html>
 <body>
   <nav>
     <div class="brand">DNSE Connector</div>
-    <a href="/" id="nav-dash">Dashboard</a>
-    <a href="/setup" id="nav-setup">Setup Wizard</a>
-    <a href="/status" id="nav-status">System Status</a>
-    <a href="/settings" id="nav-settings">Settings</a>
-    <a href="/logs" id="nav-logs">Logs</a>
+    <a href="/" id="nav-dash">Bảng điều khiển</a>
+    <a href="/setup" id="nav-setup">Bắt đầu sử dụng</a>
+    <a href="/status" id="nav-status">Trạng thái hệ thống</a>
+    <a href="/settings" id="nav-settings">Cấu hình</a>
+    <a href="/logs" id="nav-logs">Nhật ký</a>
     <div style="margin-top: auto; padding: 20px;">
-      <button class="btn secondary" style="width: 100%" onclick="window.location.href='/support/export'">Export Support Zip</button>
+      <button class="btn secondary" style="width: 100%" onclick="window.location.href='/support/export'">Xuất gói hỗ trợ</button>
     </div>
   </nav>
   <main>
@@ -174,38 +174,38 @@ const layoutBottom = `
 `
 
 const setupHTML = layoutTop + `
-  <h1>Setup Wizard</h1>
-  <p style="color: var(--text-muted)">Welcome to the DNSE MT5 Connector. This wizard will help you configure everything.</p>
+  <h1>Bắt đầu sử dụng</h1>
+  <p style="color: var(--text-muted)">Thiết lập nhanh để DNSE MT5 Connector có thể kết nối, cài vào MT5 và tự nạp dữ liệu lịch sử nền cho lần chạy đầu tiên.</p>
   
   <div class="card">
     <div class="step done">
-      <h3>Step 1: System Check</h3>
-      <div id="sys-check-res">Checking...</div>
+      <h3>Bước 1: Kiểm tra hệ thống</h3>
+      <div id="sys-check-res">Đang kiểm tra...</div>
     </div>
     
     <div class="step" id="step-2">
-      <h3>Step 2: MT5 Installation</h3>
-      <p>We need to install the bridging DLL and MQL5 EA into your MetaTrader 5 data folder.</p>
-      <button class="btn" onclick="detectMT5()">Auto-Detect & Install</button>
+      <h3>Bước 2: Cài vào MT5</h3>
+      <p>Hệ thống sẽ tự chép DLL và Expert Advisor vào thư mục dữ liệu MetaTrader 5.</p>
+      <button class="btn" onclick="detectMT5()">Tự dò và cài đặt</button>
       <pre id="mt5-res" style="background: var(--bg); padding: 10px; border-radius: 4px; margin-top: 10px; display: none;"></pre>
     </div>
 
     <div class="step" id="step-3">
-      <h3>Step 3: Gmail OTP</h3>
-      <p>For fully automated trading without entering OTPs manually, authorize Gmail access.</p>
-      <button class="btn secondary" onclick="checkGmail()">Check Gmail Status</button>
+      <h3>Bước 3: OTP tự động</h3>
+      <p>Nếu muốn nhận OTP tự động từ email, kiểm tra trạng thái Gmail tại đây.</p>
+      <button class="btn secondary" onclick="checkGmail()">Kiểm tra Gmail</button>
       <p id="gmail-res" style="color: var(--text-muted);"></p>
     </div>
 
     <div class="step" id="step-4">
-      <h3>Step 4: DNSE API Test</h3>
-      <button class="btn secondary" onclick="testDNSE()">Test Connection</button>
+      <h3>Bước 4: Kiểm tra kết nối DNSE</h3>
+      <button class="btn secondary" onclick="testDNSE()">Kiểm tra kết nối</button>
       <pre id="dnse-res" style="background: var(--bg); padding: 10px; border-radius: 4px; margin-top: 10px; display: none;"></pre>
     </div>
 
     <div class="step" id="step-5" style="border-left-color: transparent;">
-      <h3>Step 5: Completion</h3>
-      <p>Once everything is green, head to the <a href="/" style="color: var(--primary)">Dashboard</a> to monitor your system.</p>
+      <h3>Bước 5: Hoàn tất</h3>
+      <p>Sau khi cấu hình xong, hệ thống sẽ tự đồng bộ dữ liệu lịch sử nền cho mã chính ở lần chạy đầu. Sau đó anh chỉ cần vào <a href="/" style="color: var(--primary)">Bảng điều khiển</a> để theo dõi.</p>
     </div>
   </div>
 
@@ -223,7 +223,7 @@ const setupHTML = layoutTop + `
     async function detectMT5() {
       const out = document.getElementById('mt5-res');
       out.style.display = 'block';
-      out.innerText = 'Installing files...';
+      out.innerText = 'Đang cài các tệp vào MT5...';
       const {ok, data} = await r('/api/setup/install', {method: 'POST'});
       if (data.success) {
         out.innerText = data.logs.join('\n');
@@ -237,32 +237,32 @@ const setupHTML = layoutTop + `
       const {ok, data} = await r('/status');
       const el = document.getElementById('gmail-res');
       if(data.gmail_ok) {
-        el.innerHTML = '<span class="status-indicator status-ok"></span> Gmail Authorized';
+        el.innerHTML = '<span class="status-indicator status-ok"></span> Gmail đã sẵn sàng';
         document.getElementById('step-3').classList.add('done');
       } else {
-        el.innerHTML = '<span class="status-indicator status-err"></span> Gmail not authorized. Check terminal logs for auth URL.';
+        el.innerHTML = '<span class="status-indicator status-err"></span> Gmail chưa được xác thực. Hãy xem log terminal để lấy liên kết xác thực.';
       }
     }
 
     async function testDNSE() {
       const out = document.getElementById('dnse-res');
       out.style.display = 'block';
-      out.innerText = 'Testing...';
+      out.innerText = 'Đang kiểm tra...';
       const {ok, data} = await r('/account');
       if (ok && !data.error) {
-        out.innerText = "Connection successful!\nAccount Info loaded.";
+        out.innerText = "Kết nối thành công.\nĐã tải thông tin tài khoản.";
         document.getElementById('step-4').classList.add('done');
         document.getElementById('step-5').classList.add('done');
       } else {
-        out.innerText = "Error: " + JSON.stringify(data, null, 2);
+        out.innerText = "Lỗi: " + JSON.stringify(data, null, 2);
       }
     }
 
     // Run sys check
     r('/status').then(({ok, data}) => {
       let html = '<ul style="margin:0; padding-left:20px; color: var(--text-muted)">';
-      html += '<li>Go Bridge: ' + (ok ? '<span style="color:var(--success)">OK</span>' : 'Error') + '</li>';
-      html += '<li>TCP Port 9090: ' + (data.market_data_ok ? '<span style="color:var(--success)">OK</span>' : 'Error') + '</li>';
+      html += '<li>Go Bridge: ' + (ok ? '<span style="color:var(--success)">OK</span>' : 'Lỗi') + '</li>';
+      html += '<li>Cổng TCP 9090: ' + (data.market_data_ok ? '<span style="color:var(--success)">OK</span>' : 'Lỗi') + '</li>';
       html += '</ul>';
       document.getElementById('sys-check-res').innerHTML = html;
     });
@@ -270,28 +270,28 @@ const setupHTML = layoutTop + `
 ` + layoutBottom
 
 const settingsHTML = layoutTop + `
-  <h1>Settings</h1>
+  <h1>Cấu hình</h1>
   <div class="card">
     <div class="form-group">
-      <label>DNSE API Key</label>
-      <input type="text" id="apiKey" placeholder="Leave empty to keep unchanged">
+      <label>Khóa API DNSE</label>
+      <input type="text" id="apiKey" placeholder="Để trống nếu không muốn thay đổi">
     </div>
     <div class="form-group">
-      <label>DNSE API Secret</label>
-      <input type="password" id="apiSecret" placeholder="*** MASKED *** (Leave empty to keep unchanged)">
+      <label>Mã bí mật API DNSE</label>
+      <input type="password" id="apiSecret" placeholder="*** ĐÃ ẨN *** - để trống nếu không muốn thay đổi">
     </div>
     <div class="form-group">
-      <label>DNSE Account No</label>
+      <label>Số tài khoản DNSE</label>
       <input type="text" id="accountNo">
     </div>
     <div class="form-group">
-      <label>Mock Mode</label>
+      <label>Chế độ mô phỏng</label>
       <select id="mockMode">
-        <option value="true">True (Offline Testing)</option>
-        <option value="false">False (Live API)</option>
+        <option value="true">Bật (kiểm thử offline)</option>
+        <option value="false">Tắt (API thật)</option>
       </select>
     </div>
-    <button class="btn" onclick="saveSettings()">Save Configuration</button>
+    <button class="btn" onclick="saveSettings()">Lưu cấu hình</button>
     <span id="save-res" style="margin-left: 15px; color: var(--success);"></span>
   </div>
 
@@ -319,7 +319,7 @@ const settingsHTML = layoutTop + `
       });
       
       if(res.ok) {
-        document.getElementById('save-res').innerText = 'Saved successfully! Please restart the Go Bridge to apply.';
+        document.getElementById('save-res').innerText = 'Đã lưu thành công. Vui lòng khởi động lại bridge để áp dụng.';
         setTimeout(() => document.getElementById('save-res').innerText = '', 5000);
       }
     }
@@ -330,9 +330,10 @@ const settingsHTML = layoutTop + `
 
 const logsHTML = layoutTop + `
   <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-    <h1 style="margin:0">System Logs</h1>
-    <button class="btn secondary" onclick="loadLogs()">Refresh Logs</button>
+    <h1 style="margin:0">Nhật ký hệ thống</h1>
+    <button class="btn secondary" onclick="loadLogs()">Tải lại nhật ký</button>
   </div>
+  <p style="margin-top:0; color: var(--text-muted)">Trang này chỉ hiển thị phần nhật ký gần nhất để hệ thống luôn nhẹ. Nhật ký cũ sẽ được tự động tách sang thư mục <code>logs/archive</code>.</p>
   <div class="card" style="padding: 0; overflow: hidden;">
     <pre id="log-viewer" style="margin: 0; padding: 20px; height: 600px; overflow-y: auto; background: #000; color: #00ff00; font-family: monospace; font-size: 12px;"></pre>
   </div>
@@ -340,14 +341,14 @@ const logsHTML = layoutTop + `
   <script>
     async function loadLogs() {
       const out = document.getElementById('log-viewer');
-      out.innerText = 'Loading...';
+      out.innerText = 'Đang tải...';
       try {
         const res = await fetch('/api/logs/raw');
         const text = await res.text();
         out.innerText = text;
         out.scrollTop = out.scrollHeight;
       } catch(e) {
-        out.innerText = 'Failed to load logs.';
+        out.innerText = 'Không thể tải nhật ký.';
       }
     }
     loadLogs();
@@ -356,9 +357,9 @@ const logsHTML = layoutTop + `
 ` + layoutBottom
 
 const systemStatusHTML = layoutTop + `
-  <h1>System Status</h1>
+  <h1>Trạng thái hệ thống</h1>
   <div class="grid-2" id="status-grid">
-    Loading...
+    Đang tải...
   </div>
 
   <script>
@@ -373,7 +374,7 @@ const systemStatusHTML = layoutTop + `
         { name: 'Go Bridge API', ok: data.api_ok },
         { name: 'DNSE Authentication', ok: data.token_valid },
         { name: 'TCP Market Data (9090)', ok: data.market_data_ok },
-        { name: 'MT5 Connection', ok: data.mt5_connected },
+        { name: 'EA / DLL MT5', ok: data.mt5_connected, text: data.mt5_connected ? 'Đã kết nối' : 'Đang chờ EA', statusClass: data.mt5_connected ? 'status-ok' : 'status-warn' },
         { name: 'Gmail Auto OTP', ok: data.gmail_ok },
         { name: 'Trading Active (Kill Switch)', ok: data.system_enabled }
       ];
@@ -385,8 +386,8 @@ const systemStatusHTML = layoutTop + `
         card.innerHTML = 
           '<h3 style="margin: 0 0 10px; color: var(--text-muted); font-size: 14px;">' + item.name + '</h3>' +
           '<div style="font-size: 18px; font-weight: bold; display: flex; align-items: center;">' +
-            '<span class="status-indicator ' + (item.ok ? 'status-ok' : 'status-err') + '"></span>' +
-            (item.ok ? 'Operational' : 'Error / Not Found') +
+            '<span class="status-indicator ' + (item.statusClass || (item.ok ? 'status-ok' : 'status-err')) + '"></span>' +
+            (item.text || (item.ok ? 'Đang hoạt động' : 'Lỗi / chưa tìm thấy')) +
           '</div>';
         grid.appendChild(card);
       });

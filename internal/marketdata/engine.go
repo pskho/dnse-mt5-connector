@@ -41,6 +41,7 @@ type Engine struct {
 	logger   *logger.FileLogger
 	profiles []SymbolProfile
 	states   map[string]*symbolRuntimeState
+	status   *BridgeStatus
 }
 
 func NewEngine(cfg config.MarketDataConfig, apiKey, secret string, client MarketDataClient, history *HistoryService, appLog *logger.FileLogger) *Engine {
@@ -62,6 +63,7 @@ func NewEngine(cfg config.MarketDataConfig, apiKey, secret string, client Market
 		logger:   appLog,
 		profiles: profiles,
 		states:   states,
+		status:   NewBridgeStatus(),
 	}
 }
 
@@ -75,13 +77,20 @@ func (e *Engine) Profiles() []SymbolProfile {
 	return out
 }
 
+func (e *Engine) Status() BridgeStatusSnapshot {
+	if e == nil || e.status == nil {
+		return BridgeStatusSnapshot{}
+	}
+	return e.status.Snapshot()
+}
+
 func (e *Engine) Start(ctx context.Context) {
 	if !e.cfg.Enabled {
 		e.logger.Info("marketdata_disabled", nil)
 		return
 	}
 
-	publisher := NewPublisher(e.cfg.BridgeAddress, e.cfg.Symbol, e.store, e.history, e.logger)
+	publisher := NewPublisher(e.cfg.BridgeAddress, e.cfg.Symbol, e.store, e.history, e.logger, e.status)
 	go func() {
 		if err := publisher.Run(ctx); err != nil {
 			e.logger.Error("marketdata_publisher_failed", map[string]any{"error": err.Error()})

@@ -17,10 +17,11 @@ type Publisher struct {
 	store   *Store
 	history *HistoryService
 	logger  *logger.FileLogger
+	status  *BridgeStatus
 }
 
-func NewPublisher(address, symbol string, store *Store, history *HistoryService, appLog *logger.FileLogger) *Publisher {
-	return &Publisher{address: address, symbol: symbol, store: store, history: history, logger: appLog}
+func NewPublisher(address, symbol string, store *Store, history *HistoryService, appLog *logger.FileLogger, status *BridgeStatus) *Publisher {
+	return &Publisher{address: address, symbol: symbol, store: store, history: history, logger: appLog, status: status}
 }
 
 func (p *Publisher) Run(ctx context.Context) error {
@@ -29,6 +30,7 @@ func (p *Publisher) Run(ctx context.Context) error {
 		return err
 	}
 	defer listener.Close()
+	p.status.MarkPublisherStarted()
 	p.logger.Info("marketdata_publisher_started", map[string]any{"address": p.address})
 
 	go func() {
@@ -58,7 +60,11 @@ func (p *Publisher) handle(ctx context.Context, conn net.Conn) {
 		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 	}
 	p.logger.Info("marketdata_client_connected", map[string]any{"remote": conn.RemoteAddr().String()})
-	defer p.logger.Info("marketdata_client_disconnected", map[string]any{"remote": conn.RemoteAddr().String()})
+	p.status.ClientConnected()
+	defer func() {
+		p.status.ClientDisconnected()
+		p.logger.Info("marketdata_client_disconnected", map[string]any{"remote": conn.RemoteAddr().String()})
+	}()
 
 	ticks, unsubscribe := p.store.SubscribeSymbol(p.symbol)
 	defer unsubscribe()
@@ -104,9 +110,9 @@ func (p *Publisher) writeHistorySnapshot(writeLine func([]byte) bool) bool {
 		return true
 	}
 	startLine, _ := json.Marshal(map[string]any{
-		"type":  "history_start",
+		"type":   "history_start",
 		"symbol": key.Symbol,
-		"count": len(candles),
+		"count":  len(candles),
 	})
 	if !writeLine(append(startLine, '\n')) {
 		return false
@@ -117,9 +123,9 @@ func (p *Publisher) writeHistorySnapshot(writeLine func([]byte) bool) bool {
 		}
 	}
 	endLine, _ := json.Marshal(map[string]any{
-		"type":  "history_end",
+		"type":   "history_end",
 		"symbol": key.Symbol,
-		"count": len(candles),
+		"count":  len(candles),
 	})
 	return writeLine(append(endLine, '\n'))
 }

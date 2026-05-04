@@ -129,6 +129,21 @@ func (c Config) ServerAddress() string {
 	return fmt.Sprintf("%s:%d", c.Host, c.Port)
 }
 
+func (c DNSEConfig) HasUsableCredentials() bool {
+	return !isPlaceholder(c.APIKey) && !isPlaceholder(c.APISecret)
+}
+
+func isPlaceholder(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return true
+	}
+	upper := strings.ToUpper(value)
+	return strings.Contains(upper, "PASTE_DNSE_API_KEY_HERE") ||
+		strings.Contains(upper, "PASTE_DNSE_API_SECRET_HERE") ||
+		strings.Contains(upper, "PASTE_ACCOUNT_NO_HERE")
+}
+
 func loadJSONFallback(path string, cfg Config) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

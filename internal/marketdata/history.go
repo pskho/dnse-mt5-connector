@@ -103,6 +103,31 @@ func (s *HistoryService) Fetch(ctx context.Context) error {
 	return nil
 }
 
+func (s *HistoryService) NeedsBootstrap(ctx context.Context, symbol, marketType string, resolution int) bool {
+	if s.cache == nil {
+		return true
+	}
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		symbol = strings.ToUpper(strings.TrimSpace(s.cfg.Symbol))
+	}
+	marketType = strings.ToUpper(strings.TrimSpace(marketType))
+	if marketType == "" {
+		marketType = strings.ToUpper(strings.TrimSpace(s.cfg.MarketType))
+	}
+	if resolution <= 0 {
+		resolution = s.cfg.Resolution
+	}
+	_, _, count, err := s.cache.GetHistoryCoverage(ctx, symbol, marketType, resolution)
+	if err != nil {
+		s.logger.Error("history_bootstrap_coverage_failed", map[string]any{
+			"symbol": symbol, "marketType": marketType, "resolution": resolution, "error": err.Error(),
+		})
+		return true
+	}
+	return count == 0
+}
+
 func (s *HistoryService) Sync(ctx context.Context, firstTime, lastTime int64) (any, error) {
 	return s.SyncWithOptions(ctx, SyncOptions{
 		FirstTime: firstTime,

@@ -11,9 +11,13 @@ $bundleRoot = Join-Path $root $OutputRoot
 $packageRoot = Join-Path $bundleRoot $PackageName
 $zipPath = Join-Path $bundleRoot ($PackageName + ".zip")
 $bridgePath = Join-Path $root "bridge.exe"
+$configExamplePath = Join-Path $root "config\config.yaml.example"
 
 if (-not $SkipBridgeBuild) {
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "build_bridge.ps1") -Output $bridgePath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Build bridge that bai. Dung dong goi de tranh su dung bridge.exe cu."
+    }
 }
 
 $requiredFiles = @(
@@ -37,6 +41,10 @@ if (-not (Test-Path $bundleRoot)) {
     New-Item -ItemType Directory -Path $bundleRoot | Out-Null
 }
 
+Get-ChildItem -Path $bundleRoot -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like "*upload*" -or $_.Name -like "~DNSE-*" } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
 New-Item -ItemType Directory -Path $packageRoot | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $packageRoot "config") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $packageRoot "logs") | Out-Null
@@ -53,11 +61,12 @@ Copy-Item (Join-Path $root "README_TRIAL_VN30F1M.md") (Join-Path $packageRoot "R
 Copy-Item (Join-Path $root "start_trial.bat") (Join-Path $packageRoot "start_trial.bat") -Force
 Copy-Item (Join-Path $root "stop_trial.bat") (Join-Path $packageRoot "stop_trial.bat") -Force
 Copy-Item (Join-Path $root "open_setup.bat") (Join-Path $packageRoot "open_setup.bat") -Force
-if (Test-Path (Join-Path $root "config\config.yaml.example")) {
-    Copy-Item (Join-Path $root "config\config.yaml.example") (Join-Path $packageRoot "config\config.yaml.example") -Force
-}
-
-$configContent = @'
+Copy-Item (Join-Path $root "run_bridge_console.bat") (Join-Path $packageRoot "run_bridge_console.bat") -Force
+if (Test-Path $configExamplePath) {
+    Copy-Item $configExamplePath (Join-Path $packageRoot "config\config.yaml.example") -Force
+    Copy-Item $configExamplePath (Join-Path $packageRoot "config\config.yaml") -Force
+} else {
+    $configContent = @'
 host: "127.0.0.1"
 port: 8080
 database_path: "data/connector.db"
@@ -72,7 +81,7 @@ dnse:
   base_url: "https://openapi.dnse.com.vn"
   api_key: "PASTE_DNSE_API_KEY_HERE"
   api_secret: "PASTE_DNSE_API_SECRET_HERE"
-  account_no: ""
+  account_no: "PASTE_ACCOUNT_NO_HERE"
   mock: false
 
 market_data:
@@ -103,12 +112,23 @@ gmail_otp:
   email_domain_filter: "dnse.com.vn"
 '@
 
-Set-Content -Path (Join-Path $packageRoot "config\config.yaml") -Value $configContent -Encoding UTF8
+    Set-Content -Path (Join-Path $packageRoot "config\config.yaml.example") -Value $configContent -Encoding UTF8
+    Set-Content -Path (Join-Path $packageRoot "config\config.yaml") -Value $configContent -Encoding UTF8
+}
 
 if (Test-Path $zipPath) {
     Remove-Item -Path $zipPath -Force
 }
-Compress-Archive -Path (Join-Path $packageRoot "*") -DestinationPath $zipPath -CompressionLevel Optimal
+
+$tarCmd = Get-Command tar.exe -ErrorAction SilentlyContinue
+if (-not $tarCmd) {
+    throw "Khong tim thay tar.exe de dong goi file zip."
+}
+
+& $tarCmd.Source -a -c -f $zipPath -C $packageRoot .
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $zipPath)) {
+    throw "Khong tao duoc file zip: $zipPath"
+}
 
 Write-Host "Package ready:" -ForegroundColor Green
 Write-Host "  Folder: $packageRoot"

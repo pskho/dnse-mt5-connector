@@ -1,267 +1,110 @@
 package api
 
-const indexHTML = `<!doctype html>
-<html lang="vi">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DNSE MT5 Connector Dashboard</title>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+const indexHTML = layoutTop + `
   <style>
-    :root {
-      --bg: #0f172a;
-      --card-bg: rgba(30, 41, 59, 0.7);
-      --card-border: rgba(255, 255, 255, 0.1);
-      --text: #f8fafc;
-      --text-muted: #94a3b8;
-      --primary: #3b82f6;
-      --primary-hover: #2563eb;
-      --danger: #ef4444;
-      --danger-hover: #dc2626;
-      --success: #10b981;
-      --success-hover: #059669;
-      --warning: #f59e0b;
-      --input-bg: rgba(15, 23, 42, 0.6);
-      --input-border: rgba(255, 255, 255, 0.15);
-      --input-focus: #3b82f6;
+    .dashboard-shell {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 24px;
+      align-items: start;
     }
-
-    * { box-sizing: border-box; }
-    
-    body {
-      margin: 0;
-      font-family: 'Inter', sans-serif;
-      background: var(--bg);
-      background-image: 
-        radial-gradient(circle at 15% 50%, rgba(59, 130, 246, 0.15), transparent 25%),
-        radial-gradient(circle at 85% 30%, rgba(16, 185, 129, 0.15), transparent 25%);
-      color: var(--text);
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
+    .dashboard-main {
+      min-width: 0;
     }
-
-    header {
-      padding: 20px 30px;
-      background: rgba(15, 23, 42, 0.8);
-      backdrop-filter: blur(12px);
-      border-bottom: 1px solid var(--card-border);
+    .dashboard-side {
       position: sticky;
-      top: 0;
-      z-index: 10;
+      top: 24px;
+    }
+    .dashboard-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 24px;
+    }
+    .dashboard-section {
+      margin-bottom: 0;
+    }
+    .dashboard-section.full {
+      grid-column: 1 / -1;
+    }
+    .toolbar {
       display: flex;
       justify-content: space-between;
       align-items: center;
+      gap: 16px;
+      margin-bottom: 24px;
     }
-
-    h1 {
-      font-size: 24px;
-      font-weight: 700;
-      margin: 0;
-      background: linear-gradient(to right, #60a5fa, #34d399);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }
-
     .status-badge {
-      padding: 6px 12px;
-      border-radius: 9999px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(56, 142, 60, 0.15);
+      border: 1px solid rgba(56, 142, 60, 0.3);
+      color: #9be7a1;
+      padding: 8px 12px;
+      border-radius: 999px;
       font-size: 13px;
       font-weight: 600;
-      background: rgba(16, 185, 129, 0.2);
-      color: var(--success);
-      border: 1px solid rgba(16, 185, 129, 0.3);
-      display: flex;
-      align-items: center;
-      gap: 6px;
     }
-    
-    .status-badge.error {
-      background: rgba(239, 68, 68, 0.2);
-      color: var(--danger);
-      border-color: rgba(239, 68, 68, 0.3);
-    }
-
     .status-badge::before {
       content: '';
-      width: 8px;
-      height: 8px;
+      width: 10px;
+      height: 10px;
       border-radius: 50%;
       background: currentColor;
       box-shadow: 0 0 8px currentColor;
     }
-
-    main {
-      flex: 1;
-      max-width: 1400px;
-      margin: 0 auto;
-      padding: 30px;
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
-      gap: 24px;
-      width: 100%;
+    .status-badge.error {
+      background: rgba(211, 47, 47, 0.15);
+      border-color: rgba(211, 47, 47, 0.35);
+      color: #ff8a80;
     }
-
-    section {
-      background: var(--card-bg);
-      backdrop-filter: blur(16px);
-      border: 1px solid var(--card-border);
-      border-radius: 16px;
-      padding: 24px;
-      box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
-      transition: transform 0.2s, box-shadow 0.2s;
-    }
-
-    section:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.6);
-      border-color: rgba(255, 255, 255, 0.2);
-    }
-
-    h2 {
-      font-size: 18px;
-      font-weight: 600;
-      margin: 0 0 20px;
-      padding-bottom: 12px;
-      border-bottom: 1px solid var(--card-border);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-
     .grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 16px;
     }
-
     .full {
       grid-column: 1 / -1;
     }
-
-    label {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      font-size: 13px;
-      font-weight: 500;
-      color: var(--text-muted);
-    }
-
-    input, select {
-      height: 40px;
-      background: var(--input-bg);
-      border: 1px solid var(--input-border);
-      border-radius: 8px;
-      padding: 0 12px;
-      font-size: 14px;
-      color: var(--text);
-      font-family: inherit;
-      transition: all 0.2s;
-    }
-
-    input:focus, select:focus {
-      outline: none;
-      border-color: var(--input-focus);
-      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
-    }
-
-    button {
-      height: 40px;
-      background: var(--primary);
-      color: white;
-      border: none;
-      border-radius: 8px;
-      padding: 0 16px;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.2s;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-    }
-
-    button:hover {
-      background: var(--primary-hover);
-      transform: translateY(-1px);
-    }
-
-    button:active {
-      transform: translateY(1px);
-    }
-
-    button.secondary {
-      background: rgba(255, 255, 255, 0.1);
-      color: var(--text);
-    }
-
-    button.secondary:hover {
-      background: rgba(255, 255, 255, 0.15);
-    }
-
-    button.danger {
-      background: var(--danger);
-    }
-
-    button.danger:hover {
-      background: var(--danger-hover);
-    }
-    
-    button.success {
-      background: var(--success);
-    }
-
-    button.success:hover {
-      background: var(--success-hover);
-    }
-
     .actions {
-      margin-top: 20px;
+      margin-top: 18px;
       display: flex;
       flex-wrap: wrap;
       gap: 12px;
     }
-
-    .console-wrapper {
-      grid-column: 1 / -1;
-      position: sticky;
-      bottom: 20px;
-      z-index: 100;
+    .inline-note {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--text-muted);
     }
-
+    .console-card {
+      margin-bottom: 0;
+    }
     .console {
-      background: #020617;
-      border: 1px solid var(--card-border);
-      border-radius: 12px;
+      background: #0c0c0c;
+      border: 1px solid var(--border);
+      border-radius: 8px;
       padding: 16px;
-      height: 250px;
+      height: min(72vh, 760px);
       overflow: auto;
-      font-family: 'Consolas', 'Monaco', monospace;
+      font-family: Consolas, Monaco, monospace;
       font-size: 13px;
       line-height: 1.5;
-      color: #34d399;
-      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+      color: #87f59f;
     }
-
     .console.error-text {
-      color: #f87171;
+      color: #ff9b9b;
     }
-
     .console-header {
       display: flex;
       justify-content: space-between;
+      align-items: center;
       margin-bottom: 12px;
-      font-family: 'Inter', sans-serif;
       color: var(--text-muted);
       font-size: 12px;
-      font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: 0.04em;
     }
-
-    /* Toasts */
     .toast-container {
       position: fixed;
       top: 20px;
@@ -271,192 +114,191 @@ const indexHTML = `<!doctype html>
       gap: 10px;
       z-index: 1000;
     }
-
     .toast {
-      background: rgba(30, 41, 59, 0.9);
-      backdrop-filter: blur(8px);
+      background: rgba(30, 30, 30, 0.95);
       border-left: 4px solid var(--primary);
       color: white;
-      padding: 16px 20px;
+      padding: 14px 18px;
       border-radius: 8px;
-      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
       font-size: 14px;
-      font-weight: 500;
-      animation: slideIn 0.3s ease forwards;
-      max-width: 350px;
+      max-width: 360px;
     }
-
     .toast.error { border-color: var(--danger); }
     .toast.success { border-color: var(--success); }
-
-    @keyframes slideIn {
-      from { transform: translateX(100%); opacity: 0; }
-      to { transform: translateX(0); opacity: 1; }
+    @media (max-width: 1100px) {
+      .dashboard-shell {
+        grid-template-columns: 1fr;
+      }
+      .dashboard-side {
+        position: static;
+      }
+      .dashboard-grid {
+        grid-template-columns: 1fr;
+      }
+      .dashboard-section.full {
+        grid-column: auto;
+      }
+      .console {
+        height: 320px;
+      }
     }
-
-    @keyframes fadeOut {
-      to { opacity: 0; transform: translateY(-10px); }
-    }
-    
-    .signals-list, .positions-list {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      margin-top: 10px;
-    }
-    
-    .list-item {
-      background: rgba(0,0,0,0.2);
-      border: 1px solid var(--card-border);
-      padding: 12px;
-      border-radius: 8px;
-      font-size: 13px;
-    }
-
   </style>
-</head>
-<body>
 
   <div class="toast-container" id="toast-container"></div>
 
-  <header>
-    <h1>DNSE MT5 Connector</h1>
-    <div class="status-badge" id="status-badge">Checking Server...</div>
-  </header>
+  <div class="toolbar">
+    <div>
+      <h1 style="margin-bottom:8px">Bảng điều khiển</h1>
+      <p style="margin:0; color: var(--text-muted)">Theo dõi bridge, kiểm tra kết nối DNSE và thao tác nhanh với dữ liệu thị trường.</p>
+    </div>
+    <div class="status-badge" id="status-badge">Đang kiểm tra máy chủ...</div>
+  </div>
 
-  <main>
-    <!-- Section 1: System Control -->
-    <section>
-      <h2>System Control</h2>
+  <div class="dashboard-shell">
+    <div class="dashboard-main">
+      <div class="dashboard-grid">
+    <section class="card dashboard-section">
+      <h2>Điều khiển hệ thống</h2>
       <div class="grid">
-        <label class="full">Trading Mode
+        <div class="form-group full">
+          <label>Chế độ giao dịch</label>
           <select id="sysMode">
-            <option value="manual">Manual</option>
-            <option value="semi_auto">Semi-Auto</option>
-            <option value="auto">Auto</option>
+            <option value="manual">Thủ công</option>
+            <option value="semi_auto">Bán tự động</option>
+            <option value="auto">Tự động</option>
           </select>
-        </label>
+        </div>
       </div>
       <div class="actions">
-        <button onclick="ping()">Ping Server</button>
-        <button class="secondary" onclick="getStatus()">Server Status</button>
-        <button class="secondary" onclick="changeMode()">Set Mode</button>
-        <button class="danger" onclick="killSwitch(true)">KILL SWITCH</button>
-        <button class="success" onclick="killSwitch(false)">Unkill</button>
+        <button class="btn" onclick="ping()">Kiểm tra máy chủ</button>
+        <button class="btn secondary" onclick="getStatus()">Xem trạng thái</button>
+        <button class="btn secondary" onclick="changeMode()">Đổi chế độ</button>
+        <button class="btn danger" onclick="killSwitch(true)">Tắt khẩn cấp</button>
+        <button class="btn" style="background:var(--success)" onclick="killSwitch(false)">Bật lại</button>
       </div>
     </section>
 
-    <!-- Section 2: Account & Auth -->
-    <section>
-      <h2>Account & Auth</h2>
+    <section class="card dashboard-section">
+      <h2>Tài khoản và xác thực</h2>
       <div class="grid">
-        <label>Account No
-          <input id="accountNo" placeholder="e.g. 0001007412">
-        </label>
-        <label>OTP Type
+        <div class="form-group">
+          <label>Số tài khoản</label>
+          <input id="accountNo" placeholder="Ví dụ: 0001007412">
+        </div>
+        <div class="form-group">
+          <label>Loại OTP</label>
           <select id="otpType">
             <option value="email_otp">email_otp</option>
             <option value="smart_otp">smart_otp</option>
           </select>
-        </label>
-        <label class="full">Passcode
-          <input id="passcode" placeholder="Enter OTP manually or fetch latest">
-        </label>
+        </div>
+        <div class="form-group full">
+          <label>Mã OTP</label>
+          <input id="passcode" placeholder="Nhập tay hoặc lấy OTP mới nhất">
+        </div>
       </div>
       <div class="actions">
-        <button onclick="getAccount()">Get Account</button>
-        <button class="secondary" onclick="getLatestOTP()">Fetch Auto OTP</button>
-        <button class="secondary" onclick="sendOtp()">Send Email OTP</button>
-        <button class="success" onclick="verifyOtp()">Register Token</button>
+        <button class="btn" onclick="getAccount()">Lấy thông tin tài khoản</button>
+        <button class="btn secondary" onclick="getLatestOTP()">Lấy OTP tự động</button>
+        <button class="btn secondary" onclick="sendOtp()">Gửi OTP qua email</button>
+        <button class="btn" style="background:var(--success)" onclick="verifyOtp()">Đăng ký token</button>
       </div>
     </section>
 
-    <!-- Section 3: Market Data & History -->
-    <section>
-      <h2>Market Data & History</h2>
+    <section class="card dashboard-section">
+      <h2>Dữ liệu thị trường và lịch sử</h2>
       <div class="grid">
-        <label>First Time (ms)
+        <div class="form-group">
+          <label>Thời điểm bắt đầu (ms)</label>
           <input id="firstTime" type="number" value="0">
-        </label>
-        <label>Last Time (ms)
+        </div>
+        <div class="form-group">
+          <label>Thời điểm kết thúc (ms)</label>
           <input id="lastTime" type="number" value="0">
-        </label>
-        <label>Lookback Days
+        </div>
+        <div class="form-group">
+          <label>Số ngày lấy lùi</label>
           <input id="lookbackDays" type="number" value="365" min="1">
-        </label>
+        </div>
       </div>
-        <div class="actions">
-          <button onclick="syncHistory()">Sync History Data</button>
-          <button class="secondary" onclick="fullSyncHistory()">Full History Rebuild</button>
-          <button class="secondary" onclick="backfillHistory()">Backfill <= Yesterday</button>
-        </div>
-        <div style="margin-top:10px; font-size:12px; color:var(--text-muted)">
-          Note: Backfill <= Yesterday dung de nap mot lan phan lich su nen; realtime va du lieu hom nay de luong khac xu ly.
-        </div>
+      <div class="actions">
+        <button class="btn" onclick="syncHistory()">Đồng bộ lịch sử</button>
+        <button class="btn secondary" onclick="fullSyncHistory()">Nạp lại toàn bộ lịch sử</button>
+        <button class="btn secondary" onclick="backfillHistory()">Nạp lịch sử đến hết hôm qua</button>
+      </div>
+      <div class="inline-note">Luồng "đến hết hôm qua" dùng để dựng nền dữ liệu một lần; realtime và dữ liệu hôm nay đi theo luồng riêng.</div>
     </section>
 
-    <!-- Section 4: Loan & PPSE -->
-    <section>
-      <h2>Purchasing Power (PPSE)</h2>
+    <section class="card dashboard-section">
+      <h2>Sức mua (PPSE)</h2>
       <div class="grid">
-        <label>Symbol
+        <div class="form-group">
+          <label>Mã</label>
           <input id="pkgSymbol" value="VN30F1M">
-        </label>
-        <label>Market Type
+        </div>
+        <div class="form-group">
+          <label>Loại thị trường</label>
           <select id="pkgMarketType">
             <option value="DERIVATIVE">DERIVATIVE</option>
             <option value="STOCK">STOCK</option>
           </select>
-        </label>
-        <label>Loan Package ID
-          <input id="loanPackageId" placeholder="Auto-filled">
-        </label>
-        <label>Price
+        </div>
+        <div class="form-group">
+          <label>Mã gói vay</label>
+          <input id="loanPackageId" placeholder="Tự điền">
+        </div>
+        <div class="form-group">
+          <label>Giá</label>
           <input id="ppsePrice" type="number" value="0">
-        </label>
+        </div>
       </div>
       <div class="actions">
-        <button onclick="getLoanPackages()">Get Loan Packages</button>
-        <button class="secondary" onclick="getPpse()">Calculate PPSE</button>
+        <button class="btn" onclick="getLoanPackages()">Lấy danh sách gói vay</button>
+        <button class="btn secondary" onclick="getPpse()">Tính PPSE</button>
       </div>
     </section>
 
-    <!-- Section 5: Position & Orders -->
-    <section>
-      <h2>Positions & Order Info</h2>
+    <section class="card dashboard-section">
+      <h2>Vị thế và thông tin lệnh</h2>
       <div class="grid">
-        <label class="full">Order ID (to query/cancel)
-          <input id="queryOrderId" placeholder="e.g. ord-12345">
-        </label>
+        <div class="form-group full">
+          <label>Mã lệnh</label>
+          <input id="queryOrderId" placeholder="Ví dụ: ord-12345">
+        </div>
       </div>
       <div class="actions">
-        <button onclick="getPositions()">All Positions</button>
-        <button class="secondary" onclick="getPositionBySymbol()">Pos by Symbol</button>
-        <button class="secondary" onclick="getOrder()">Get Order Info</button>
-        <button class="danger" onclick="cancelOrder()">Cancel Order</button>
+        <button class="btn" onclick="getPositions()">Xem toàn bộ vị thế</button>
+        <button class="btn secondary" onclick="getPositionBySymbol()">Xem vị thế theo mã</button>
+        <button class="btn secondary" onclick="getOrder()">Xem chi tiết lệnh</button>
+        <button class="btn danger" onclick="cancelOrder()">Hủy lệnh</button>
       </div>
     </section>
 
-    <!-- Section 6: Place Order -->
-    <section>
-      <h2>Place Order (Manual)</h2>
+    <section class="card dashboard-section">
+      <h2>Đặt lệnh thủ công</h2>
       <div class="grid">
-        <label>Client Order ID
+        <div class="form-group">
+          <label>Mã lệnh phía client</label>
           <input id="clientOrderId" value="mt5-test-001">
-        </label>
-        <label>Symbol
+        </div>
+        <div class="form-group">
+          <label>Mã</label>
           <input id="symbol" value="VN30F1M">
-        </label>
-        <label>Side
+        </div>
+        <div class="form-group">
+          <label>Chiều lệnh</label>
           <select id="side">
-            <option value="BUY">BUY</option>
-            <option value="SELL">SELL</option>
+            <option value="BUY">Mua</option>
+            <option value="SELL">Bán</option>
           </select>
-        </label>
-        <label>Quantity
+        </div>
+        <div class="form-group">
+          <label>Khối lượng</label>
           <input id="quantity" type="number" min="1" value="1">
-        </label>
-        <label>Order Type
+        </div>
+        <div class="form-group">
+          <label>Loại lệnh</label>
           <select id="orderType">
             <option value="MTL">MTL</option>
             <option value="LO">LO</option>
@@ -465,114 +307,111 @@ const indexHTML = `<!doctype html>
             <option value="ATO">ATO</option>
             <option value="ATC">ATC</option>
           </select>
-        </label>
-        <label>Price
+        </div>
+        <div class="form-group">
+          <label>Giá</label>
           <input id="price" type="number" min="0" value="0">
-        </label>
-        <label>Market Type
+        </div>
+        <div class="form-group">
+          <label>Loại thị trường</label>
           <select id="marketType">
             <option value="DERIVATIVE">DERIVATIVE</option>
             <option value="STOCK">STOCK</option>
           </select>
-        </label>
-        <label>Order Category
-          <input id="orderCategory" value="NORMAL">
-        </label>
-      </div>
-      <div class="actions">
-        <button class="success" onclick="placeOrder()">Submit Order</button>
-      </div>
-    </section>
-
-    <!-- Section 7: Signals Management -->
-    <section>
-      <h2>Pending Signals (Semi-Auto)</h2>
-      <div class="grid">
-        <label class="full">Signal ID (to confirm/reject)
-          <input id="signalId" placeholder="e.g. sig-12345">
-        </label>
-      </div>
-      <div class="actions">
-        <button onclick="getPendingSignals()">Fetch Signals</button>
-        <button class="success" onclick="confirmSignal()">Confirm Signal</button>
-        <button class="danger" onclick="rejectSignal()">Reject Signal</button>
-      </div>
-    </section>
-
-    <!-- Global Console -->
-    <div class="console-wrapper">
-      <div class="console">
-        <div class="console-header">
-          <span>Terminal Output</span>
-          <span style="cursor:pointer" onclick="clearConsole()">Clear</span>
         </div>
-        <div id="output">System initialized. Ready for requests.</div>
+        <div class="form-group">
+          <label>Nhóm lệnh</label>
+          <input id="orderCategory" value="NORMAL">
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn" style="background:var(--success)" onclick="placeOrder()">Gửi lệnh</button>
+      </div>
+    </section>
+
+    <section class="card dashboard-section">
+      <h2>Tín hiệu chờ xử lý</h2>
+      <div class="grid">
+        <div class="form-group full">
+          <label>Mã tín hiệu</label>
+          <input id="signalId" placeholder="Ví dụ: sig-12345">
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn" onclick="getPendingSignals()">Tải tín hiệu chờ</button>
+        <button class="btn" style="background:var(--success)" onclick="confirmSignal()">Xác nhận tín hiệu</button>
+        <button class="btn danger" onclick="rejectSignal()">Từ chối tín hiệu</button>
+      </div>
+    </section>
       </div>
     </div>
-  </main>
+
+    <aside class="dashboard-side">
+      <section class="card console-card">
+        <div class="console-header">
+          <span>Đầu ra hệ thống</span>
+          <button class="btn secondary" onclick="clearConsole()">Xóa</button>
+        </div>
+        <div id="output" class="console">Hệ thống đã sẵn sàng.</div>
+      </section>
+    </aside>
+  </div>
 
   <script>
     const $ = (id) => document.getElementById(id);
 
-    // Toast System
     function showToast(message, type = 'success') {
       const container = $('toast-container');
       const toast = document.createElement('div');
       toast.className = 'toast ' + type;
       toast.textContent = message;
       container.appendChild(toast);
-      setTimeout(() => {
-        toast.style.animation = 'fadeOut 0.3s ease forwards';
-        setTimeout(() => toast.remove(), 300);
-      }, 3000);
+      setTimeout(() => toast.remove(), 3000);
     }
 
-    // Console System
     function printConsole(data, isError = false) {
       const out = $('output');
-      out.className = isError ? 'error-text' : '';
+      out.className = isError ? 'console error-text' : 'console';
       out.textContent = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
     }
-    
+
     function clearConsole() {
       $('output').textContent = '';
     }
 
-    // Set Status Badge
     function setStatus(isOnline) {
       const badge = $('status-badge');
       if (isOnline) {
         badge.className = 'status-badge';
-        badge.textContent = 'Server Online';
+        badge.textContent = 'Bridge đang hoạt động';
       } else {
         badge.className = 'status-badge error';
-        badge.textContent = 'Connection Error';
+        badge.textContent = 'Không kết nối được';
       }
     }
 
-    // API Wrapper
     async function request(path, options = {}) {
       try {
         const res = await fetch(path, options);
         const text = await res.text();
         let body;
         try { body = text ? JSON.parse(text) : {}; } catch { body = text; }
-        
+
         if (!res.ok) {
           printConsole(body, true);
-          showToast('Error: ' + res.status, 'error');
+          showToast('Lỗi ' + res.status, 'error');
           setStatus(false);
           throw body;
         }
-        
+
         printConsole(body, false);
-        showToast('Success');
+        showToast('Thành công');
         setStatus(true);
         return body;
       } catch (err) {
-        if (!err.error) { // Network error
-          printConsole(err.message || 'Network error', true);
-          showToast('Network error', 'error');
+        if (!err.error) {
+          printConsole(err.message || 'Lỗi mạng', true);
+          showToast('Lỗi mạng', 'error');
           setStatus(false);
         }
         throw err;
@@ -583,9 +422,7 @@ const indexHTML = `<!doctype html>
       try { await fn(); } catch (e) { console.error(e); }
     }
 
-    // API Functions
     function ping() { run(() => request('/ping')); }
-    
     function getStatus() { run(() => request('/status')); }
 
     function changeMode() {
@@ -617,7 +454,7 @@ const indexHTML = `<!doctype html>
         if (data.valid && data.otp) {
           $('passcode').value = data.otp;
         } else {
-          showToast('No valid OTP found', 'error');
+          showToast('Không tìm thấy OTP hợp lệ', 'error');
         }
       });
     }
@@ -638,9 +475,9 @@ const indexHTML = `<!doctype html>
       run(() => request('/history/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          firstTime: Number($('firstTime').value), 
-          lastTime: Number($('lastTime').value) 
+        body: JSON.stringify({
+          firstTime: Number($('firstTime').value),
+          lastTime: Number($('lastTime').value)
         })
       }));
     }
@@ -694,21 +531,21 @@ const indexHTML = `<!doctype html>
     }
 
     function getPositions() { run(() => request('/positions')); }
-    
-    function getPositionBySymbol() { 
+
+    function getPositionBySymbol() {
       const sym = $('pkgSymbol').value || $('symbol').value;
-      run(() => request('/position/' + sym)); 
+      run(() => request('/position/' + sym));
     }
 
-    function getOrder() { 
+    function getOrder() {
       const id = $('queryOrderId').value;
-      if (!id) return showToast('Please enter Order ID', 'error');
-      run(() => request('/order/' + id)); 
+      if (!id) return showToast('Vui lòng nhập mã lệnh', 'error');
+      run(() => request('/order/' + id));
     }
 
     function cancelOrder() {
       const id = $('queryOrderId').value;
-      if (!id) return showToast('Please enter Order ID', 'error');
+      if (!id) return showToast('Vui lòng nhập mã lệnh', 'error');
       run(() => request('/cancel', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -750,7 +587,7 @@ const indexHTML = `<!doctype html>
 
     function confirmSignal() {
       const id = $('signalId').value;
-      if (!id) return showToast('Please enter Signal ID', 'error');
+      if (!id) return showToast('Vui lòng nhập mã tín hiệu', 'error');
       run(() => request('/confirm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -760,7 +597,7 @@ const indexHTML = `<!doctype html>
 
     function rejectSignal() {
       const id = $('signalId').value;
-      if (!id) return showToast('Please enter Signal ID', 'error');
+      if (!id) return showToast('Vui lòng nhập mã tín hiệu', 'error');
       run(() => request('/reject', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -768,9 +605,6 @@ const indexHTML = `<!doctype html>
       }));
     }
 
-    // Initial check
     ping();
   </script>
-</body>
-</html>`
-
+` + layoutBottom

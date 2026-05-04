@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -25,12 +24,17 @@ type HistorySyncer interface {
 	FullSync(ctx context.Context, lookbackDays int) (any, error)
 }
 
+type MarketDataStatusProvider interface {
+	Status() marketdata.BridgeStatusSnapshot
+}
+
 type Handler struct {
 	orders    *service.OrderService
 	positions *service.PositionService
 	signals   *service.SignalService
 	symbols   *service.SymbolCatalogService
 	profiles  []marketdata.SymbolProfile
+	market    MarketDataStatusProvider
 	dnse      *DNSEClient
 	history   HistorySyncer
 	otp       OTPFetcher
@@ -54,8 +58,8 @@ type killSwitchRequest struct {
 	Enabled bool `json:"enabled"`
 }
 
-func NewHandler(orderService *service.OrderService, positionService *service.PositionService, signalService *service.SignalService, symbolService *service.SymbolCatalogService, profiles []marketdata.SymbolProfile, dnseClient *DNSEClient, historyService HistorySyncer, otpFetcher OTPFetcher, appLog *logger.FileLogger) *Handler {
-	return &Handler{orders: orderService, positions: positionService, signals: signalService, symbols: symbolService, profiles: profiles, dnse: dnseClient, history: historyService, otp: otpFetcher, logger: appLog}
+func NewHandler(orderService *service.OrderService, positionService *service.PositionService, signalService *service.SignalService, symbolService *service.SymbolCatalogService, profiles []marketdata.SymbolProfile, marketStatus MarketDataStatusProvider, dnseClient *DNSEClient, historyService HistorySyncer, otpFetcher OTPFetcher, appLog *logger.FileLogger) *Handler {
+	return &Handler{orders: orderService, positions: positionService, signals: signalService, symbols: symbolService, profiles: profiles, market: marketStatus, dnse: dnseClient, history: historyService, otp: otpFetcher, logger: appLog}
 }
 
 func (h *Handler) Routes() http.Handler {
@@ -271,16 +275,27 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		gmailOK = true // Simplified for now
 	}
 
+	marketStatus := marketdata.BridgeStatusSnapshot{}
+	if h.market != nil {
+		marketStatus = h.market.Status()
+	}
+	marketDataOK := marketStatus.PublisherStarted
+	mt5MarketClientConnected := marketStatus.ActiveClients > 0
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"connected":      true,
-		"api_ok":         apiOK,
-		"token_valid":    h.dnse.TokenValid(),
-		"mt5_connected":  h.signals.MT5Connected(30 * time.Second),
-		"market_data_ok": true, // Assume true if go bridge is running
-		"gmail_ok":       gmailOK,
-		"system_enabled": h.orders.IsEnabled(),
-		"mode":           h.signals.Mode(),
-		"pendingSignals": len(h.signals.Pending()),
+		"connected":                   true,
+		"api_ok":                      apiOK,
+		"token_valid":                 h.dnse.TokenValid(),
+		"mt5_connected":               mt5MarketClientConnected,
+		"mt5_signal_connected":        h.signals.MT5Connected(30 * time.Second),
+		"market_data_ok":              marketDataOK,
+		"market_data_active_clients":  marketStatus.ActiveClients,
+		"market_data_last_connected":  marketStatus.LastClientConnectedAt,
+		"market_data_last_disconnect": marketStatus.LastClientDisconnectedAt,
+		"gmail_ok":                    gmailOK,
+		"system_enabled":              h.orders.IsEnabled(),
+		"mode":                        h.signals.Mode(),
+		"pendingSignals":              len(h.signals.Pending()),
 	})
 }
 
@@ -338,10 +353,10 @@ func (h *Handler) orderByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/order/")
-	
+
 	var order service.OrderStatusResponse
 	var err error
-	
+
 	if strings.HasPrefix(path, "client/") {
 		clientOrderID := strings.TrimPrefix(path, "client/")
 		if clientOrderID == "" || strings.Contains(clientOrderID, "/") {
@@ -660,11 +675,11 @@ func (h *Handler) historySync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		FirstTime int64 `json:"firstTime"`
-		LastTime  int64 `json:"lastTime"`
-		Symbol    string `json:"symbol"`
+		FirstTime  int64  `json:"firstTime"`
+		LastTime   int64  `json:"lastTime"`
+		Symbol     string `json:"symbol"`
 		MarketType string `json:"marketType"`
-		Resolution int `json:"resolution"`
+		Resolution int    `json:"resolution"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json body")
@@ -674,9 +689,9 @@ func (h *Handler) historySync(w http.ResponseWriter, r *http.Request) {
 		SyncWithOptions(ctx context.Context, opt marketdata.SyncOptions) (any, error)
 	}); ok {
 		result, err := svc.SyncWithOptions(r.Context(), marketdata.SyncOptions{
-			FirstTime: req.FirstTime,
-			LastTime: req.LastTime,
-			Symbol: req.Symbol,
+			FirstTime:  req.FirstTime,
+			LastTime:   req.LastTime,
+			Symbol:     req.Symbol,
 			MarketType: req.MarketType,
 			Resolution: req.Resolution,
 		})
@@ -701,7 +716,7 @@ func (h *Handler) historyFull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		LookbackDays int `json:"lookbackDays"`
+		LookbackDays int    `json:"lookbackDays"`
 		Symbol       string `json:"symbol"`
 		MarketType   string `json:"marketType"`
 		Resolution   int    `json:"resolution"`
@@ -714,11 +729,11 @@ func (h *Handler) historyFull(w http.ResponseWriter, r *http.Request) {
 		SyncWithOptions(ctx context.Context, opt marketdata.SyncOptions) (any, error)
 	}); ok {
 		result, err := svc.SyncWithOptions(r.Context(), marketdata.SyncOptions{
-			ForceFull: true,
+			ForceFull:    true,
 			LookbackDays: req.LookbackDays,
-			Symbol: req.Symbol,
-			MarketType: req.MarketType,
-			Resolution: req.Resolution,
+			Symbol:       req.Symbol,
+			MarketType:   req.MarketType,
+			Resolution:   req.Resolution,
 		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -862,21 +877,25 @@ func (h *Handler) settingsAPI(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
-		
+
 		cfg, err := config.Load("config/config.yaml")
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		
-		if req.APIKey != "" { cfg.DNSE.APIKey = req.APIKey }
-		if req.APISecret != "" { 
-			cfg.DNSE.APISecret = req.APISecret 
+
+		if req.APIKey != "" {
+			cfg.DNSE.APIKey = req.APIKey
+		}
+		if req.APISecret != "" {
+			cfg.DNSE.APISecret = req.APISecret
 			cfg.DNSE.SecretKey = req.APISecret
 		}
-		if req.AccountNo != "" { cfg.DNSE.AccountNo = req.AccountNo }
+		if req.AccountNo != "" {
+			cfg.DNSE.AccountNo = req.AccountNo
+		}
 		cfg.DNSE.Mock = req.Mock
-		
+
 		if err := cfg.Save("config/config.yaml"); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to save config")
 			return
@@ -888,15 +907,22 @@ func (h *Handler) settingsAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) logsRawAPI(w http.ResponseWriter, r *http.Request) {
-	// Read last bytes of the log file for UI display
-	// Just return the whole file if small, or error out. 
-	// For simplicity, we just dump it here.
-	data, err := os.ReadFile("logs/app.jsonl") // Will need "os" package if not imported.
-	if err != nil {
-		http.Error(w, "Failed to read logs: " + err.Error(), http.StatusInternalServerError)
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	w.Header().Set("Content-Type", "text/plain")
+
+	if h.logger == nil {
+		http.Error(w, "Logger is not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	data, err := h.logger.ReadTail(128 * 1024)
+	if err != nil {
+		http.Error(w, "Failed to read logs: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write(data)
 }
 
@@ -907,31 +933,31 @@ func (h *Handler) setupInstallAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	folders, err := setup.DetectMT5Folders()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to detect MT5: " + err.Error())
+		writeError(w, http.StatusInternalServerError, "Failed to detect MT5: "+err.Error())
 		return
 	}
 	if len(folders) == 0 {
 		writeJSON(w, http.StatusOK, map[string]any{"success": false, "message": "No MetaTrader 5 folders detected at standard paths."})
 		return
 	}
-	
+
 	// Just install into the first detected folder for MVP
 	logs, err := setup.InstallFiles(folders[0].Path, h.logger)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"success": false, "message": "Failed to install: " + err.Error(), "logs": logs})
 		return
 	}
-	
+
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "Successfully copied files.", "logs": logs})
 }
 
 func (h *Handler) supportExport(w http.ResponseWriter, r *http.Request) {
 	data, err := setup.ExportSupportPackage("config/config.yaml", "logs/app.jsonl")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to create support package: " + err.Error())
+		writeError(w, http.StatusInternalServerError, "Failed to create support package: "+err.Error())
 		return
 	}
-	
+
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", "attachment; filename=\"support_package.zip\"")
 	w.Write(data)

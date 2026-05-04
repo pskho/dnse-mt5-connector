@@ -5,6 +5,8 @@ dist/
 bridge.pid
 bridge_err.txt
 bridge_out.txt
+.gocache/
+.gomodcache/
 config/config.yaml
 config/credentials.json
 config/token.json

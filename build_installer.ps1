@@ -31,6 +31,9 @@ $installerPath = Join-Path $bundleRoot $InstallerName
 $bootstrapSource = Join-Path $root "installer_bootstrap.cs"
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "package_trial.ps1") -OutputRoot $OutputRoot -PackageName $PackageName
+if ($LASTEXITCODE -ne 0) {
+    throw "Khong the tao goi trial moi. Package build that bai."
+}
 
 if (-not (Test-Path $packageZip)) {
     throw "Package zip not found: $packageZip"
@@ -46,6 +49,14 @@ New-Item -ItemType Directory -Path $stageRoot | Out-Null
 
 $resourceZip = Join-Path $stageRoot "payload.zip"
 Copy-Item $packageZip $resourceZip -Force
+
+if (Test-Path $installerPath) {
+    try {
+        Remove-Item $installerPath -Force
+    } catch {
+        throw "Khong the ghi de $installerPath. Hay dong file installer dang mo, hoac build voi -InstallerName ten-khac.exe"
+    }
+}
 
 $csc = Find-CSharpCompiler
 
