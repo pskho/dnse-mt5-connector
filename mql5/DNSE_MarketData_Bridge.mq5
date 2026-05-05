@@ -3,7 +3,7 @@
 //| Updates custom symbol VN30F1M_DNSE from DNSEBridge.dll           |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.11"
+#property version   "1.14"
 
 struct MqlRateLite {
    long     time;
@@ -15,15 +15,15 @@ struct MqlRateLite {
 };
 
 #import "DNSEBridge.dll"
-bool ConnectBridge(string endpoint);
-bool IsConnected();
-bool IsHistoryReady();
-bool GetLatestTick(double &bid, double &ask, double &last, long &volume, long &timestamp_ms);
-void DisconnectBridge();
-int GetHistoricalRates(MqlRateLite &buffer[], int max_count);
-int GetHistoricalRatesCount();
-int GetHistoricalRatesRange(int offset, MqlRateLite &buffer[], int max_count);
-void ClearHistoricalRates();
+bool ConnectBridge(string endpoint, string symbol);
+bool IsConnected(string symbol);
+bool IsHistoryReady(string symbol);
+bool GetLatestTick(string symbol, double &bid, double &ask, double &last, long &volume, long &timestamp_ms);
+void DisconnectBridge(string symbol);
+int GetHistoricalRates(string symbol, MqlRateLite &buffer[], int max_count);
+int GetHistoricalRatesCount(string symbol);
+int GetHistoricalRatesRange(string symbol, int offset, MqlRateLite &buffer[], int max_count);
+void ClearHistoricalRates(string symbol);
 #import
 
 input string InpEndpoint      = "127.0.0.1:9090";
@@ -38,6 +38,7 @@ input int    InpAutoRecentHistoryDays = 0;   // 0=manual only, 1=today, 7=last w
 input int    InpAutoRecentSyncDelaySec = 15; // wait for realtime before any history backfill
 input bool   InpEnableSignalBridge = false;
 
+string   g_instance_lock_name = "DNSE_MT5_BRIDGE_MASTER_LOCK";
 long     g_last_timestamp_ms = 0;
 double   g_last_bid          = 0.0;
 double   g_last_ask          = 0.0;
@@ -51,6 +52,22 @@ bool     g_recent_history_done = false;
 datetime g_recent_history_not_before = 0;
 datetime g_recent_history_retry_after = 0;
 datetime g_last_realtime_log = 0;
+
+string   g_symbols[];
+string   g_custom_symbols[];
+string   g_layout_symbols[];
+string   g_layout_groups[];
+string   g_layout_descriptions[];
+int      g_layout_digits[];
+double   g_layout_points[];
+long     g_last_timestamp_by_symbol[];
+double   g_last_bid_by_symbol[];
+double   g_last_ask_by_symbol[];
+double   g_last_last_by_symbol[];
+long     g_last_volume_by_symbol[];
+bool     g_history_imported_by_symbol[];
+datetime g_last_realtime_log_by_symbol[];
+datetime g_last_reconnect_by_symbol[];
 
 struct PendingSignal {
    string id;
@@ -171,7 +188,10 @@ void CheckForSignal()
 
 bool EnsureCustomSymbol()
 {
-   if(!SymbolSelect(InpCustomSymbol, true) && !CustomSymbolCreate(InpCustomSymbol, "DNSE"))
+   string groupPath = LookupGroupPath(InpSourceSymbol);
+   if(groupPath == "")
+      groupPath = "DNSE";
+   if(!SymbolSelect(InpCustomSymbol, true) && !CustomSymbolCreate(InpCustomSymbol, groupPath))
    {
       int err = GetLastError();
       PrintFormat("DNSE bridge: cannot create custom symbol %s, error=%d", InpCustomSymbol, err);
@@ -179,11 +199,238 @@ bool EnsureCustomSymbol()
       return false;
    }
 
-   CustomSymbolSetInteger(InpCustomSymbol, SYMBOL_DIGITS, 1);
-   CustomSymbolSetDouble(InpCustomSymbol, SYMBOL_POINT, 0.1);
-   CustomSymbolSetString(InpCustomSymbol, SYMBOL_DESCRIPTION, "DNSE realtime " + InpSourceSymbol);
+   CustomSymbolSetInteger(InpCustomSymbol, SYMBOL_DIGITS, LookupDigits(InpSourceSymbol));
+   CustomSymbolSetDouble(InpCustomSymbol, SYMBOL_POINT, LookupPoint(InpSourceSymbol));
+   CustomSymbolSetString(InpCustomSymbol, SYMBOL_DESCRIPTION, LookupDescription(InpSourceSymbol));
    SymbolSelect(InpCustomSymbol, true);
    return true;
+}
+
+void EnsureNamedCustomSymbol(string sourceSymbol)
+{
+   sourceSymbol = NormalizeSymbolName(sourceSymbol);
+   string customSymbol = sourceSymbol + "_DNSE";
+   string groupPath = LookupGroupPath(sourceSymbol);
+   if(groupPath == "")
+      groupPath = "DNSE";
+   if(!SymbolSelect(customSymbol, true) && !CustomSymbolCreate(customSymbol, groupPath))
+      return;
+   CustomSymbolSetInteger(customSymbol, SYMBOL_DIGITS, LookupDigits(sourceSymbol));
+   CustomSymbolSetDouble(customSymbol, SYMBOL_POINT, LookupPoint(sourceSymbol));
+   CustomSymbolSetString(customSymbol, SYMBOL_DESCRIPTION, LookupDescription(sourceSymbol));
+   SymbolSelect(customSymbol, true);
+}
+
+string NormalizeSymbolName(string value)
+{
+   StringTrimLeft(value);
+   StringTrimRight(value);
+   StringToUpper(value);
+   if(StringFind(value, "VN100F") == 0)
+      value = "V100F" + StringSubstr(value, 6);
+   return value;
+}
+
+int FindTrackedSymbolIndex(string symbol)
+{
+   symbol = NormalizeSymbolName(symbol);
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+   {
+      if(g_symbols[i] == symbol)
+         return i;
+   }
+   return -1;
+}
+
+void AddTrackedSymbol(string sourceSymbol)
+{
+   sourceSymbol = NormalizeSymbolName(sourceSymbol);
+   if(sourceSymbol == "")
+      return;
+   if(FindTrackedSymbolIndex(sourceSymbol) >= 0)
+      return;
+
+   int idx = ArraySize(g_symbols);
+   ArrayResize(g_symbols, idx + 1);
+   ArrayResize(g_custom_symbols, idx + 1);
+   ArrayResize(g_last_timestamp_by_symbol, idx + 1);
+   ArrayResize(g_last_bid_by_symbol, idx + 1);
+   ArrayResize(g_last_ask_by_symbol, idx + 1);
+   ArrayResize(g_last_last_by_symbol, idx + 1);
+   ArrayResize(g_last_volume_by_symbol, idx + 1);
+   ArrayResize(g_history_imported_by_symbol, idx + 1);
+   ArrayResize(g_last_realtime_log_by_symbol, idx + 1);
+   ArrayResize(g_last_reconnect_by_symbol, idx + 1);
+
+   g_symbols[idx] = sourceSymbol;
+   g_custom_symbols[idx] = sourceSymbol + "_DNSE";
+   g_last_timestamp_by_symbol[idx] = 0;
+   g_last_bid_by_symbol[idx] = 0.0;
+   g_last_ask_by_symbol[idx] = 0.0;
+   g_last_last_by_symbol[idx] = 0.0;
+   g_last_volume_by_symbol[idx] = 0;
+   g_history_imported_by_symbol[idx] = false;
+   g_last_realtime_log_by_symbol[idx] = 0;
+   g_last_reconnect_by_symbol[idx] = 0;
+}
+
+int FindLayoutIndex(string symbol)
+{
+   symbol = NormalizeSymbolName(symbol);
+   for(int i = 0; i < ArraySize(g_layout_symbols); i++)
+   {
+      if(g_layout_symbols[i] == symbol)
+         return i;
+   }
+   return -1;
+}
+
+string LookupGroupPath(string symbol)
+{
+   int idx = FindLayoutIndex(symbol);
+   if(idx >= 0 && idx < ArraySize(g_layout_groups) && g_layout_groups[idx] != "")
+      return g_layout_groups[idx];
+   return "DNSE";
+}
+
+string LookupDescription(string symbol)
+{
+   symbol = NormalizeSymbolName(symbol);
+   int idx = FindLayoutIndex(symbol);
+   if(idx >= 0 && idx < ArraySize(g_layout_descriptions) && g_layout_descriptions[idx] != "")
+      return g_layout_descriptions[idx];
+   return "DNSE realtime " + symbol;
+}
+
+int LookupDigits(string symbol)
+{
+   int idx = FindLayoutIndex(symbol);
+   if(idx >= 0 && idx < ArraySize(g_layout_digits) && g_layout_digits[idx] > 0)
+      return g_layout_digits[idx];
+   symbol = NormalizeSymbolName(symbol);
+   if(StringFind(symbol, "VN30F") == 0 || StringFind(symbol, "V100F") == 0)
+      return 1;
+   return 2;
+}
+
+double LookupPoint(string symbol)
+{
+   int idx = FindLayoutIndex(symbol);
+   if(idx >= 0 && idx < ArraySize(g_layout_points) && g_layout_points[idx] > 0.0)
+      return g_layout_points[idx];
+   symbol = NormalizeSymbolName(symbol);
+   if(StringFind(symbol, "VN30F") == 0 || StringFind(symbol, "V100F") == 0)
+      return 0.1;
+   return 0.01;
+}
+
+void LoadMT5Layouts()
+{
+   ArrayResize(g_layout_symbols, 0);
+   ArrayResize(g_layout_groups, 0);
+   ArrayResize(g_layout_descriptions, 0);
+   ArrayResize(g_layout_digits, 0);
+   ArrayResize(g_layout_points, 0);
+
+   string url = "http://127.0.0.1:8080/symbols/mt5-layout";
+   char data[];
+   char result[];
+   string result_headers;
+   int res = WebRequest("GET", url, "", 3000, data, result, result_headers);
+   if(res != 200)
+   {
+      PrintFormat("DNSE bridge: cannot load MT5 symbol layout. res=%d", res);
+      return;
+   }
+
+   string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+   string rows[];
+   int rowCount = StringSplit(response, '\n', rows);
+   for(int i = 0; i < rowCount; i++)
+   {
+      string row = rows[i];
+      StringTrimLeft(row);
+      StringTrimRight(row);
+      if(row == "")
+         continue;
+
+      string cols[];
+      int colCount = StringSplit(row, '\t', cols);
+      if(colCount < 3)
+         continue;
+
+      string symbol = NormalizeSymbolName(cols[0]);
+      if(symbol == "")
+         continue;
+
+      int idx = ArraySize(g_layout_symbols);
+      ArrayResize(g_layout_symbols, idx + 1);
+      ArrayResize(g_layout_groups, idx + 1);
+      ArrayResize(g_layout_descriptions, idx + 1);
+      ArrayResize(g_layout_digits, idx + 1);
+      ArrayResize(g_layout_points, idx + 1);
+      g_layout_symbols[idx] = symbol;
+      g_layout_groups[idx] = cols[1];
+      g_layout_descriptions[idx] = cols[2];
+      g_layout_digits[idx] = (colCount >= 4) ? (int)StringToInteger(cols[3]) : LookupDigits(symbol);
+      g_layout_points[idx] = (colCount >= 5) ? StringToDouble(cols[4]) : LookupPoint(symbol);
+   }
+}
+
+string GetConfiguredSymbolsSummary()
+{
+   string summary = "";
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+   {
+      if(i > 0)
+         summary += ", ";
+      summary += g_symbols[i];
+   }
+   return summary;
+}
+
+void EnsureConfiguredCustomSymbols()
+{
+   LoadMT5Layouts();
+   ArrayResize(g_symbols, 0);
+   ArrayResize(g_custom_symbols, 0);
+   ArrayResize(g_last_timestamp_by_symbol, 0);
+   ArrayResize(g_last_bid_by_symbol, 0);
+   ArrayResize(g_last_ask_by_symbol, 0);
+   ArrayResize(g_last_last_by_symbol, 0);
+   ArrayResize(g_last_volume_by_symbol, 0);
+   ArrayResize(g_history_imported_by_symbol, 0);
+   ArrayResize(g_last_realtime_log_by_symbol, 0);
+   ArrayResize(g_last_reconnect_by_symbol, 0);
+
+   AddTrackedSymbol(InpSourceSymbol);
+   string url = "http://127.0.0.1:8080/symbols/profiles";
+   char data[];
+   char result[];
+   string result_headers;
+   int res = WebRequest("GET", url, "", 3000, data, result, result_headers);
+   if(res != 200)
+      return;
+
+   string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+   int pos = 0;
+   while(true)
+   {
+      int start = StringFind(response, "\"Symbol\":\"", pos);
+      if(start < 0)
+         break;
+      start += 10;
+      int end = StringFind(response, "\"", start);
+      if(end <= start)
+         break;
+      string sourceSymbol = StringSubstr(response, start, end - start);
+      if(sourceSymbol != "")
+      {
+         AddTrackedSymbol(sourceSymbol);
+         EnsureNamedCustomSymbol(sourceSymbol);
+      }
+      pos = end + 1;
+   }
 }
 
 string SafeCharArrayToString(char &buffer[])
@@ -322,7 +569,7 @@ void UpdateRealtimeStatus(bool connected, long timestamp_ms, double last)
 void RefreshBridgeHistory()
 {
    Print("DNSE bridge: Refreshing DLL bridge to import staged history.");
-   DisconnectBridge();
+   DisconnectBridge(InpSourceSymbol);
    Sleep(300);
    g_last_reconnect = 0;
    TryConnect();
@@ -330,27 +577,34 @@ void RefreshBridgeHistory()
 
 int ImportHistoricalRates()
 {
+   long latestImportedTimeMs = 0;
+   return ImportHistoricalRatesForSymbol(InpSourceSymbol, InpCustomSymbol, latestImportedTimeMs);
+}
+
+int ImportHistoricalRatesForSymbol(string sourceSymbol, string customSymbol, long &latestImportedTimeMs)
+{
    const int chunkSize = 2000;
    const int waitMs = 60000;
    int waited = 0;
+   latestImportedTimeMs = 0;
 
    while(waited < waitMs)
    {
-      if(IsHistoryReady())
+      if(IsHistoryReady(sourceSymbol))
          break;
       Sleep(200);
       waited += 200;
    }
 
-   if(!IsHistoryReady())
+   if(!IsHistoryReady(sourceSymbol))
    {
-      Print("DNSE bridge: history stream was not marked ready before timeout, importing whatever is available.");
+      PrintFormat("DNSE bridge: history stream for %s was not marked ready before timeout, importing whatever is available.", sourceSymbol);
    }
 
-   int total = GetHistoricalRatesCount();
+   int total = GetHistoricalRatesCount(sourceSymbol);
    if(total <= 0)
    {
-      Print("DNSE bridge: no historical candles received from DLL.");
+      PrintFormat("DNSE bridge: no historical candles received from DLL for %s.", sourceSymbol);
       return 0;
    }
 
@@ -360,7 +614,7 @@ int ImportHistoricalRates()
       int want = MathMin(chunkSize, total - offset);
       MqlRateLite historyBuffer[];
       ArrayResize(historyBuffer, want);
-      int count = GetHistoricalRatesRange(offset, historyBuffer, want);
+      int count = GetHistoricalRatesRange(sourceSymbol, offset, historyBuffer, want);
       if(count <= 0)
          break;
 
@@ -369,6 +623,8 @@ int ImportHistoricalRates()
       for(int i = 0; i < count; i++)
       {
          rates[i].time = (datetime)(historyBuffer[i].time / 1000);
+         if(historyBuffer[i].time > latestImportedTimeMs)
+            latestImportedTimeMs = historyBuffer[i].time;
          rates[i].open = historyBuffer[i].open;
          rates[i].high = historyBuffer[i].high;
          rates[i].low = historyBuffer[i].low;
@@ -378,27 +634,36 @@ int ImportHistoricalRates()
          rates[i].real_volume = 0;
       }
 
-      int updated = CustomRatesUpdate(InpCustomSymbol, rates, count);
+      int updated = CustomRatesUpdate(customSymbol, rates, count);
       if(updated < 0)
       {
          int err = GetLastError();
-         PrintFormat("DNSE bridge: CustomRatesUpdate failed at offset=%d, error=%d", offset, err);
+         PrintFormat("DNSE bridge: CustomRatesUpdate failed for %s at offset=%d, error=%d", customSymbol, offset, err);
          ResetLastError();
          break;
       }
       imported += count;
    }
 
-   ClearHistoricalRates();
-   PrintFormat("DNSE bridge: Imported %d/%d historical candles into %s.", imported, total, InpCustomSymbol);
+   ClearHistoricalRates(sourceSymbol);
+   PrintFormat("DNSE bridge: Imported %d/%d historical candles into %s.", imported, total, customSymbol);
    return imported;
 }
 
 bool TryConnect()
 {
-   if(IsConnected())
+   return TryConnectSymbol(InpSourceSymbol, true);
+}
+
+bool TryConnectSymbol(string sourceSymbol, bool logPrimary)
+{
+   int idx = FindTrackedSymbolIndex(sourceSymbol);
+   if(idx < 0)
+      return false;
+
+   if(IsConnected(sourceSymbol))
    {
-      if(g_warned_disconnect)
+      if(logPrimary && g_warned_disconnect)
       {
          Print("DNSE bridge: Socket connected!");
          g_warned_disconnect = false;
@@ -407,21 +672,117 @@ bool TryConnect()
    }
 
    datetime now = TimeCurrent();
-   if(g_last_reconnect != 0 && (now - g_last_reconnect) < InpReconnectSec)
+   if(g_last_reconnect_by_symbol[idx] != 0 && (now - g_last_reconnect_by_symbol[idx]) < InpReconnectSec)
       return false;
 
-   g_last_reconnect = now;
-   PrintFormat("DNSE bridge: Calling ConnectBridge(\"%s\")", InpEndpoint);
-   bool ok = ConnectBridge(InpEndpoint);
-   if(ok)
+   g_last_reconnect_by_symbol[idx] = now;
+   if(logPrimary)
+      PrintFormat("DNSE bridge: Calling ConnectBridge(\"%s\", \"%s\")", InpEndpoint, sourceSymbol);
+   bool ok = ConnectBridge(InpEndpoint, sourceSymbol);
+   if(logPrimary)
    {
-      PrintFormat("DNSE bridge: ConnectBridge started thread for %s", InpEndpoint);
-   }
-   else
-   {
-      PrintFormat("DNSE bridge: ConnectBridge failed for %s", InpEndpoint);
+      if(ok)
+         PrintFormat("DNSE bridge: ConnectBridge started thread for %s", InpEndpoint);
+      else
+         PrintFormat("DNSE bridge: ConnectBridge failed for %s", InpEndpoint);
    }
    return ok;
+}
+
+void ProcessTrackedSymbol(int idx)
+{
+   string sourceSymbol = g_symbols[idx];
+   string customSymbol = g_custom_symbols[idx];
+
+   double bid = 0.0;
+   double ask = 0.0;
+   double last = 0.0;
+   long volume = 0;
+   long timestamp_ms = 0;
+   if(!GetLatestTick(sourceSymbol, bid, ask, last, volume, timestamp_ms))
+      return;
+   if(timestamp_ms <= 0)
+      return;
+
+   if(timestamp_ms == g_last_timestamp_by_symbol[idx] &&
+      bid == g_last_bid_by_symbol[idx] &&
+      ask == g_last_ask_by_symbol[idx] &&
+      last == g_last_last_by_symbol[idx] &&
+      volume == g_last_volume_by_symbol[idx])
+      return;
+
+   if(timestamp_ms <= g_last_timestamp_by_symbol[idx])
+      timestamp_ms = g_last_timestamp_by_symbol[idx] + 1;
+
+   MqlTick tick;
+   ZeroMemory(tick);
+   tick.time = (datetime)(timestamp_ms / 1000);
+   tick.time_msc = timestamp_ms;
+   tick.bid = bid;
+   tick.ask = ask;
+   tick.last = last;
+   tick.volume = volume;
+   tick.volume_real = (double)volume;
+   tick.flags = TICK_FLAG_BID | TICK_FLAG_ASK | TICK_FLAG_LAST | TICK_FLAG_VOLUME;
+
+   MqlTick ticks[1];
+   ticks[0] = tick;
+   int added = CustomTicksAdd(customSymbol, ticks);
+   if(added <= 0)
+   {
+      int err = GetLastError();
+      if(err == 5310)
+      {
+         PrintFormat("DNSE bridge: CustomTicksAdd skipped for %s because MT5 rejected the incoming tick order/time (error=%d).", customSymbol, err);
+         ResetLastError();
+         g_last_timestamp_by_symbol[idx] = timestamp_ms;
+         g_last_bid_by_symbol[idx] = bid;
+         g_last_ask_by_symbol[idx] = ask;
+         g_last_last_by_symbol[idx] = last;
+         g_last_volume_by_symbol[idx] = volume;
+         return;
+      }
+      PrintFormat("DNSE bridge: CustomTicksAdd failed for %s, error=%d", customSymbol, err);
+      ResetLastError();
+      return;
+   }
+
+   g_last_timestamp_by_symbol[idx] = timestamp_ms;
+   g_last_bid_by_symbol[idx] = bid;
+   g_last_ask_by_symbol[idx] = ask;
+   g_last_last_by_symbol[idx] = last;
+   g_last_volume_by_symbol[idx] = volume;
+   if(sourceSymbol == InpSourceSymbol)
+      g_first_tick_seen = true;
+
+   if(g_last_realtime_log_by_symbol[idx] == 0 || (TimeCurrent() - g_last_realtime_log_by_symbol[idx]) >= 30)
+   {
+      PrintFormat("DNSE bridge: realtime tick applied for %s. last=%.1f, bid=%.1f, ask=%.1f, time=%s", sourceSymbol, last, bid, ask, TimeToString((datetime)(timestamp_ms / 1000), TIME_DATE|TIME_SECONDS));
+      g_last_realtime_log_by_symbol[idx] = TimeCurrent();
+   }
+
+   if(sourceSymbol == InpSourceSymbol)
+   {
+      g_last_timestamp_ms = timestamp_ms;
+      g_last_bid = bid;
+      g_last_ask = ask;
+      g_last_last = last;
+      g_last_volume = volume;
+      UpdateRealtimeStatus(true, timestamp_ms, last);
+      CheckForSignal();
+   }
+
+   if(IsHistoryReady(sourceSymbol) && GetHistoricalRatesCount(sourceSymbol) > 0)
+   {
+      long latestImportedTimeMs = 0;
+      int imported = ImportHistoricalRatesForSymbol(sourceSymbol, customSymbol, latestImportedTimeMs);
+      if(imported > 0)
+      {
+         g_history_imported_by_symbol[idx] = true;
+         if(latestImportedTimeMs > g_last_timestamp_by_symbol[idx])
+            g_last_timestamp_by_symbol[idx] = latestImportedTimeMs;
+      }
+   }
 }
 
 int OnInit()
@@ -431,25 +792,38 @@ int OnInit()
       Print("DNSE bridge: DLL imports are disabled. Enable 'Allow DLL imports' in EA settings.");
       return INIT_FAILED;
    }
-   if(!EnsureCustomSymbol())
+   if(GlobalVariableCheck(g_instance_lock_name))
+   {
+      Print("DNSE bridge: Another EA instance is already running. Keep only one master EA attached to one chart. If this is a stale lock, press F3 in MT5 and delete DNSE_MT5_BRIDGE_MASTER_LOCK.");
       return INIT_FAILED;
-
-   TryConnect();
+   }
+   GlobalVariableSet(g_instance_lock_name, (double)ChartID());
+   if(!EnsureCustomSymbol())
+   {
+      Print("DNSE bridge: OnInit failed because the primary custom symbol could not be created or selected.");
+      GlobalVariableDel(g_instance_lock_name);
+      return INIT_FAILED;
+   }
+   EnsureConfiguredCustomSymbols();
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+      TryConnectSymbol(g_symbols[i], g_symbols[i] == InpSourceSymbol);
    g_first_tick_seen = false;
    g_recent_history_done = (InpAutoRecentHistoryDays <= 0);
    g_recent_history_not_before = TimeCurrent() + InpAutoRecentSyncDelaySec;
    g_recent_history_retry_after = 0;
    EventSetMillisecondTimer(MathMax(50, InpTimerMs));
-   PrintFormat("DNSE bridge v1.11: EA started, source=%s, custom symbol=%s, autoRecentHistoryDays=%d, historyTimeoutMs=%d", InpSourceSymbol, InpCustomSymbol, InpAutoRecentHistoryDays, InpHistoryTimeoutMs);
+   PrintFormat("DNSE bridge v1.14: EA started, source=%s, custom symbol=%s, trackedSymbols=%s, autoRecentHistoryDays=%d, historyTimeoutMs=%d", InpSourceSymbol, InpCustomSymbol, GetConfiguredSymbolsSummary(), InpAutoRecentHistoryDays, InpHistoryTimeoutMs);
    if(InpAutoRecentHistoryDays <= 0)
-      Print("DNSE bridge v1.11: auto history backfill is disabled; realtime is priority, older history is manual.");
+      Print("DNSE bridge v1.14: auto history backfill is disabled; realtime is priority, older history is manual.");
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
    EventKillTimer();
-   DisconnectBridge();
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+      DisconnectBridge(g_symbols[i]);
+   GlobalVariableDel(g_instance_lock_name);
    Print("DNSE bridge: EA stopped");
 }
 
@@ -457,7 +831,15 @@ void OnTimer()
 {
    PollPendingSignals();
 
-   if(!TryConnect())
+   bool primaryConnected = TryConnectSymbol(InpSourceSymbol, true);
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+   {
+      if(g_symbols[i] == InpSourceSymbol)
+         continue;
+      TryConnectSymbol(g_symbols[i], false);
+   }
+
+   if(!primaryConnected)
    {
       if(!g_warned_disconnect)
       {
@@ -468,71 +850,9 @@ void OnTimer()
       return;
    }
 
-   if(IsHistoryReady() && GetHistoricalRatesCount() > 0)
-   {
-      ImportHistoricalRates();
-   }
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+      ProcessTrackedSymbol(i);
 
-   double bid = 0.0;
-   double ask = 0.0;
-   double last = 0.0;
-   long volume = 0;
-   long timestamp_ms = 0;
-
-   if(!GetLatestTick(bid, ask, last, volume, timestamp_ms))
-   {
-      UpdateRealtimeStatus(true, g_last_timestamp_ms, g_last_last);
-      return;
-   }
-   if(timestamp_ms <= 0)
-   {
-      UpdateRealtimeStatus(true, g_last_timestamp_ms, g_last_last);
-      return;
-   }
-
-   if(timestamp_ms == g_last_timestamp_ms && bid == g_last_bid && ask == g_last_ask && last == g_last_last && volume == g_last_volume)
-   {
-      MaybeBackfillRecentHistory();
-      UpdateRealtimeStatus(true, timestamp_ms, last);
-      return;
-   }
-
-   MqlTick tick;
-   ZeroMemory(tick);
-   tick.time      = (datetime)(timestamp_ms / 1000);
-   tick.time_msc  = timestamp_ms;
-   tick.bid       = bid;
-   tick.ask       = ask;
-   tick.last      = last;
-   tick.volume    = volume;
-   tick.volume_real = (double)volume;
-   tick.flags     = TICK_FLAG_BID | TICK_FLAG_ASK | TICK_FLAG_LAST | TICK_FLAG_VOLUME;
-
-   MqlTick ticks[1];
-   ticks[0] = tick;
-   int added = CustomTicksAdd(InpCustomSymbol, ticks);
-   if(added > 0)
-   {
-      g_last_timestamp_ms = timestamp_ms;
-      g_last_bid = bid;
-      g_last_ask = ask;
-      g_last_last = last;
-      g_last_volume = volume;
-      g_first_tick_seen = true;
-      UpdateRealtimeStatus(true, timestamp_ms, last);
-      if(g_last_realtime_log == 0 || (TimeCurrent() - g_last_realtime_log) >= 30)
-      {
-         PrintFormat("DNSE bridge: realtime tick applied. last=%.1f, bid=%.1f, ask=%.1f, time=%s", last, bid, ask, TimeToString((datetime)(timestamp_ms / 1000), TIME_DATE|TIME_SECONDS));
-         g_last_realtime_log = TimeCurrent();
-      }
-      
-      CheckForSignal();
-      MaybeBackfillRecentHistory();
-   }
-   else
-   {
-      int err = GetLastError();
-      PrintFormat("DNSE bridge: CustomTicksAdd failed, error=%d", err);
-      ResetLastError();
-   }
+   MaybeBackfillRecentHistory();
+   UpdateRealtimeStatus(true, g_last_timestamp_ms, g_last_last);
 }

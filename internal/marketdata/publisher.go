@@ -1,10 +1,12 @@
 package marketdata
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,7 +68,12 @@ func (p *Publisher) handle(ctx context.Context, conn net.Conn) {
 		p.logger.Info("marketdata_client_disconnected", map[string]any{"remote": conn.RemoteAddr().String()})
 	}()
 
-	ticks, unsubscribe := p.store.SubscribeSymbol(p.symbol)
+	subscribedSymbol := p.readSubscription(conn)
+	if subscribedSymbol == "" {
+		subscribedSymbol = p.symbol
+	}
+
+	ticks, unsubscribe := p.store.SubscribeSymbol(subscribedSymbol)
 	defer unsubscribe()
 	historyUpdates, unsubscribeHistory := p.history.SubscribeChanges()
 	defer unsubscribeHistory()
@@ -80,11 +87,11 @@ func (p *Publisher) handle(ctx context.Context, conn net.Conn) {
 		return err == nil
 	}
 
-	if !p.writeHistorySnapshot(writeLine) {
+	if !p.writeHistorySnapshot(subscribedSymbol, writeLine) {
 		return
 	}
 
-	if tick, ok := p.store.Latest(p.symbol); ok && !writeLine(tick.JSONLine()) {
+	if tick, ok := p.store.Latest(subscribedSymbol); ok && !writeLine(tick.JSONLine()) {
 		return
 	}
 
@@ -92,8 +99,14 @@ func (p *Publisher) handle(ctx context.Context, conn net.Conn) {
 		select {
 		case <-ctx.Done():
 			return
-		case _, ok := <-historyUpdates:
-			if !ok || !p.writeHistorySnapshot(writeLine) {
+		case key, ok := <-historyUpdates:
+			if !ok {
+				return
+			}
+			if !strings.EqualFold(key.Symbol, subscribedSymbol) {
+				continue
+			}
+			if !p.writeHistorySnapshot(subscribedSymbol, writeLine) {
 				return
 			}
 		case tick, ok := <-ticks:
@@ -104,10 +117,40 @@ func (p *Publisher) handle(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func (p *Publisher) writeHistorySnapshot(writeLine func([]byte) bool) bool {
-	key, candles := p.history.Snapshot()
-	if p.symbol != "" && key.Symbol != "" && key.Symbol != p.symbol {
-		return true
+func (p *Publisher) readSubscription(conn net.Conn) string {
+	_ = conn.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadBytes('\n')
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil || len(line) == 0 {
+		return ""
+	}
+
+	var payload struct {
+		Type   string `json:"type"`
+		Symbol string `json:"symbol"`
+	}
+	if err := json.Unmarshal(line, &payload); err != nil {
+		return ""
+	}
+	if !strings.EqualFold(strings.TrimSpace(payload.Type), "subscribe") {
+		return ""
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(payload.Symbol))
+	if symbol != "" {
+		p.logger.Info("marketdata_client_subscribed", map[string]any{
+			"remote": conn.RemoteAddr().String(),
+			"symbol": symbol,
+		})
+	}
+	return symbol
+}
+
+func (p *Publisher) writeHistorySnapshot(symbol string, writeLine func([]byte) bool) bool {
+	key, candles, ok := p.history.SnapshotForSymbol(symbol)
+	if !ok {
+		key = HistoryKey{Symbol: symbol}
+		candles = nil
 	}
 	startLine, _ := json.Marshal(map[string]any{
 		"type":   "history_start",

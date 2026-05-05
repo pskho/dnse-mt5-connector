@@ -472,18 +472,15 @@ const indexHTML = layoutTop + `
     }
 
     function syncHistory() {
-      run(() => request('/history/sync', {
+      run(() => request('/history/today-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          firstTime: Number($('firstTime').value),
-          lastTime: Number($('lastTime').value)
-        })
+        body: JSON.stringify({})
       }));
     }
 
     function fullSyncHistory() {
-      run(() => request('/history/full', {
+      run(() => request('/history/full-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -493,14 +490,11 @@ const indexHTML = layoutTop + `
     }
 
     function backfillHistory() {
-      run(() => request('/history/backfill', {
+      run(() => request('/history/backfill-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          lookbackDays: Number($('lookbackDays').value) || 365,
-          symbol: $('symbol').value || 'VN30F1M',
-          marketType: 'DERIVATIVE',
-          resolution: 1
+          lookbackDays: Number($('lookbackDays').value) || 365
         })
       }));
     }

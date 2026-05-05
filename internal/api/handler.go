@@ -80,7 +80,11 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/history/full", h.historyFull)
 	mux.HandleFunc("/history/backfill", h.historyBackfill)
 	mux.HandleFunc("/history/today", h.historyToday)
+	mux.HandleFunc("/history/full-all", h.historyFullAll)
+	mux.HandleFunc("/history/backfill-all", h.historyBackfillAll)
+	mux.HandleFunc("/history/today-all", h.historyTodayAll)
 	mux.HandleFunc("/otp/latest", h.getLatestOTP)
+	mux.HandleFunc("/accounts/orderable", h.orderableAccounts)
 	mux.HandleFunc("/positions", h.positionsHandler)
 	mux.HandleFunc("/position/", h.positionBySymbol)
 	mux.HandleFunc("/kill-switch", h.killSwitch)
@@ -89,8 +93,12 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/loan-packages", h.loanPackages)
 	mux.HandleFunc("/ppse", h.ppse)
 	mux.HandleFunc("/symbols/derivatives", h.derivativeSymbols)
+	mux.HandleFunc("/symbols/instruments", h.instrumentSymbols)
+	mux.HandleFunc("/symbols/tickers", h.tickerSymbols)
+	mux.HandleFunc("/symbols/mt5-layout", h.mt5Layout)
 	mux.HandleFunc("/symbols/profiles", h.symbolProfiles)
 	mux.HandleFunc("/registration/trading-token", h.registrationTradingToken)
+	mux.HandleFunc("/registration/trading-token/refresh", h.refreshTradingToken)
 	mux.HandleFunc("/registration/send-email-otp", h.sendEmailOTP)
 
 	// UI Routes
@@ -152,6 +160,19 @@ func (h *Handler) order(w http.ResponseWriter, r *http.Request) {
 		h.signals.MarkMT5Activity()
 	}
 
+	if len(req.AccountNos) > 0 {
+		responses, err := h.orders.PlaceOrders(r.Context(), req)
+		status := http.StatusOK
+		if err != nil {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, map[string]any{
+			"success": err == nil,
+			"orders":  responses,
+			"error":   errorString(err),
+		})
+		return
+	}
 	resp, err := h.orders.PlaceOrder(r.Context(), req)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Success: false, Error: err.Error()})
@@ -286,12 +307,14 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"connected":                   true,
 		"api_ok":                      apiOK,
 		"token_valid":                 h.dnse.TokenValid(),
+		"trading_token":               h.dnse.TradingTokenStatus(),
 		"mt5_connected":               mt5MarketClientConnected,
 		"mt5_signal_connected":        h.signals.MT5Connected(30 * time.Second),
 		"market_data_ok":              marketDataOK,
 		"market_data_active_clients":  marketStatus.ActiveClients,
 		"market_data_last_connected":  marketStatus.LastClientConnectedAt,
 		"market_data_last_disconnect": marketStatus.LastClientDisconnectedAt,
+		"market_data_symbols":         marketStatus.Symbols,
 		"gmail_ok":                    gmailOK,
 		"system_enabled":              h.orders.IsEnabled(),
 		"mode":                        h.signals.Mode(),
@@ -327,6 +350,19 @@ func (h *Handler) account(w http.ResponseWriter, r *http.Request) {
 	}
 
 	accounts, err := h.orders.Accounts(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": accounts})
+}
+
+func (h *Handler) orderableAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	accounts, err := h.orders.OrderableAccounts(r.Context())
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -531,6 +567,139 @@ func (h *Handler) derivativeSymbols(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) instrumentSymbols(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.symbols == nil {
+		writeError(w, http.StatusServiceUnavailable, "symbol catalog service is not configured")
+		return
+	}
+
+	exchanges := strings.Split(strings.TrimSpace(r.URL.Query().Get("exchange")), ",")
+	if len(exchanges) == 1 && strings.TrimSpace(exchanges[0]) == "" {
+		exchanges = []string{"HOSE", "HNX", "UPCOM"}
+	}
+
+	type instrumentFetcher interface {
+		GetInstrumentSymbols(ctx context.Context, exchanges []string) ([]service.InstrumentSymbolInfo, error)
+	}
+	fetcher, ok := any(h.symbols).(instrumentFetcher)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "instrument catalog is not supported")
+		return
+	}
+
+	items, err := fetcher.GetInstrumentSymbols(r.Context(), exchanges)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total":     len(items),
+		"exchanges": exchanges,
+		"data":      items,
+	})
+}
+
+func (h *Handler) tickerSymbols(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.symbols == nil {
+		writeError(w, http.StatusServiceUnavailable, "symbol catalog service is not configured")
+		return
+	}
+
+	type tickerFetcher interface {
+		GetTickerMetadata(ctx context.Context, forceRefresh bool) ([]storage.TickerMetadataRecord, error)
+	}
+	fetcher, ok := any(h.symbols).(tickerFetcher)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "ticker catalog is not supported")
+		return
+	}
+
+	forceRefresh := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("refresh")), "1") ||
+		strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("refresh")), "true")
+	items, err := fetcher.GetTickerMetadata(r.Context(), forceRefresh)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total":   len(items),
+		"refresh": forceRefresh,
+		"data":    items,
+	})
+}
+
+func (h *Handler) mt5Layout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.symbols == nil {
+		writeError(w, http.StatusServiceUnavailable, "symbol catalog service is not configured")
+		return
+	}
+
+	type layoutFetcher interface {
+		GetMT5Layouts(ctx context.Context, symbols []string) ([]service.MT5SymbolLayout, error)
+	}
+	fetcher, ok := any(h.symbols).(layoutFetcher)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "mt5 layout is not supported")
+		return
+	}
+
+	symbols := make([]string, 0, len(h.profiles))
+	seen := make(map[string]struct{}, len(h.profiles))
+	for _, profile := range h.profiles {
+		symbol := strings.ToUpper(strings.TrimSpace(profile.Symbol))
+		if symbol == "" {
+			continue
+		}
+		if _, exists := seen[symbol]; exists {
+			continue
+		}
+		seen[symbol] = struct{}{}
+		symbols = append(symbols, symbol)
+	}
+
+	items, err := fetcher.GetMT5Layouts(r.Context(), symbols)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("format")), "json") {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"total": len(items),
+			"data":  items,
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	var builder strings.Builder
+	for _, item := range items {
+		builder.WriteString(item.Symbol)
+		builder.WriteByte('\t')
+		builder.WriteString(item.GroupPath)
+		builder.WriteByte('\t')
+		builder.WriteString(strings.ReplaceAll(item.Description, "\t", " "))
+		builder.WriteByte('\t')
+		builder.WriteString(fmt.Sprintf("%d", item.Digits))
+		builder.WriteByte('\t')
+		builder.WriteString(item.Point)
+		builder.WriteByte('\n')
+	}
+	_, _ = io.WriteString(w, builder.String())
+}
+
 func (h *Handler) symbolProfiles(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -570,6 +739,22 @@ func (h *Handler) registrationTradingToken(w http.ResponseWriter, r *http.Reques
 		"tradingToken": token,
 		"expiresAt":    expiresAt.UTC().Format(time.RFC3339),
 	})
+}
+
+func (h *Handler) refreshTradingToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.dnse == nil {
+		writeError(w, http.StatusServiceUnavailable, "dnse client is not configured")
+		return
+	}
+	if err := h.dnse.EnsureTradingToken(r.Context(), 8*time.Hour); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, h.dnse.TradingTokenStatus())
 }
 
 func (h *Handler) sendEmailOTP(w http.ResponseWriter, r *http.Request) {
@@ -667,6 +852,13 @@ func parsePositiveFloat(value string) (float64, error) {
 		return 0, errors.New("not positive")
 	}
 	return n, nil
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func (h *Handler) historySync(w http.ResponseWriter, r *http.Request) {
@@ -819,6 +1011,158 @@ func (h *Handler) historyToday(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusServiceUnavailable, "today sync is not supported")
 }
 
+func (h *Handler) historyFullAll(w http.ResponseWriter, r *http.Request) {
+	h.historySyncAll(w, r, "full")
+}
+
+func (h *Handler) historyBackfillAll(w http.ResponseWriter, r *http.Request) {
+	h.historySyncAll(w, r, "backfill")
+}
+
+func (h *Handler) historyTodayAll(w http.ResponseWriter, r *http.Request) {
+	h.historySyncAll(w, r, "today")
+}
+
+func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode string) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req struct {
+		LookbackDays int `json:"lookbackDays"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+
+	svc, ok := h.history.(interface {
+		SyncWithOptions(ctx context.Context, opt marketdata.SyncOptions) (any, error)
+	})
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "history multi-symbol sync is not supported")
+		return
+	}
+	type historySnapshotCloner interface {
+		CloneSnapshot(sourceSymbol, targetSymbol, marketType string, resolution int) bool
+	}
+	cloner, _ := h.history.(historySnapshotCloner)
+	type tickerLookup interface {
+		GetTickerMetadataBySymbol(ctx context.Context, symbol string) (storage.TickerMetadataRecord, error)
+	}
+	var tickerSvc tickerLookup
+	if h.symbols != nil {
+		tickerSvc, _ = any(h.symbols).(tickerLookup)
+	}
+
+	type item struct {
+		Symbol     string `json:"symbol"`
+		MarketType string `json:"marketType"`
+		Resolution int    `json:"resolution"`
+		Success    bool   `json:"success"`
+		Message    string `json:"message"`
+	}
+
+	lookbackDays := req.LookbackDays
+	if lookbackDays <= 0 {
+		lookbackDays = 365
+	}
+
+	results := make([]item, 0, len(h.profiles))
+	successCount := 0
+	type syncJob struct {
+		fetchSymbol string
+		profile     marketdata.SymbolProfile
+		members     []marketdata.SymbolProfile
+	}
+	jobsByCanonical := make(map[string]*syncJob)
+	order := make([]string, 0, len(h.profiles))
+	for _, profile := range h.profiles {
+		canonical := strings.ToUpper(strings.TrimSpace(profile.Symbol))
+		if tickerSvc != nil {
+			if record, err := tickerSvc.GetTickerMetadataBySymbol(r.Context(), profile.Symbol); err == nil {
+				if feed := strings.ToUpper(strings.TrimSpace(record.FeedSymbol)); feed != "" {
+					canonical = feed
+				}
+			}
+		}
+		job := jobsByCanonical[canonical]
+		if job == nil {
+			job = &syncJob{
+				fetchSymbol: canonical,
+				profile: marketdata.SymbolProfile{
+					Symbol:               canonical,
+					AssetClass:           profile.AssetClass,
+					MarketType:           profile.MarketType,
+					Channels:             profile.Channels,
+					Resolution:           profile.Resolution,
+					BoardID:              profile.BoardID,
+					SupportsRESTFallback: profile.SupportsRESTFallback,
+				},
+			}
+			jobsByCanonical[canonical] = job
+			order = append(order, canonical)
+		}
+		job.members = append(job.members, profile)
+	}
+
+	for _, canonical := range order {
+		job := jobsByCanonical[canonical]
+		opt := marketdata.SyncOptions{
+			Symbol:     job.profile.Symbol,
+			MarketType: job.profile.MarketType,
+			Resolution: job.profile.Resolution,
+		}
+		switch mode {
+		case "full":
+			opt.ForceFull = true
+			opt.LookbackDays = lookbackDays
+		case "backfill":
+			opt.ForceFull = true
+			opt.BeforeToday = true
+			opt.LookbackDays = lookbackDays
+		case "today":
+			opt.TodayOnly = true
+		}
+
+		res, err := svc.SyncWithOptions(r.Context(), opt)
+		baseMessage := "completed"
+		if payload, ok := res.(marketdata.SyncResult); ok && payload.Message != "" {
+			baseMessage = payload.Message
+		}
+		for _, member := range job.members {
+			entry := item{
+				Symbol:     member.Symbol,
+				MarketType: member.MarketType,
+				Resolution: member.Resolution,
+				Success:    err == nil,
+			}
+			if err != nil {
+				entry.Message = err.Error()
+			} else {
+				if !strings.EqualFold(member.Symbol, job.fetchSymbol) && cloner != nil {
+					cloner.CloneSnapshot(job.fetchSymbol, member.Symbol, member.MarketType, member.Resolution)
+				}
+				entry.Message = baseMessage
+				if !strings.EqualFold(member.Symbol, job.fetchSymbol) {
+					entry.Message = "Reused history from " + job.fetchSymbol
+				}
+				successCount++
+			}
+			results = append(results, entry)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":      successCount == len(results),
+		"mode":         mode,
+		"totalSymbols": len(results),
+		"successCount": successCount,
+		"results":      results,
+	})
+}
+
 func (h *Handler) getLatestOTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -868,10 +1212,12 @@ func (h *Handler) settingsAPI(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodPost {
 		var req struct {
-			APIKey    string `json:"apiKey"`
-			APISecret string `json:"apiSecret"`
-			AccountNo string `json:"accountNo"`
-			Mock      bool   `json:"mock"`
+			APIKey        string   `json:"apiKey"`
+			APISecret     string   `json:"apiSecret"`
+			AccountNo     string   `json:"accountNo"`
+			Mock          bool     `json:"mock"`
+			Symbols       []string `json:"symbols"`
+			PrimarySymbol string   `json:"primarySymbol"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid json")
@@ -895,6 +1241,22 @@ func (h *Handler) settingsAPI(w http.ResponseWriter, r *http.Request) {
 			cfg.DNSE.AccountNo = req.AccountNo
 		}
 		cfg.DNSE.Mock = req.Mock
+		if len(req.Symbols) > 0 {
+			cfg.MarketData.Symbols = h.canonicalizeSymbols(r.Context(), req.Symbols)
+		}
+		if req.PrimarySymbol != "" {
+			primary := req.PrimarySymbol
+			canonicalPrimary := h.canonicalizeSymbols(r.Context(), []string{primary})
+			if len(canonicalPrimary) > 0 {
+				primary = canonicalPrimary[0]
+			}
+			cfg.MarketData.Symbol = primary
+			cfg.History.Symbol = primary
+			if profile, ok := marketdata.InferSymbolProfile(primary, cfg.MarketData.Channels); ok {
+				cfg.History.MarketType = profile.MarketType
+				cfg.History.Resolution = profile.Resolution
+			}
+		}
 
 		if err := cfg.Save("config/config.yaml"); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to save config")
@@ -904,6 +1266,28 @@ func (h *Handler) settingsAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+}
+
+func (h *Handler) canonicalizeSymbols(ctx context.Context, symbols []string) []string {
+	_ = ctx
+	out := make([]string, 0, len(symbols))
+	seen := make(map[string]struct{}, len(symbols))
+
+	for _, symbol := range symbols {
+		symbol = strings.ToUpper(strings.TrimSpace(symbol))
+		if strings.HasPrefix(symbol, "VN100F") {
+			symbol = "V100F" + strings.TrimPrefix(symbol, "VN100F")
+		}
+		if symbol == "" {
+			continue
+		}
+		if _, ok := seen[symbol]; ok {
+			continue
+		}
+		seen[symbol] = struct{}{}
+		out = append(out, symbol)
+	}
+	return out
 }
 
 func (h *Handler) logsRawAPI(w http.ResponseWriter, r *http.Request) {

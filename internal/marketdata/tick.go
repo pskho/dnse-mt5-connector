@@ -13,6 +13,7 @@ type Tick struct {
 	Last        float64 `json:"last"`
 	Volume      int64   `json:"volume"`
 	TimestampMS int64   `json:"timestamp_ms"`
+	Source      string  `json:"source,omitempty"`
 }
 
 type Store struct {
@@ -38,6 +39,33 @@ func (s *Store) Update(tick Tick) {
 		return
 	}
 	s.mu.Lock()
+	if previous, ok := s.latestBySymbol[tick.Symbol]; ok {
+		if tick.Bid <= 0 {
+			tick.Bid = previous.Bid
+		}
+		if tick.Ask <= 0 {
+			tick.Ask = previous.Ask
+		}
+		if tick.Last <= 0 {
+			tick.Last = previous.Last
+		}
+		if tick.Volume <= 0 {
+			tick.Volume = previous.Volume
+		}
+		if tick.TimestampMS <= 0 {
+			tick.TimestampMS = previous.TimestampMS
+		}
+	}
+	if tick.Last <= 0 {
+		s.mu.Unlock()
+		return
+	}
+	if tick.Bid <= 0 {
+		tick.Bid = tick.Last
+	}
+	if tick.Ask <= 0 {
+		tick.Ask = tick.Last
+	}
 	s.latest = tick
 	s.hasLatest = true
 	s.latestBySymbol[tick.Symbol] = tick

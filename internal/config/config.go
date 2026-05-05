@@ -8,6 +8,24 @@ import (
 	"strings"
 )
 
+var defaultTrackedSymbols = []string{
+	"VN30F1M",
+	"VN30F2M",
+	"VN30F1Q",
+	"VN30F2Q",
+	"V100F1M",
+	"V100F2M",
+	"V100F1Q",
+	"V100F2Q",
+	"VNINDEX",
+	"VN30",
+	"HNX",
+	"HNX30",
+	"VN100",
+	"UPCOM",
+	"VNXALLSHARE",
+}
+
 type Config struct {
 	Host         string           `json:"host"`
 	Port         int              `json:"port"`
@@ -15,6 +33,7 @@ type Config struct {
 	LogFile      string           `json:"logFile"`
 	Risk         RiskConfig       `json:"risk"`
 	DNSE         DNSEConfig       `json:"dnse"`
+	Entrade      EntradeConfig    `json:"entrade"`
 	MarketData   MarketDataConfig `json:"marketData"`
 	History      HistoryConfig    `json:"history"`
 	GmailOTP     GmailOTPConfig   `json:"gmailOTP"`
@@ -55,6 +74,20 @@ type DNSEConfig struct {
 	Mock         bool   `json:"mock"`
 }
 
+type EntradeConfig struct {
+	Enabled      bool   `json:"enabled"`
+	Environment  string `json:"environment"`
+	AuthURL      string `json:"authUrl"`
+	BaseURL      string `json:"baseUrl"`
+	PaperBaseURL string `json:"paperBaseUrl"`
+	Username     string `json:"username"`
+	Password     string `json:"password"`
+	InvestorID   string `json:"investorId"`
+	AccountNo    string `json:"accountNo"`
+	TradingToken string `json:"tradingToken"`
+	Mock         bool   `json:"mock"`
+}
+
 type MarketDataConfig struct {
 	Enabled          bool     `json:"enabled"`
 	Symbol           string   `json:"symbol"`
@@ -81,13 +114,19 @@ func Load(path string) (Config, error) {
 			BaseURL: "https://openapi.dnse.com.vn",
 			Mock:    true,
 		},
+		Entrade: EntradeConfig{
+			Environment:  "paper",
+			AuthURL:      "https://services.entrade.com.vn/entrade-api/v2/auth",
+			BaseURL:      "https://services.entrade.com.vn/entrade-api",
+			PaperBaseURL: "https://services.entrade.com.vn/papertrade-entrade-api",
+		},
 		MarketData: MarketDataConfig{
 			Enabled:          true,
 			Symbol:           "VN30F1M",
-			Symbols:          []string{"VN30F1M"},
+			Symbols:          append([]string(nil), defaultTrackedSymbols...),
 			BridgeAddress:    "127.0.0.1:9090",
 			WebSocketURL:     "wss://ws-openapi.dnse.com.vn/v1/stream?encoding=json",
-			Channels:         []string{"trades.json", "quotes.json"},
+			Channels:         []string{"tick.G1.json", "top_price.G1.json", "ohlc.1.json", "ohlc_closed.1.json"},
 			ReconnectSeconds: 5,
 		},
 		History: HistoryConfig{
@@ -166,6 +205,18 @@ func normalize(cfg *Config) {
 	if cfg.DNSE.SecretKey == "" {
 		cfg.DNSE.SecretKey = cfg.DNSE.APISecret
 	}
+	if cfg.Entrade.Environment == "" {
+		cfg.Entrade.Environment = "paper"
+	}
+	if cfg.Entrade.AuthURL == "" {
+		cfg.Entrade.AuthURL = "https://services.entrade.com.vn/entrade-api/v2/auth"
+	}
+	if cfg.Entrade.BaseURL == "" {
+		cfg.Entrade.BaseURL = "https://services.entrade.com.vn/entrade-api"
+	}
+	if cfg.Entrade.PaperBaseURL == "" {
+		cfg.Entrade.PaperBaseURL = "https://services.entrade.com.vn/papertrade-entrade-api"
+	}
 	if cfg.Risk.MaxQuantity <= 0 {
 		cfg.Risk.MaxQuantity = 10
 	}
@@ -179,11 +230,18 @@ func normalize(cfg *Config) {
 		cfg.MarketData.Symbol = "VN30F1M"
 	}
 	if len(cfg.MarketData.Symbols) == 0 {
-		cfg.MarketData.Symbols = []string{cfg.MarketData.Symbol}
+		if strings.TrimSpace(cfg.MarketData.Symbol) != "" {
+			cfg.MarketData.Symbols = []string{cfg.MarketData.Symbol}
+		} else {
+			cfg.MarketData.Symbols = append([]string(nil), defaultTrackedSymbols...)
+		}
 	}
 	cfg.MarketData.Symbols = normalizeSymbols(cfg.MarketData.Symbols)
 	if len(cfg.MarketData.Symbols) > 0 {
 		cfg.MarketData.Symbol = cfg.MarketData.Symbols[0]
+	} else {
+		cfg.MarketData.Symbol = "VN30F1M"
+		cfg.MarketData.Symbols = append([]string(nil), defaultTrackedSymbols...)
 	}
 	if cfg.MarketData.BridgeAddress == "" {
 		cfg.MarketData.BridgeAddress = "127.0.0.1:9090"
@@ -192,7 +250,7 @@ func normalize(cfg *Config) {
 		cfg.MarketData.WebSocketURL = "wss://ws-openapi.dnse.com.vn/v1/stream?encoding=json"
 	}
 	if len(cfg.MarketData.Channels) == 0 {
-		cfg.MarketData.Channels = []string{"trades.json", "quotes.json"}
+		cfg.MarketData.Channels = []string{"tick.G1.json", "top_price.G1.json", "ohlc.1.json", "ohlc_closed.1.json"}
 	}
 	if cfg.MarketData.ReconnectSeconds <= 0 {
 		cfg.MarketData.ReconnectSeconds = 5
@@ -280,6 +338,39 @@ func parseSimpleYAML(data []byte, cfg *Config) error {
 					return fmt.Errorf("invalid dnse.mock: %w", err)
 				}
 				cfg.DNSE.Mock = enabled
+			}
+		case "entrade":
+			switch key {
+			case "enabled":
+				enabled, err := strconv.ParseBool(value)
+				if err != nil {
+					return fmt.Errorf("invalid entrade.enabled: %w", err)
+				}
+				cfg.Entrade.Enabled = enabled
+			case "environment":
+				cfg.Entrade.Environment = value
+			case "auth_url":
+				cfg.Entrade.AuthURL = value
+			case "base_url":
+				cfg.Entrade.BaseURL = value
+			case "paper_base_url":
+				cfg.Entrade.PaperBaseURL = value
+			case "username":
+				cfg.Entrade.Username = value
+			case "password":
+				cfg.Entrade.Password = value
+			case "investor_id":
+				cfg.Entrade.InvestorID = value
+			case "account_no":
+				cfg.Entrade.AccountNo = value
+			case "trading_token":
+				cfg.Entrade.TradingToken = value
+			case "mock":
+				enabled, err := strconv.ParseBool(value)
+				if err != nil {
+					return fmt.Errorf("invalid entrade.mock: %w", err)
+				}
+				cfg.Entrade.Mock = enabled
 			}
 		case "risk":
 			n, err := strconv.Atoi(value)
@@ -442,6 +533,19 @@ dnse:
   account_no: "%s"
   mock: %v
 
+entrade:
+  enabled: %v
+  environment: "%s"
+  auth_url: "%s"
+  base_url: "%s"
+  paper_base_url: "%s"
+  username: "%s"
+  password: "%s"
+  investor_id: "%s"
+  account_no: "%s"
+  trading_token: "%s"
+  mock: %v
+
 market_data:
   enabled: %v
   symbol: "%s"
@@ -472,6 +576,8 @@ gmail_otp:
 		c.Host, c.Port, c.DatabasePath, c.LogFile,
 		c.Risk.MaxQuantity, c.Risk.MaxOpenPosition, c.Risk.DuplicateWindowSeconds,
 		c.DNSE.BaseURL, c.DNSE.APIKey, c.DNSE.APISecret, c.DNSE.AccountNo, c.DNSE.Mock,
+		c.Entrade.Enabled, c.Entrade.Environment, c.Entrade.AuthURL, c.Entrade.BaseURL, c.Entrade.PaperBaseURL,
+		c.Entrade.Username, c.Entrade.Password, c.Entrade.InvestorID, c.Entrade.AccountNo, c.Entrade.TradingToken, c.Entrade.Mock,
 		c.MarketData.Enabled, c.MarketData.Symbol, strings.Join(quoteChannels(c.MarketData.Symbols), ", "), c.MarketData.BridgeAddress, c.MarketData.WebSocketURL, strings.Join(quoteChannels(c.MarketData.Channels), ", "), c.MarketData.Mock, c.MarketData.ReconnectSeconds,
 		c.History.Enabled, c.History.Symbol, c.History.MarketType, c.History.Resolution, c.History.InitialLookbackDays, c.History.IncrementalSync, c.History.FullRebuild, c.History.MaxBatchDays,
 		c.GmailOTP.Enabled, c.GmailOTP.CredentialsFile, c.GmailOTP.TokenFile, c.GmailOTP.PollIntervalSeconds, c.GmailOTP.EmailDomainFilter,
@@ -493,6 +599,9 @@ func normalizeSymbols(symbols []string) []string {
 	seen := make(map[string]struct{})
 	for _, symbol := range symbols {
 		symbol = strings.ToUpper(strings.TrimSpace(symbol))
+		if strings.HasPrefix(symbol, "VN100F") {
+			symbol = "V100F" + strings.TrimPrefix(symbol, "VN100F")
+		}
 		if symbol == "" {
 			continue
 		}

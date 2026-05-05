@@ -15,13 +15,26 @@ dnse:
   account_no: "PASTE_ACCOUNT_NO_HERE"
   mock: false
 
+entrade:
+  enabled: false
+  environment: "paper" # paper or real
+  auth_url: "https://services.entrade.com.vn/entrade-api/v2/auth"
+  base_url: "https://services.entrade.com.vn/entrade-api"
+  paper_base_url: "https://services.entrade.com.vn/papertrade-entrade-api"
+  username: "PASTE_ENTRADE_USERNAME_HERE"
+  password: "PASTE_ENTRADE_PASSWORD_HERE"
+  investor_id: "PASTE_ENTRADE_INVESTOR_ID_HERE"
+  account_no: ""
+  trading_token: ""
+  mock: false
+
 market_data:
   enabled: true
   symbol: "VN30F1M"
-  symbols: ["VN30F1M", "VNINDEX", "VN30", "HPG"]
+  symbols: ["VN30F1M", "VN30F2M", "VN30F1Q", "VN30F2Q", "V100F1M", "V100F2M", "V100F1Q", "V100F2Q", "VNINDEX", "VN30", "HNX", "HNX30", "VN100", "UPCOM", "VNXALLSHARE"]
   bridge_address: "127.0.0.1:9090"
   websocket_url: "wss://ws-openapi.dnse.com.vn/v1/stream?encoding=json"
-  channels: ["trades.json", "quotes.json"]
+  channels: ["tick.G1.json", "top_price.G1.json", "ohlc.1.json", "ohlc_closed.1.json"]
   mock: false
   reconnect_seconds: 5
 

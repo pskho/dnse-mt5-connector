@@ -3,8 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,10 +46,33 @@ type DNSEClient struct {
 	otpType   string
 }
 
+type TradingTokenStatus struct {
+	Valid            bool      `json:"valid"`
+	ExpiresAt        time.Time `json:"expiresAt,omitempty"`
+	RemainingSeconds int64     `json:"remainingSeconds"`
+}
+
 type tradingTokenResponse struct {
 	TradingToken string `json:"tradingToken"`
 	Token        string `json:"token"`
 	ExpiresIn    int    `json:"expiresIn"`
+}
+
+type InstrumentInfo struct {
+	Symbol   string `json:"symbol"`
+	Exchange string `json:"exchange"`
+	Type     string `json:"type,omitempty"`
+}
+
+type TickerInfo struct {
+	Symbol      string `json:"symbol"`
+	FeedSymbol  string `json:"feedSymbol"`
+	Exchange    string `json:"exchange"`
+	Type        string `json:"type,omitempty"`
+	BoardID     string `json:"boardId,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	RawJSON     string `json:"rawJson,omitempty"`
 }
 
 func NewDNSEClient(cfg config.DNSEConfig, appLog *logger.FileLogger, store tokenStore) *DNSEClient {
@@ -97,6 +121,39 @@ func (c *DNSEClient) TokenValid() bool {
 	}
 	token, expiresAt := c.tokenState()
 	return token != "" && time.Now().UTC().Before(expiresAt.Add(-30*time.Second))
+}
+
+func (c *DNSEClient) TradingTokenStatus() TradingTokenStatus {
+	if c.cfg.Mock {
+		return TradingTokenStatus{Valid: true, ExpiresAt: time.Now().UTC().Add(8 * time.Hour), RemainingSeconds: int64((8 * time.Hour).Seconds())}
+	}
+	token, expiresAt := c.tokenState()
+	remaining := int64(0)
+	if !expiresAt.IsZero() {
+		remaining = int64(time.Until(expiresAt).Seconds())
+		if remaining < 0 {
+			remaining = 0
+		}
+	}
+	return TradingTokenStatus{
+		Valid:            token != "" && time.Now().UTC().Before(expiresAt.Add(-30*time.Second)),
+		ExpiresAt:        expiresAt,
+		RemainingSeconds: remaining,
+	}
+}
+
+func (c *DNSEClient) EnsureTradingToken(ctx context.Context, minValidity time.Duration) error {
+	if c.cfg.Mock {
+		return nil
+	}
+	if minValidity <= 0 {
+		minValidity = 30 * time.Second
+	}
+	token, expiresAt := c.tokenState()
+	if token != "" && time.Now().UTC().Before(expiresAt.Add(-minValidity)) {
+		return nil
+	}
+	return c.refreshToken(ctx)
 }
 
 func (c *DNSEClient) SendEmailOTP(ctx context.Context) error {
@@ -148,7 +205,7 @@ func (c *DNSEClient) GetAccounts(ctx context.Context) ([]dnsemodel.Account, erro
 	if c.cfg.Mock {
 		c.logger.Info("dnse_api_request", map[string]any{"method": http.MethodGet, "path": "/accounts", "mock": true})
 		accounts := []dnsemodel.Account{{
-			AccountNo:                defaultString(c.cfg.AccountNo, "MOCK001"),
+			AccountNo:               defaultString(c.cfg.AccountNo, "MOCK001"),
 			DerivativeAccountStatus: "ACTIVE",
 		}}
 		c.logger.Info("dnse_api_response", map[string]any{"path": "/accounts", "statusCode": 200, "mock": true})
@@ -359,6 +416,135 @@ func (c *DNSEClient) GetSecurityDefinition(ctx context.Context, symbol string) (
 	default:
 		return nil, nil
 	}
+}
+
+func (c *DNSEClient) GetInstruments(ctx context.Context, exchange string) ([]InstrumentInfo, error) {
+	exchange = strings.ToUpper(strings.TrimSpace(exchange))
+	if exchange == "" {
+		return nil, errors.New("exchange is required")
+	}
+	if c.cfg.Mock {
+		return []InstrumentInfo{
+			{Symbol: "HPG", Exchange: exchange},
+			{Symbol: "FPT", Exchange: exchange},
+			{Symbol: "SSI", Exchange: exchange},
+		}, nil
+	}
+
+	var lastErr error
+	builders := []func(page, pageSize int) string{
+		func(page, pageSize int) string {
+			return fmt.Sprintf("/instruments?exchange=%s&page=%d&pageSize=%d", url.QueryEscape(exchange), page, pageSize)
+		},
+		func(page, pageSize int) string {
+			return fmt.Sprintf("/instruments?floor=%s&page=%d&pageSize=%d", url.QueryEscape(exchange), page, pageSize)
+		},
+		func(page, pageSize int) string {
+			return fmt.Sprintf("/instruments?market=%s&page=%d&pageSize=%d", url.QueryEscape(exchange), page, pageSize)
+		},
+	}
+
+	for _, buildPath := range builders {
+		items, ok, err := c.fetchPagedInstruments(ctx, exchange, buildPath)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if ok && len(items) > 0 {
+			return mergeInstrumentDefaults(exchange, items), nil
+		}
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return mergeInstrumentDefaults(exchange, nil), nil
+}
+
+func (c *DNSEClient) GetTickers(ctx context.Context, symbol string) ([]TickerInfo, error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if c.cfg.Mock {
+		return []TickerInfo{
+			{Symbol: "VNINDEX", FeedSymbol: "VNINDEX", Exchange: "INDEX", Type: "INDEX", Name: "VNINDEX", Description: "Chỉ số của toàn bộ cổ phiếu đang niêm yết trên HSX"},
+			{Symbol: "VN30", FeedSymbol: "VN30", Exchange: "INDEX", Type: "INDEX", Name: "VN30", Description: "Chỉ số của 30 cổ phiếu có vốn hoá và thanh khoản lớn nhất trên HSX"},
+			{Symbol: "HPG", FeedSymbol: "HPG", Exchange: "HOSE", Type: "STOCK", BoardID: "G1", Name: "HPG"},
+			{Symbol: "VN30F1M", FeedSymbol: "41I1G5000", Exchange: "DERIVATIVE", Type: "DERIVATIVE", BoardID: "G1", Name: "VN30F1M"},
+		}, nil
+	}
+
+	baseURL := "https://api.dnse.com.vn/market-api/tickers?symbol=" + url.QueryEscape(symbol)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("dnse ticker api returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var raw any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, err
+	}
+	return simplifyTickers(raw), nil
+}
+
+func (c *DNSEClient) fetchPagedInstruments(ctx context.Context, exchange string, buildPath func(page, pageSize int) string) ([]InstrumentInfo, bool, error) {
+	const pageSize = 500
+
+	seen := make(map[string]InstrumentInfo)
+	var previousPageSignature string
+
+	for page := 1; page <= 20; page++ {
+		path := buildPath(page, pageSize)
+		var raw any
+		if err := c.do(ctx, http.MethodGet, path, nil, &raw, false, true); err != nil {
+			if page == 1 {
+				return nil, false, err
+			}
+			break
+		}
+
+		items := simplifyInstruments(raw, exchange)
+		if len(items) == 0 {
+			break
+		}
+
+		signature := instrumentPageSignature(items)
+		if signature != "" && signature == previousPageSignature {
+			break
+		}
+		previousPageSignature = signature
+
+		for _, item := range items {
+			seen[item.Symbol] = item
+		}
+
+		total, currentPage, currentPageSize, hasNext := extractInstrumentPagination(raw)
+		if total > 0 && len(seen) >= total {
+			break
+		}
+		if hasNext {
+			continue
+		}
+		if currentPage > 0 && currentPageSize > 0 && currentPage >= 1 && len(items) < currentPageSize {
+			break
+		}
+		if len(items) < pageSize {
+			break
+		}
+	}
+
+	out := make([]InstrumentInfo, 0, len(seen))
+	for _, item := range seen {
+		out = append(out, item)
+	}
+	return out, len(out) > 0, nil
 }
 
 func (c *DNSEClient) FetchLatestTrade(ctx context.Context, symbol, boardID string) (any, error) {
@@ -591,7 +777,7 @@ func (c *DNSEClient) fetchTradingToken(ctx context.Context, passcode, otpType st
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	c.logger.Info("dnse_token_response", map[string]any{"statusCode": resp.StatusCode, "body": string(respBody)})
+	c.logger.Info("dnse_token_response", map[string]any{"statusCode": resp.StatusCode, "body": maskTokenResponse(respBody)})
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", time.Time{}, fmt.Errorf("dnse token api returned status %d: %s", resp.StatusCode, string(respBody))
@@ -765,7 +951,7 @@ func simplifyAccounts(raw any, preferredAccountNo string) []dnsemodel.Account {
 			status = "UNKNOWN"
 		}
 		accounts = append(accounts, dnsemodel.Account{
-			AccountNo:                accountNo,
+			AccountNo:               accountNo,
 			DerivativeAccountStatus: status,
 		})
 	}
@@ -791,6 +977,263 @@ func simplifyLoanPackages(raw any) []dnsemodel.LoanPackage {
 		})
 	}
 	return packages
+}
+
+func simplifyInstruments(raw any, exchange string) []InstrumentInfo {
+	items := make([]InstrumentInfo, 0, 1024)
+	appendMap := func(item map[string]any) {
+		symbol := strings.ToUpper(strings.TrimSpace(firstString(item, "symbol", "secSymbol", "ticker", "code")))
+		if symbol == "" {
+			return
+		}
+		instrumentExchange := strings.ToUpper(strings.TrimSpace(firstString(item, "exchange", "floor", "market")))
+		if instrumentExchange == "" {
+			instrumentExchange = exchange
+		}
+		items = append(items, InstrumentInfo{
+			Symbol:   symbol,
+			Exchange: instrumentExchange,
+			Type:     strings.TrimSpace(firstString(item, "type", "instrumentType")),
+		})
+	}
+
+	var walk func(value any)
+	walk = func(value any) {
+		switch v := value.(type) {
+		case []any:
+			for _, item := range v {
+				walk(item)
+			}
+		case map[string]any:
+			if symbol := firstString(v, "symbol", "secSymbol", "ticker", "code"); strings.TrimSpace(symbol) != "" {
+				appendMap(v)
+				return
+			}
+			for _, key := range []string{"data", "items", "results", "list", "rows", "instruments"} {
+				if nested, ok := v[key]; ok {
+					walk(nested)
+				}
+			}
+		}
+	}
+	walk(raw)
+
+	seen := make(map[string]InstrumentInfo, len(items))
+	for _, item := range items {
+		seen[item.Symbol] = item
+	}
+	out := make([]InstrumentInfo, 0, len(seen))
+	for _, item := range seen {
+		out = append(out, item)
+	}
+	return out
+}
+
+func extractInstrumentPagination(raw any) (total, page, pageSize int, hasNext bool) {
+	root, ok := raw.(map[string]any)
+	if !ok {
+		return 0, 0, 0, false
+	}
+
+	total = firstInt(root, "total", "totalCount", "totalElements", "count")
+	page = firstInt(root, "page", "pageNumber", "currentPage")
+	pageSize = firstInt(root, "pageSize", "size", "perPage", "limit")
+	hasNext = firstBool(root, "hasNext", "hasMore")
+
+	if !hasNext {
+		totalPages := firstInt(root, "totalPages", "pageCount")
+		if totalPages > 0 && page > 0 && page < totalPages {
+			hasNext = true
+		}
+	}
+
+	for _, key := range []string{"pagination", "meta"} {
+		nested, ok := root[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		if total == 0 {
+			total = firstInt(nested, "total", "totalCount", "totalElements", "count")
+		}
+		if page == 0 {
+			page = firstInt(nested, "page", "pageNumber", "currentPage")
+		}
+		if pageSize == 0 {
+			pageSize = firstInt(nested, "pageSize", "size", "perPage", "limit")
+		}
+		if !hasNext {
+			hasNext = firstBool(nested, "hasNext", "hasMore")
+			totalPages := firstInt(nested, "totalPages", "pageCount")
+			if !hasNext && totalPages > 0 && page > 0 && page < totalPages {
+				hasNext = true
+			}
+		}
+	}
+
+	return total, page, pageSize, hasNext
+}
+
+func instrumentPageSignature(items []InstrumentInfo) string {
+	if len(items) == 0 {
+		return ""
+	}
+	first := items[0].Symbol
+	last := items[len(items)-1].Symbol
+	return first + "|" + last + "|" + strconv.Itoa(len(items))
+}
+
+func mergeInstrumentDefaults(exchange string, items []InstrumentInfo) []InstrumentInfo {
+	seen := make(map[string]InstrumentInfo, len(items)+8)
+	for _, item := range items {
+		seen[item.Symbol] = item
+	}
+
+	defaults := []InstrumentInfo{
+		{Symbol: "VNINDEX", Exchange: "INDEX", Type: "INDEX"},
+		{Symbol: "VN30", Exchange: "INDEX", Type: "INDEX"},
+		{Symbol: "HNX", Exchange: "INDEX", Type: "INDEX"},
+		{Symbol: "HNX30", Exchange: "INDEX", Type: "INDEX"},
+		{Symbol: "VN100", Exchange: "INDEX", Type: "INDEX"},
+		{Symbol: "UPCOM", Exchange: "INDEX", Type: "INDEX"},
+		{Symbol: "VNXALLSHARE", Exchange: "INDEX", Type: "INDEX"},
+	}
+	if strings.EqualFold(exchange, "DERIVATIVE") || strings.EqualFold(exchange, "PS") {
+		defaults = append(defaults,
+			InstrumentInfo{Symbol: "VN30F1M", Exchange: "DERIVATIVE", Type: "DERIVATIVE"},
+			InstrumentInfo{Symbol: "VN30F2M", Exchange: "DERIVATIVE", Type: "DERIVATIVE"},
+			InstrumentInfo{Symbol: "VN30F1Q", Exchange: "DERIVATIVE", Type: "DERIVATIVE"},
+			InstrumentInfo{Symbol: "VN30F2Q", Exchange: "DERIVATIVE", Type: "DERIVATIVE"},
+			InstrumentInfo{Symbol: "V100F1M", Exchange: "DERIVATIVE", Type: "DERIVATIVE"},
+			InstrumentInfo{Symbol: "V100F2M", Exchange: "DERIVATIVE", Type: "DERIVATIVE"},
+			InstrumentInfo{Symbol: "V100F1Q", Exchange: "DERIVATIVE", Type: "DERIVATIVE"},
+			InstrumentInfo{Symbol: "V100F2Q", Exchange: "DERIVATIVE", Type: "DERIVATIVE"},
+		)
+	}
+
+	for _, item := range defaults {
+		if _, ok := seen[item.Symbol]; ok {
+			continue
+		}
+		seen[item.Symbol] = item
+	}
+
+	out := make([]InstrumentInfo, 0, len(seen))
+	for _, item := range seen {
+		out = append(out, item)
+	}
+	return out
+}
+
+func simplifyTickers(raw any) []TickerInfo {
+	items := make([]TickerInfo, 0, 2048)
+
+	appendMap := func(item map[string]any) {
+		rawJSON, _ := json.Marshal(item)
+		symbol := strings.ToUpper(strings.TrimSpace(firstString(item, "symbolType", "displaySymbol", "ticker", "symbol", "code")))
+		if symbol == "" {
+			return
+		}
+		feedSymbol := strings.ToUpper(strings.TrimSpace(firstString(item, "symbol", "code", "secSymbol", "ticker")))
+		if feedSymbol == "" {
+			feedSymbol = symbol
+		}
+		exchange := strings.ToUpper(strings.TrimSpace(firstString(item, "exchange", "floor", "market", "marketId")))
+		if exchange == "" {
+			exchange = classifyTickerExchange(symbol, firstString(item, "type", "instrumentType", "securityType", "assetClass"))
+		}
+		items = append(items, TickerInfo{
+			Symbol:      symbol,
+			FeedSymbol:  feedSymbol,
+			Exchange:    exchange,
+			Type:        normalizeTickerType(symbol, firstString(item, "type", "instrumentType", "securityType", "assetClass")),
+			BoardID:     strings.TrimSpace(firstString(item, "boardId", "boardID")),
+			Name:        strings.TrimSpace(firstString(item, "name", "fullName", "viName", "title")),
+			Description: strings.TrimSpace(firstString(item, "description", "desc", "remark", "enName")),
+			RawJSON:     string(rawJSON),
+		})
+	}
+
+	var walk func(value any)
+	walk = func(value any) {
+		switch v := value.(type) {
+		case []any:
+			for _, item := range v {
+				walk(item)
+			}
+		case map[string]any:
+			if len(v) == 0 {
+				return
+			}
+			if hasTickerIdentity(v) {
+				appendMap(v)
+				return
+			}
+			for _, key := range []string{"data", "items", "results", "list", "rows", "tickers"} {
+				if nested, ok := v[key]; ok {
+					walk(nested)
+				}
+			}
+		}
+	}
+	walk(raw)
+
+	seen := make(map[string]TickerInfo, len(items))
+	for _, item := range items {
+		seen[item.Symbol] = item
+	}
+	out := make([]TickerInfo, 0, len(seen))
+	for _, item := range seen {
+		out = append(out, item)
+	}
+	return out
+}
+
+func hasTickerIdentity(item map[string]any) bool {
+	return firstString(item, "symbolType", "displaySymbol", "ticker", "symbol", "code") != ""
+}
+
+func normalizeTickerType(symbol, rawType string) string {
+	rawType = strings.ToUpper(strings.TrimSpace(rawType))
+	switch {
+	case rawType != "":
+		return rawType
+	case strings.HasPrefix(symbol, "VN30F"), strings.HasPrefix(symbol, "V100F"):
+		return "DERIVATIVE"
+	case strings.HasPrefix(symbol, "VN"), symbol == "HNX", symbol == "HNX30", symbol == "UPCOM", symbol == "VNXALLSHARE":
+		return "INDEX"
+	default:
+		return "STOCK"
+	}
+}
+
+func classifyTickerExchange(symbol, rawType string) string {
+	switch normalizeTickerType(symbol, rawType) {
+	case "INDEX":
+		return "INDEX"
+	case "DERIVATIVE":
+		return "DERIVATIVE"
+	default:
+		return "STOCK"
+	}
+}
+
+func firstBool(item map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if value, ok := item[key]; ok {
+			switch v := value.(type) {
+			case bool:
+				return v
+			case string:
+				parsed, _ := strconv.ParseBool(strings.TrimSpace(v))
+				return parsed
+			case float64:
+				return v != 0
+			case int:
+				return v != 0
+			}
+		}
+	}
+	return false
 }
 
 func simplifyPositions(raw any) []dnsemodel.Position {
@@ -906,7 +1349,9 @@ func firstString(item map[string]any, keys ...string) string {
 		if value, ok := item[key]; ok {
 			switch v := value.(type) {
 			case string:
-				return strings.TrimSpace(v)
+				if trimmed := strings.TrimSpace(v); trimmed != "" {
+					return trimmed
+				}
 			case float64:
 				return fmt.Sprintf("%.0f", v)
 			}
@@ -997,4 +1442,29 @@ func generateNonce() string {
 		return strings.ReplaceAll(fmt.Sprintf("%d", time.Now().UnixNano()), "-", "")
 	}
 	return fmt.Sprintf("%x", b[:])
+}
+
+func maskTokenResponse(body []byte) string {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "<unparseable token response>"
+	}
+	for _, key := range []string{"tradingToken", "token"} {
+		if value, ok := payload[key].(string); ok && value != "" {
+			payload[key] = maskSecret(value)
+		}
+	}
+	masked, err := json.Marshal(payload)
+	if err != nil {
+		return "<masked token response>"
+	}
+	return string(masked)
+}
+
+func maskSecret(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 8 {
+		return "***"
+	}
+	return value[:4] + "..." + value[len(value)-4:]
 }

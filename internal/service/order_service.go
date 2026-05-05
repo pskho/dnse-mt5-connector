@@ -32,21 +32,25 @@ type DNSEClient interface {
 	CancelOrder(ctx context.Context, accountNo, orderID, marketType, orderCategory string) (dnsemodel.CancelOrderResponse, error)
 }
 
+type securityDefinitionClient interface {
+	GetSecurityDefinition(ctx context.Context, symbol string) ([]map[string]any, error)
+}
+
 type RiskEngine interface {
 	Check(ctx context.Context, accountNo, symbol, side string, quantity int, price float64) error
 }
 
 type OrderService struct {
-	store    Store
-	dnse     DNSEClient
-	risk     RiskEngine
-	logger   *logger.FileLogger
+	store            Store
+	dnse             DNSEClient
+	risk             RiskEngine
+	logger           *logger.FileLogger
 	defaultAccountNo string
-	positions *PositionService
-	maxOpenPosition int
-	systemEnabled bool
-	idempotency map[string]idempotencyEntry
-	mu       sync.Mutex
+	positions        *PositionService
+	maxOpenPosition  int
+	systemEnabled    bool
+	idempotency      map[string]idempotencyEntry
+	mu               sync.Mutex
 }
 
 type idempotencyEntry struct {
@@ -59,15 +63,15 @@ func NewOrderService(store Store, dnseClient DNSEClient, riskEngine RiskEngine, 
 		maxOpenPosition = 10
 	}
 	return &OrderService{
-		store:    store,
-		dnse:     dnseClient,
-		risk:     riskEngine,
-		logger:   appLog,
+		store:            store,
+		dnse:             dnseClient,
+		risk:             riskEngine,
+		logger:           appLog,
 		defaultAccountNo: strings.TrimSpace(defaultAccountNo),
-		positions: positions,
-		maxOpenPosition: maxOpenPosition,
-		systemEnabled: true,
-		idempotency: make(map[string]idempotencyEntry),
+		positions:        positions,
+		maxOpenPosition:  maxOpenPosition,
+		systemEnabled:    true,
+		idempotency:      make(map[string]idempotencyEntry),
 	}
 }
 
@@ -91,8 +95,8 @@ func (s *OrderService) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 	if !s.reserveOrder(idempotencyKey, 3*time.Second) {
 		err := errors.New("duplicate order rejected within 3 seconds")
 		s.log(ctx, "error", "risk_rejected_idempotency", map[string]any{
-			"error": err.Error(),
-			"key":   idempotencyKey,
+			"error":   err.Error(),
+			"key":     idempotencyKey,
 			"request": normalized,
 		})
 		return OrderResponse{}, err
@@ -106,6 +110,11 @@ func (s *OrderService) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 
 	if err := s.checkMarketOpen(time.Now()); err != nil {
 		s.log(ctx, "error", "risk_rejected_market_closed", map[string]any{"error": err.Error(), "request": normalized})
+		return OrderResponse{}, err
+	}
+
+	if err := s.checkPriceBand(ctx, normalized); err != nil {
+		s.log(ctx, "error", "risk_rejected_price_band", map[string]any{"error": err.Error(), "request": normalized})
 		return OrderResponse{}, err
 	}
 
@@ -158,14 +167,60 @@ func (s *OrderService) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 		s.log(ctx, "error", "order_persist_failed", map[string]any{"error": err.Error(), "orderId": apiResp.OrderID})
 		return OrderResponse{
 			Success: true,
-			OrderID:  apiResp.OrderID,
-			Status:   apiResp.Status,
-			Message:  "order accepted by DNSE but local persistence failed; check logs immediately",
+			OrderID: apiResp.OrderID,
+			Status:  apiResp.Status,
+			Message: "order accepted by DNSE but local persistence failed; check logs immediately",
 		}, nil
 	}
 
 	s.log(ctx, "info", "order_accepted", map[string]any{"orderId": apiResp.OrderID, "status": apiResp.Status})
-	return OrderResponse{Success: true, OrderID: apiResp.OrderID, Status: apiResp.Status}, nil
+	return OrderResponse{Success: true, OrderID: apiResp.OrderID, Status: apiResp.Status, AccountNo: normalized.AccountNo}, nil
+}
+
+func (s *OrderService) PlaceOrders(ctx context.Context, req OrderRequest) ([]OrderResponse, error) {
+	accounts := normalizeAccountList(req.AccountNos)
+	if len(accounts) == 0 && strings.TrimSpace(req.AccountNo) != "" {
+		accounts = []string{strings.TrimSpace(req.AccountNo)}
+	}
+	if len(accounts) == 0 {
+		resp, err := s.PlaceOrder(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		return []OrderResponse{resp}, nil
+	}
+	out := make([]OrderResponse, 0, len(accounts))
+	var firstErr error
+	for _, accountNo := range accounts {
+		itemReq := req
+		itemReq.AccountNo = accountNo
+		itemReq.AccountNos = nil
+		if len(accounts) > 1 && strings.TrimSpace(itemReq.ClientOrderID) != "" {
+			itemReq.ClientOrderID = itemReq.ClientOrderID + "-" + accountNo
+		}
+		resp, err := s.PlaceOrder(ctx, itemReq)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			out = append(out, OrderResponse{Success: false, AccountNo: accountNo, Message: err.Error()})
+			continue
+		}
+		out = append(out, resp)
+	}
+	if firstErr != nil {
+		allFailed := true
+		for _, resp := range out {
+			if resp.Success {
+				allFailed = false
+				break
+			}
+		}
+		if allFailed {
+			return out, firstErr
+		}
+	}
+	return out, nil
 }
 
 func (s *OrderService) Accounts(ctx context.Context) ([]Account, error) {
@@ -180,6 +235,21 @@ func (s *OrderService) Accounts(ctx context.Context) ([]Account, error) {
 			AccountNo: account.AccountNo,
 			Type:      account.DerivativeAccountStatus,
 		})
+	}
+	return out, nil
+}
+
+func (s *OrderService) OrderableAccounts(ctx context.Context) ([]Account, error) {
+	accounts, err := s.Accounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Account, 0, len(accounts))
+	for _, account := range accounts {
+		status := strings.ToUpper(strings.TrimSpace(account.Type))
+		if status == "" || status == "ACTIVE" || strings.Contains(status, "ACTIVE") {
+			out = append(out, account)
+		}
 	}
 	return out, nil
 }
@@ -386,11 +456,44 @@ func (s *OrderService) checkPositionLimit(ctx context.Context, req OrderRequest)
 		return fmt.Errorf("order would increase %s exposure to %d, above max open position %d", req.Symbol, exposure, s.maxOpenPosition)
 	}
 	s.log(ctx, "info", "position_risk_passed", map[string]any{
-		"symbol": req.Symbol,
-		"position": marshalPosition(position),
-		"newExposure": exposure,
+		"symbol":          req.Symbol,
+		"position":        marshalPosition(position),
+		"newExposure":     exposure,
 		"maxOpenPosition": s.maxOpenPosition,
 	})
+	return nil
+}
+
+func (s *OrderService) checkPriceBand(ctx context.Context, req OrderRequest) error {
+	if req.OrderType != "LO" || req.Price <= 0 {
+		return nil
+	}
+	client, ok := s.dnse.(securityDefinitionClient)
+	if !ok {
+		return nil
+	}
+	items, err := client.GetSecurityDefinition(ctx, req.Symbol)
+	if err != nil || len(items) == 0 {
+		if err != nil {
+			s.log(ctx, "error", "price_band_lookup_failed", map[string]any{"symbol": req.Symbol, "error": err.Error()})
+		}
+		return nil
+	}
+	for _, item := range items {
+		boardID := strings.ToUpper(strings.TrimSpace(firstMapString(item, "boardId", "boardID")))
+		if boardID != "" && boardID != "G1" {
+			continue
+		}
+		floorPrice := firstMapFloat(item, "floorPrice")
+		ceilingPrice := firstMapFloat(item, "ceilingPrice")
+		if floorPrice > 0 && req.Price < floorPrice {
+			return fmt.Errorf("price %.2f is below floor %.2f for %s", req.Price, floorPrice, req.Symbol)
+		}
+		if ceilingPrice > 0 && req.Price > ceilingPrice {
+			return fmt.Errorf("price %.2f is above ceiling %.2f for %s", req.Price, ceilingPrice, req.Symbol)
+		}
+		return nil
+	}
 	return nil
 }
 
@@ -404,12 +507,14 @@ func (s *OrderService) checkMarketOpen(now time.Time) error {
 		return errors.New("market is closed on weekends")
 	}
 	minute := t.Hour()*60 + t.Minute()
-	open := 8*60 + 45
-	close := 14*60 + 45
-	if minute < open || minute > close {
-		return errors.New("market is closed outside 08:45-14:45 Asia/Ho_Chi_Minh")
+	morningOpen := 8*60 + 45
+	morningClose := 11*60 + 30
+	afternoonOpen := 13 * 60
+	afternoonClose := 14*60 + 45
+	if (minute >= morningOpen && minute <= morningClose) || (minute >= afternoonOpen && minute <= afternoonClose) {
+		return nil
 	}
-	return nil
+	return errors.New("market is closed outside 08:45-11:30 and 13:00-14:45 Asia/Ho_Chi_Minh")
 }
 
 func selectLoanPackage(marketType string, packages []dnsemodel.LoanPackage) dnsemodel.LoanPackage {
@@ -431,6 +536,38 @@ func selectLoanPackage(marketType string, packages []dnsemodel.LoanPackage) dnse
 		}
 	}
 	return dnsemodel.LoanPackage{}
+}
+
+func firstMapString(item map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := item[key]; ok {
+			if text, ok := value.(string); ok {
+				return strings.TrimSpace(text)
+			}
+		}
+	}
+	return ""
+}
+
+func firstMapFloat(item map[string]any, keys ...string) float64 {
+	for _, key := range keys {
+		if value, ok := item[key]; ok {
+			switch v := value.(type) {
+			case float64:
+				return v
+			case int:
+				return float64(v)
+			case int64:
+				return float64(v)
+			case string:
+				var n float64
+				if _, err := fmt.Sscanf(strings.TrimSpace(v), "%f", &n); err == nil {
+					return n
+				}
+			}
+		}
+	}
+	return 0
 }
 
 func inferMarketType(symbol string) string {
@@ -470,6 +607,23 @@ func orderIdempotencyKey(req OrderRequest) string {
 	raw := fmt.Sprintf("%s|%s|%d", req.Symbol, req.Side, req.Quantity)
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
+}
+
+func normalizeAccountList(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func (s *OrderService) reserveOrder(key string, window time.Duration) bool {

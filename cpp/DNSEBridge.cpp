@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <fstream>
 #include <ctime>
@@ -52,20 +53,24 @@ struct MqlRateLite {
 };
 #pragma pack(pop)
 
-std::mutex g_tick_mutex;
-TickState g_tick;
+struct SymbolState {
+    std::mutex tick_mutex;
+    TickState tick;
+    std::mutex history_mutex;
+    std::vector<MqlRateLite> historical_rates;
+    std::atomic<bool> history_ready{false};
+    std::atomic<bool> running{false};
+    std::atomic<bool> connected{false};
+    std::mutex socket_mutex;
+    SOCKET socket = INVALID_SOCKET;
+    std::thread reader_thread;
+    std::string endpoint;
+    std::string symbol;
+};
 
-std::mutex g_history_mutex;
-std::vector<MqlRateLite> g_historical_rates;
-std::atomic<bool> g_history_ready{false};
-
-std::atomic<bool> g_running{false};
-std::atomic<bool> g_connected{false};
-
-std::mutex g_socket_mutex;
-SOCKET g_socket = INVALID_SOCKET;
-
-std::thread g_reader_thread;
+std::mutex g_states_mutex;
+std::unordered_map<std::string, SymbolState*> g_states;
+std::atomic<int> g_wsa_ref_count{0};
 
 std::string wide_to_utf8(const wchar_t* value) {
     if (value == nullptr) return {};
@@ -87,17 +92,18 @@ bool split_endpoint(const std::string& endpoint, std::string& host, std::string&
     return true;
 }
 
-void close_socket_safe() {
-    std::lock_guard<std::mutex> lock(g_socket_mutex);
-    if (g_socket != INVALID_SOCKET) {
-        shutdown(g_socket, SD_BOTH);
-        closesocket(g_socket);
-        g_socket = INVALID_SOCKET;
+void close_socket_safe(SymbolState& state) {
+    std::lock_guard<std::mutex> lock(state.socket_mutex);
+    if (state.socket != INVALID_SOCKET) {
+        shutdown(state.socket, SD_BOTH);
+        closesocket(state.socket);
+        state.socket = INVALID_SOCKET;
     }
-    g_connected.store(false);
+    state.connected.store(false);
 }
 
-bool connect_socket(const std::string& endpoint) {
+bool connect_socket(SymbolState& state) {
+    const std::string& endpoint = state.endpoint;
     std::string host, port;
     if (!split_endpoint(endpoint, host, port)) {
         log_msg("Invalid endpoint format: " + endpoint);
@@ -137,12 +143,20 @@ bool connect_socket(const std::string& endpoint) {
     ioctlsocket(s, FIONBIO, &non_blocking);
     
     {
-        std::lock_guard<std::mutex> lock(g_socket_mutex);
-        g_socket = s;
+        std::lock_guard<std::mutex> lock(state.socket_mutex);
+        state.socket = s;
     }
-    
-    g_connected.store(true);
-    log_msg("Successfully connected to " + endpoint);
+
+    std::string subscribe = std::string("{\"type\":\"subscribe\",\"symbol\":\"") + state.symbol + "\"}\n";
+    int sent = send(s, subscribe.c_str(), static_cast<int>(subscribe.size()), 0);
+    if (sent != static_cast<int>(subscribe.size())) {
+        log_msg("subscribe send failed for symbol " + state.symbol);
+        closesocket(s);
+        return false;
+    }
+
+    state.connected.store(true);
+    log_msg("Successfully connected to " + endpoint + " for symbol " + state.symbol);
     return true;
 }
 
@@ -194,29 +208,30 @@ bool contains_json_value(const std::string& json, const char* key, const char* e
     return json.compare(pos, std::strlen(expected), expected) == 0;
 }
 
-void reader_loop(std::string endpoint) {
-    log_msg("Reader thread started for " + endpoint);
+void reader_loop(SymbolState* state) {
+    if (state == nullptr) return;
+    log_msg("Reader thread started for " + state->symbol + " @ " + state->endpoint);
     std::string buffer;
     buffer.reserve(4096);
 
-    while (g_running.load()) {
-        if (!connect_socket(endpoint)) {
+    while (state->running.load()) {
+        if (!connect_socket(*state)) {
             // Wait with a loop so we can exit quickly if g_running becomes false
-            for (int i = 0; i < 20 && g_running.load(); ++i) {
+            for (int i = 0; i < 20 && state->running.load(); ++i) {
                 Sleep(100);
             }
             continue;
         }
 
         char temp[2048];
-        while (g_running.load() && g_connected.load()) {
+        while (state->running.load() && state->connected.load()) {
             fd_set read_fds;
             FD_ZERO(&read_fds);
             
             SOCKET s;
             {
-                std::lock_guard<std::mutex> lock(g_socket_mutex);
-                s = g_socket;
+                std::lock_guard<std::mutex> lock(state->socket_mutex);
+                s = state->socket;
             }
             if (s == INVALID_SOCKET) break;
 
@@ -226,13 +241,13 @@ void reader_loop(std::string endpoint) {
             timeout.tv_usec = 500000; // 500ms
             
             int select_res = select(0, &read_fds, nullptr, nullptr, &timeout);
-            if (!g_running.load()) break;
+            if (!state->running.load()) break;
 
             if (select_res > 0) {
                 int received = recv(s, temp, sizeof(temp), 0);
                 if (received <= 0) {
-                    log_msg("recv returned <= 0, disconnected");
-                    close_socket_safe();
+                    log_msg("recv returned <= 0, disconnected for " + state->symbol);
+                    close_socket_safe(*state);
                     break;
                 }
                 buffer.append(temp, temp + received);
@@ -244,13 +259,13 @@ void reader_loop(std::string endpoint) {
                     buffer.erase(0, newline + 1);
 
                     if (contains_json_value(line, "type", "history_start")) {
-                        std::lock_guard<std::mutex> lock(g_history_mutex);
-                        g_historical_rates.clear();
-                        g_history_ready.store(false);
+                        std::lock_guard<std::mutex> lock(state->history_mutex);
+                        state->historical_rates.clear();
+                        state->history_ready.store(false);
                         continue;
                     }
                     if (contains_json_value(line, "type", "history_end")) {
-                        g_history_ready.store(true);
+                        state->history_ready.store(true);
                         continue;
                     }
 
@@ -264,11 +279,11 @@ void reader_loop(std::string endpoint) {
                         c.low = parse_double(line, "low");
                         c.close = parse_double(line, "close");
                         c.tick_volume = parse_int64(line, "tick_volume");
-                        std::lock_guard<std::mutex> lock(g_history_mutex);
-                        g_historical_rates.push_back(c);
+                        std::lock_guard<std::mutex> lock(state->history_mutex);
+                        state->historical_rates.push_back(c);
                     } else if (parse_tick_line(line, parsed)) {
-                        std::lock_guard<std::mutex> lock(g_tick_mutex);
-                        g_tick = parsed;
+                        std::lock_guard<std::mutex> lock(state->tick_mutex);
+                        state->tick = parsed;
                     }
                 }
                 if (buffer.size() > 65536) {
@@ -276,67 +291,99 @@ void reader_loop(std::string endpoint) {
                     buffer.clear();
                 }
             } else if (select_res == SOCKET_ERROR) {
-                log_msg("select returned SOCKET_ERROR");
-                close_socket_safe();
+                log_msg("select returned SOCKET_ERROR for " + state->symbol);
+                close_socket_safe(*state);
                 break;
             }
         }
-        close_socket_safe();
-        log_msg("Disconnected from socket, retrying...");
+        close_socket_safe(*state);
+        log_msg("Disconnected from socket for " + state->symbol + ", retrying...");
         Sleep(500);
     }
-    log_msg("Reader thread exiting");
+    log_msg("Reader thread exiting for " + state->symbol);
 }
 
 } // namespace
 
-extern "C" __declspec(dllexport) bool __stdcall ConnectBridge(const wchar_t* endpoint) {
+SymbolState* get_state_for_symbol(const std::string& symbol) {
+    std::lock_guard<std::mutex> lock(g_states_mutex);
+    auto it = g_states.find(symbol);
+    if (it == g_states.end()) return nullptr;
+    return it->second;
+}
+
+extern "C" __declspec(dllexport) bool __stdcall ConnectBridge(const wchar_t* endpoint, const wchar_t* symbol) {
     std::string ep = wide_to_utf8(endpoint);
-    log_msg("ConnectBridge called with endpoint: " + ep);
-    if (ep.empty()) {
+    std::string sym = wide_to_utf8(symbol);
+    for (char& ch : sym) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    log_msg("ConnectBridge called with endpoint: " + ep + ", symbol: " + sym);
+    if (ep.empty() || sym.empty()) {
         log_msg("Endpoint is empty");
         return false;
     }
-    if (g_running.load()) {
-        log_msg("Already running");
+
+    SymbolState* state = get_state_for_symbol(sym);
+    if (state != nullptr && state->running.load()) {
+        log_msg("Already running for symbol " + sym);
         return true;
     }
 
-    WSADATA data{};
-    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
-        log_msg("WSAStartup failed");
-        return false;
+    if (g_wsa_ref_count.fetch_add(1) == 0) {
+        WSADATA data{};
+        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
+            log_msg("WSAStartup failed");
+            g_wsa_ref_count.fetch_sub(1);
+            return false;
+        }
     }
 
-    g_running.store(true);
-    g_history_ready.store(false);
+    if (state == nullptr) {
+        state = new SymbolState();
+        state->symbol = sym;
+        state->endpoint = ep;
+        std::lock_guard<std::mutex> lock(g_states_mutex);
+        g_states[sym] = state;
+    }
+
+    state->endpoint = ep;
+    state->history_ready.store(false);
+    state->running.store(true);
     try {
         {
-            std::lock_guard<std::mutex> lock(g_history_mutex);
-            g_historical_rates.clear();
+            std::lock_guard<std::mutex> lock(state->history_mutex);
+            state->historical_rates.clear();
         }
-        if (g_reader_thread.joinable()) {
-            g_reader_thread.join();
+        if (state->reader_thread.joinable()) {
+            state->reader_thread.join();
         }
-        g_reader_thread = std::thread(reader_loop, ep);
+        state->reader_thread = std::thread(reader_loop, state);
     } catch (const std::exception& e) {
         log_msg("Exception creating thread: " + std::string(e.what()));
-        g_running.store(false);
-        WSACleanup();
+        state->running.store(false);
+        if (g_wsa_ref_count.fetch_sub(1) == 1) {
+            WSACleanup();
+        }
         return false;
     }
     return true;
 }
 
-extern "C" __declspec(dllexport) bool __stdcall IsConnected() {
-    return g_connected.load();
+extern "C" __declspec(dllexport) bool __stdcall IsConnected(const wchar_t* symbol) {
+    std::string sym = wide_to_utf8(symbol);
+    for (char& ch : sym) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    SymbolState* state = get_state_for_symbol(sym);
+    return state != nullptr && state->connected.load();
 }
 
-extern "C" __declspec(dllexport) bool __stdcall IsHistoryReady() {
-    return g_history_ready.load();
+extern "C" __declspec(dllexport) bool __stdcall IsHistoryReady(const wchar_t* symbol) {
+    std::string sym = wide_to_utf8(symbol);
+    for (char& ch : sym) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    SymbolState* state = get_state_for_symbol(sym);
+    return state != nullptr && state->history_ready.load();
 }
 
 extern "C" __declspec(dllexport) bool __stdcall GetLatestTick(
+    const wchar_t* symbol,
     double* bid,
     double* ask,
     double* last,
@@ -346,79 +393,123 @@ extern "C" __declspec(dllexport) bool __stdcall GetLatestTick(
     if (bid == nullptr || ask == nullptr || last == nullptr || volume == nullptr || timestamp_ms == nullptr) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(g_tick_mutex);
-    if (!g_tick.valid) return false;
-    *bid = g_tick.bid;
-    *ask = g_tick.ask;
-    *last = g_tick.last;
-    *volume = g_tick.volume;
-    *timestamp_ms = g_tick.timestamp_ms;
+    std::string sym = wide_to_utf8(symbol);
+    for (char& ch : sym) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    SymbolState* state = get_state_for_symbol(sym);
+    if (state == nullptr) return false;
+    std::lock_guard<std::mutex> lock(state->tick_mutex);
+    if (!state->tick.valid) return false;
+    *bid = state->tick.bid;
+    *ask = state->tick.ask;
+    *last = state->tick.last;
+    *volume = state->tick.volume;
+    *timestamp_ms = state->tick.timestamp_ms;
     return true;
 }
 
-extern "C" __declspec(dllexport) int __stdcall GetHistoricalRates(MqlRateLite* buffer, int max_count) {
+extern "C" __declspec(dllexport) int __stdcall GetHistoricalRates(const wchar_t* symbol, MqlRateLite* buffer, int max_count) {
     if (buffer == nullptr || max_count <= 0) return 0;
-    std::lock_guard<std::mutex> lock(g_history_mutex);
-    int count = static_cast<int>(g_historical_rates.size());
+    std::string sym = wide_to_utf8(symbol);
+    for (char& ch : sym) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    SymbolState* state = get_state_for_symbol(sym);
+    if (state == nullptr) return 0;
+    std::lock_guard<std::mutex> lock(state->history_mutex);
+    int count = static_cast<int>(state->historical_rates.size());
     if (count == 0) return 0;
     int copy_count = (count > max_count) ? max_count : count;
-    std::memcpy(buffer, g_historical_rates.data(), copy_count * sizeof(MqlRateLite));
+    std::memcpy(buffer, state->historical_rates.data(), copy_count * sizeof(MqlRateLite));
     return copy_count;
 }
 
-extern "C" __declspec(dllexport) int __stdcall GetHistoricalRatesCount() {
-    std::lock_guard<std::mutex> lock(g_history_mutex);
-    return static_cast<int>(g_historical_rates.size());
+extern "C" __declspec(dllexport) int __stdcall GetHistoricalRatesCount(const wchar_t* symbol) {
+    std::string sym = wide_to_utf8(symbol);
+    for (char& ch : sym) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    SymbolState* state = get_state_for_symbol(sym);
+    if (state == nullptr) return 0;
+    std::lock_guard<std::mutex> lock(state->history_mutex);
+    return static_cast<int>(state->historical_rates.size());
 }
 
-extern "C" __declspec(dllexport) int __stdcall GetHistoricalRatesRange(int offset, MqlRateLite* buffer, int max_count) {
+extern "C" __declspec(dllexport) int __stdcall GetHistoricalRatesRange(const wchar_t* symbol, int offset, MqlRateLite* buffer, int max_count) {
     if (buffer == nullptr || max_count <= 0) return 0;
-    std::lock_guard<std::mutex> lock(g_history_mutex);
-    int count = static_cast<int>(g_historical_rates.size());
+    std::string sym = wide_to_utf8(symbol);
+    for (char& ch : sym) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    SymbolState* state = get_state_for_symbol(sym);
+    if (state == nullptr) return 0;
+    std::lock_guard<std::mutex> lock(state->history_mutex);
+    int count = static_cast<int>(state->historical_rates.size());
     if (count == 0) return 0;
     if (offset < 0 || offset >= count) return 0;
     int available = count - offset;
     int copy_count = (available > max_count) ? max_count : available;
-    std::memcpy(buffer, g_historical_rates.data() + offset, copy_count * sizeof(MqlRateLite));
+    std::memcpy(buffer, state->historical_rates.data() + offset, copy_count * sizeof(MqlRateLite));
     return copy_count;
 }
 
-extern "C" __declspec(dllexport) void __stdcall ClearHistoricalRates() {
-    std::lock_guard<std::mutex> lock(g_history_mutex);
-    g_historical_rates.clear();
-    g_history_ready.store(false);
+extern "C" __declspec(dllexport) void __stdcall ClearHistoricalRates(const wchar_t* symbol) {
+    std::string sym = wide_to_utf8(symbol);
+    for (char& ch : sym) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    SymbolState* state = get_state_for_symbol(sym);
+    if (state == nullptr) return;
+    std::lock_guard<std::mutex> lock(state->history_mutex);
+    state->historical_rates.clear();
+    state->history_ready.store(false);
 }
 
-extern "C" __declspec(dllexport) void __stdcall DisconnectBridge() {
-    log_msg("DisconnectBridge called");
-    g_running.store(false);
-    close_socket_safe();
-    
-    if (g_reader_thread.joinable()) {
-        g_reader_thread.join();
+extern "C" __declspec(dllexport) void __stdcall DisconnectBridge(const wchar_t* symbol) {
+    std::string sym = wide_to_utf8(symbol);
+    for (char& ch : sym) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    SymbolState* state = get_state_for_symbol(sym);
+    if (state == nullptr) return;
+    log_msg("DisconnectBridge called for " + sym);
+    state->running.store(false);
+    close_socket_safe(*state);
+
+    if (state->reader_thread.joinable()) {
+        state->reader_thread.join();
     }
 
     {
-        std::lock_guard<std::mutex> lock(g_tick_mutex);
-        g_tick = TickState{};
+        std::lock_guard<std::mutex> lock(state->tick_mutex);
+        state->tick = TickState{};
     }
     {
-        std::lock_guard<std::mutex> lock(g_history_mutex);
-        g_historical_rates.clear();
+        std::lock_guard<std::mutex> lock(state->history_mutex);
+        state->historical_rates.clear();
     }
-    g_history_ready.store(false);
-    WSACleanup();
-    log_msg("Disconnected completely");
+    state->history_ready.store(false);
+    {
+        std::lock_guard<std::mutex> lock(g_states_mutex);
+        g_states.erase(sym);
+    }
+    delete state;
+    if (g_wsa_ref_count.fetch_sub(1) == 1) {
+        WSACleanup();
+    }
+    log_msg("Disconnected completely for " + sym);
 }
 
 BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_DETACH) {
-        g_running.store(false);
-        close_socket_safe();
-        if (g_reader_thread.joinable()) {
-            g_reader_thread.join();
+        std::vector<SymbolState*> states;
+        {
+            std::lock_guard<std::mutex> lock(g_states_mutex);
+            for (auto& entry : g_states) {
+                states.push_back(entry.second);
+            }
+            g_states.clear();
         }
-        WSACleanup();
+        for (SymbolState* state : states) {
+            state->running.store(false);
+            close_socket_safe(*state);
+            if (state->reader_thread.joinable()) {
+                state->reader_thread.join();
+            }
+            delete state;
+        }
+        if (g_wsa_ref_count.load() > 0) {
+            WSACleanup();
+        }
     }
     return TRUE;
 }

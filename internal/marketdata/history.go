@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -68,15 +69,25 @@ type HistoryKey struct {
 }
 
 type HistoryService struct {
-	cfg     config.HistoryConfig
-	client  HistoryClient
-	logger  *logger.FileLogger
-	store   HistorySyncLogger
-	cache   HistoryCache
-	mu      sync.RWMutex
+	cfg       config.HistoryConfig
+	client    HistoryClient
+	logger    *logger.FileLogger
+	store     HistorySyncLogger
+	cache     HistoryCache
+	mu        sync.RWMutex
+	snapshots map[string]historySnapshot
+	subs      map[chan HistoryKey]struct{}
+	reqGate   *historyRequestGate
+}
+
+type historyRequestGate struct {
+	mu            sync.Mutex
+	nextAllowedAt time.Time
+}
+
+type historySnapshot struct {
+	key     HistoryKey
 	candles []HistoryCandle
-	current HistoryKey
-	subs    map[chan struct{}]struct{}
 }
 
 type HistoryClient interface {
@@ -89,12 +100,14 @@ func NewHistoryService(cfg config.HistoryConfig, client HistoryClient, store His
 		cache = c
 	}
 	return &HistoryService{
-		cfg:    cfg,
-		client: client,
-		store:  store,
-		logger: logger,
-		cache:  cache,
-		subs:   make(map[chan struct{}]struct{}),
+		cfg:       cfg,
+		client:    client,
+		store:     store,
+		logger:    logger,
+		cache:     cache,
+		snapshots: make(map[string]historySnapshot),
+		subs:      make(map[chan HistoryKey]struct{}),
+		reqGate:   &historyRequestGate{},
 	}
 }
 
@@ -261,7 +274,14 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 	}
 
 	totalCandles := 0
-	batchSeconds := int64(s.cfg.MaxBatchDays * 24 * 3600)
+	batchDays := s.cfg.MaxBatchDays
+	if opt.ForceFull && lookbackDays > batchDays {
+		batchDays = lookbackDays
+	}
+	if batchDays <= 0 {
+		batchDays = 30
+	}
+	batchSeconds := int64(batchDays * 24 * 3600)
 	currentFrom := from
 
 	// Replace the staged candle snapshot atomically for the next bridge client.
@@ -274,45 +294,54 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 			currentTo = to
 		}
 
-		raw, err := s.client.FetchOHLC(ctx, symbol, marketType, resolution, currentFrom, currentTo)
-		if err != nil {
-			s.store.LogHistorySync(ctx, firstTime, lastTime, "failed", totalCandles)
-			return SyncResult{Success: false, Message: err.Error()}, err
-		}
-
-		tList, _ := raw["t"].([]any)
-		oList, _ := raw["o"].([]any)
-		hList, _ := raw["h"].([]any)
-		lList, _ := raw["l"].([]any)
-		cList, _ := raw["c"].([]any)
-		vList, _ := raw["v"].([]any)
-
-		count := len(tList)
 		batchAdded := 0
-		for i := 0; i < count; i++ {
-			t := parseInt64(tList, i)
-			if t <= 0 {
-				continue
+		pageFrom := currentFrom
+		for page := 0; page < 100 && pageFrom <= currentTo; page++ {
+			raw, err := s.fetchOHLCWithRetry(ctx, symbol, marketType, resolution, pageFrom, currentTo)
+			if err != nil {
+				s.store.LogHistorySync(ctx, firstTime, lastTime, "failed", totalCandles)
+				return SyncResult{Success: false, Message: err.Error()}, err
 			}
-			if t < 100000000000 {
-				t *= 1000
-			}
-			if seen[t] {
-				continue
-			}
-			seen[t] = true
 
-			stagedCandles = append(stagedCandles, HistoryCandle{
-				IsHistory:  1,
-				Time:       t,
-				Open:       parseFloat64(oList, i),
-				High:       parseFloat64(hList, i),
-				Low:        parseFloat64(lList, i),
-				Close:      parseFloat64(cList, i),
-				TickVolume: parseInt64(vList, i),
-			})
-			batchAdded++
-			totalCandles++
+			tList, _ := raw["t"].([]any)
+			oList, _ := raw["o"].([]any)
+			hList, _ := raw["h"].([]any)
+			lList, _ := raw["l"].([]any)
+			cList, _ := raw["c"].([]any)
+			vList, _ := raw["v"].([]any)
+
+			count := len(tList)
+			for i := 0; i < count; i++ {
+				t := parseInt64(tList, i)
+				if t <= 0 {
+					continue
+				}
+				if t < 100000000000 {
+					t *= 1000
+				}
+				if seen[t] {
+					continue
+				}
+				seen[t] = true
+
+				stagedCandles = append(stagedCandles, HistoryCandle{
+					IsHistory:  1,
+					Time:       t,
+					Open:       parseFloat64(oList, i),
+					High:       parseFloat64(hList, i),
+					Low:        parseFloat64(lList, i),
+					Close:      parseFloat64(cList, i),
+					TickVolume: parseInt64(vList, i),
+				})
+				batchAdded++
+				totalCandles++
+			}
+
+			nextTime := parseFlexibleInt64(raw["nextTime"])
+			if nextTime <= 0 || nextTime > currentTo || nextTime <= pageFrom {
+				break
+			}
+			pageFrom = nextTime
 		}
 
 		s.logger.Info("history_sync_batch_completed", map[string]any{"currentFrom": currentFrom, "currentTo": currentTo, "added": batchAdded})
@@ -364,11 +393,13 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 
 func (s *HistoryService) replaceStagedCandles(key HistoryKey, stagedCandles []HistoryCandle) {
 	s.mu.Lock()
-	s.current = key
-	s.candles = stagedCandles
+	s.snapshots[historyKeyString(key)] = historySnapshot{
+		key:     key,
+		candles: stagedCandles,
+	}
 	for ch := range s.subs {
 		select {
-		case ch <- struct{}{}:
+		case ch <- key:
 		default:
 		}
 	}
@@ -376,30 +407,86 @@ func (s *HistoryService) replaceStagedCandles(key HistoryKey, stagedCandles []Hi
 }
 
 func (s *HistoryService) Candles() []HistoryCandle {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]HistoryCandle, len(s.candles))
-	copy(out, s.candles)
+	_, out := s.Snapshot()
 	return out
 }
 
 func (s *HistoryService) Snapshot() (HistoryKey, []HistoryCandle) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]HistoryCandle, len(s.candles))
-	copy(out, s.candles)
-	return s.current, out
+	primarySymbol := strings.ToUpper(strings.TrimSpace(s.cfg.Symbol))
+	if primarySymbol != "" {
+		for _, snapshot := range s.snapshots {
+			if strings.EqualFold(snapshot.key.Symbol, primarySymbol) {
+				out := make([]HistoryCandle, len(snapshot.candles))
+				copy(out, snapshot.candles)
+				return snapshot.key, out
+			}
+		}
+	}
+	for _, snapshot := range s.snapshots {
+		out := make([]HistoryCandle, len(snapshot.candles))
+		copy(out, snapshot.candles)
+		return snapshot.key, out
+	}
+	return HistoryKey{}, nil
+}
+
+func (s *HistoryService) SnapshotForSymbol(symbol string) (HistoryKey, []HistoryCandle, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	for _, snapshot := range s.snapshots {
+		if strings.EqualFold(snapshot.key.Symbol, symbol) {
+			out := make([]HistoryCandle, len(snapshot.candles))
+			copy(out, snapshot.candles)
+			return snapshot.key, out, true
+		}
+	}
+	return HistoryKey{}, nil, false
+}
+
+func (s *HistoryService) CloneSnapshot(sourceSymbol, targetSymbol, marketType string, resolution int) bool {
+	sourceSymbol = strings.ToUpper(strings.TrimSpace(sourceSymbol))
+	targetSymbol = strings.ToUpper(strings.TrimSpace(targetSymbol))
+	marketType = strings.ToUpper(strings.TrimSpace(marketType))
+	if sourceSymbol == "" || targetSymbol == "" {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, snapshot := range s.snapshots {
+		if !strings.EqualFold(snapshot.key.Symbol, sourceSymbol) {
+			continue
+		}
+		key := HistoryKey{Symbol: targetSymbol, MarketType: marketType, Resolution: resolution}
+		copied := make([]HistoryCandle, len(snapshot.candles))
+		copy(copied, snapshot.candles)
+		s.snapshots[historyKeyString(key)] = historySnapshot{
+			key:     key,
+			candles: copied,
+		}
+		for ch := range s.subs {
+			select {
+			case ch <- key:
+			default:
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func (s *HistoryService) ClearCandles() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.current = HistoryKey{}
-	s.candles = make([]HistoryCandle, 0)
+	s.snapshots = make(map[string]historySnapshot)
 }
 
-func (s *HistoryService) SubscribeChanges() (<-chan struct{}, func()) {
-	ch := make(chan struct{}, 1)
+func (s *HistoryService) SubscribeChanges() (<-chan HistoryKey, func()) {
+	ch := make(chan HistoryKey, 8)
 	s.mu.Lock()
 	s.subs[ch] = struct{}{}
 	s.mu.Unlock()
@@ -413,6 +500,75 @@ func (s *HistoryService) SubscribeChanges() (<-chan struct{}, func()) {
 	}
 }
 
+func historyKeyString(key HistoryKey) string {
+	return strings.ToUpper(strings.TrimSpace(key.Symbol)) + "|" +
+		strings.ToUpper(strings.TrimSpace(key.MarketType)) + "|" +
+		strconv.Itoa(key.Resolution)
+}
+
+func (s *HistoryService) fetchOHLCWithRetry(ctx context.Context, symbol, marketType string, resolution int, from, to int64) (map[string]any, error) {
+	backoffs := []time.Duration{0, 5 * time.Second, 10 * time.Second, 20 * time.Second}
+	var lastErr error
+	for attempt, wait := range backoffs {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+		s.waitRequestTurn(ctx)
+		raw, err := s.client.FetchOHLC(ctx, symbol, marketType, resolution, from, to)
+		if err == nil {
+			return raw, nil
+		}
+		lastErr = err
+		if !isRateLimitError(err) {
+			return nil, err
+		}
+		s.logger.Error("history_fetch_rate_limited", map[string]any{
+			"symbol":     symbol,
+			"marketType": marketType,
+			"resolution": resolution,
+			"from":       from,
+			"to":         to,
+			"attempt":    attempt + 1,
+			"error":      err.Error(),
+		})
+	}
+	return nil, lastErr
+}
+
+func (s *HistoryService) waitRequestTurn(ctx context.Context) {
+	if s.reqGate == nil {
+		return
+	}
+	for {
+		s.reqGate.mu.Lock()
+		now := time.Now()
+		if now.After(s.reqGate.nextAllowedAt) || now.Equal(s.reqGate.nextAllowedAt) {
+			s.reqGate.nextAllowedAt = now.Add(1200 * time.Millisecond)
+			s.reqGate.mu.Unlock()
+			return
+		}
+		wait := s.reqGate.nextAllowedAt.Sub(now)
+		s.reqGate.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+	}
+}
+
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "429") || strings.Contains(text, "rate limit")
+}
+
 func parseInt64(arr []any, i int) int64 {
 	if i >= len(arr) {
 		return 0
@@ -424,6 +580,25 @@ func parseInt64(arr []any, i int) int64 {
 		return int64(v)
 	}
 	return 0
+}
+
+func parseFlexibleInt64(value any) int64 {
+	switch v := value.(type) {
+	case float64:
+		return int64(v)
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case json.Number:
+		n, _ := v.Int64()
+		return n
+	case string:
+		n, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		return n
+	default:
+		return 0
+	}
 }
 
 func parseFloat64(arr []any, i int) float64 {

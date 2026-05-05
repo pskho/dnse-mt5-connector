@@ -14,6 +14,7 @@ import (
 
 	"dnse-mt5-connector/internal/api"
 	"dnse-mt5-connector/internal/config"
+	"dnse-mt5-connector/internal/entrade"
 	"dnse-mt5-connector/internal/gmailotp"
 	"dnse-mt5-connector/internal/logger"
 	"dnse-mt5-connector/internal/marketdata"
@@ -22,6 +23,47 @@ import (
 	"dnse-mt5-connector/internal/setup"
 	"dnse-mt5-connector/internal/storage"
 )
+
+type instrumentCatalogAdapter struct {
+	client *api.DNSEClient
+}
+
+func (a instrumentCatalogAdapter) GetInstruments(ctx context.Context, exchange string) ([]service.InstrumentSymbolInfo, error) {
+	items, err := a.client.GetInstruments(ctx, exchange)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]service.InstrumentSymbolInfo, 0, len(items))
+	for _, item := range items {
+		out = append(out, service.InstrumentSymbolInfo{
+			Symbol:   item.Symbol,
+			Exchange: item.Exchange,
+			Type:     item.Type,
+		})
+	}
+	return out, nil
+}
+
+func (a instrumentCatalogAdapter) GetTickers(ctx context.Context, symbol string) ([]service.TickerMetadataInfo, error) {
+	items, err := a.client.GetTickers(ctx, symbol)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]service.TickerMetadataInfo, 0, len(items))
+	for _, item := range items {
+		out = append(out, service.TickerMetadataInfo{
+			Symbol:      item.Symbol,
+			FeedSymbol:  item.FeedSymbol,
+			Exchange:    item.Exchange,
+			Type:        item.Type,
+			BoardID:     item.BoardID,
+			Name:        item.Name,
+			Description: item.Description,
+			RawJSON:     item.RawJSON,
+		})
+	}
+	return out, nil
+}
 
 func main() {
 	appCtx, appCancel := context.WithCancel(context.Background())
@@ -57,10 +99,25 @@ func main() {
 	dnseClient := api.NewDNSEClient(cfg.DNSE, appLog, store)
 	dnseClient.LoadPersistedToken(context.Background())
 	riskEngine := risk.NewEngine(cfg.Risk, store)
-	positionService := service.NewPositionService(dnseClient, appLog, cfg.DNSE.AccountNo)
-	orderService := service.NewOrderService(store, dnseClient, riskEngine, appLog, cfg.DNSE.AccountNo, positionService, cfg.Risk.MaxOpenPosition)
+	tradingClient := service.DNSEClient(dnseClient)
+	positionClient := service.PositionClient(dnseClient)
+	defaultTradingAccountNo := cfg.DNSE.AccountNo
+	if cfg.Entrade.Enabled {
+		entradeClient := entrade.NewClient(cfg.Entrade, appLog)
+		tradingClient = entradeClient
+		positionClient = entradeClient
+		defaultTradingAccountNo = cfg.Entrade.AccountNo
+		appLog.Info("trading_provider_selected", map[string]any{
+			"provider":    "entrade",
+			"environment": cfg.Entrade.Environment,
+		})
+	} else {
+		appLog.Info("trading_provider_selected", map[string]any{"provider": "dnse"})
+	}
+	positionService := service.NewPositionService(positionClient, appLog, defaultTradingAccountNo)
+	orderService := service.NewOrderService(store, tradingClient, riskEngine, appLog, defaultTradingAccountNo, positionService, cfg.Risk.MaxOpenPosition)
 	signalService := service.NewSignalService(orderService, appLog)
-	symbolCatalogService := service.NewSymbolCatalogService(appLog, "")
+	symbolCatalogService := service.NewSymbolCatalogService(appLog, "", instrumentCatalogAdapter{client: dnseClient}, instrumentCatalogAdapter{client: dnseClient}, store)
 	historyService := marketdata.NewHistoryService(cfg.History, dnseClient, store, appLog)
 	if err := historyService.Fetch(appCtx); err != nil {
 		appLog.Error("history_fetch_failed", map[string]any{"error": err.Error()})
@@ -71,7 +128,7 @@ func main() {
 	}
 	dnseClient.SetOTPFetcher(otpService)
 
-	marketDataEngine := marketdata.NewEngine(cfg.MarketData, cfg.DNSE.APIKey, cfg.DNSE.APISecret, dnseClient, historyService, appLog)
+	marketDataEngine := marketdata.NewEngine(cfg.MarketData, cfg.DNSE.APIKey, cfg.DNSE.APISecret, dnseClient, symbolCatalogService, historyService, appLog)
 	handler := api.NewHandler(orderService, positionService, signalService, symbolCatalogService, marketDataEngine.Profiles(), marketDataEngine, dnseClient, historyService, otpService, appLog)
 	marketDataEngine.Start(appCtx)
 
@@ -105,40 +162,84 @@ func main() {
 	if cfg.History.Enabled && cfg.DNSE.HasUsableCredentials() {
 		go func() {
 			time.Sleep(2 * time.Second)
-			if !historyService.NeedsBootstrap(appCtx, cfg.History.Symbol, cfg.History.MarketType, cfg.History.Resolution) {
-				appLog.Info("history_bootstrap_skipped", map[string]any{
-					"reason":     "cache_present",
-					"symbol":     cfg.History.Symbol,
-					"marketType": cfg.History.MarketType,
-					"resolution": cfg.History.Resolution,
+			profiles := marketDataEngine.Profiles()
+			primary := strings.ToUpper(strings.TrimSpace(cfg.MarketData.Symbol))
+			ordered := make([]marketdata.SymbolProfile, 0, len(profiles))
+			for _, profile := range profiles {
+				if strings.EqualFold(profile.Symbol, primary) {
+					continue
+				}
+				ordered = append(ordered, profile)
+			}
+			for _, profile := range profiles {
+				if strings.EqualFold(profile.Symbol, primary) {
+					ordered = append(ordered, profile)
+					break
+				}
+			}
+
+			for _, profile := range ordered {
+				if !historyService.NeedsBootstrap(appCtx, profile.Symbol, profile.MarketType, profile.Resolution) {
+					appLog.Info("history_bootstrap_skipped", map[string]any{
+						"reason":     "cache_present",
+						"symbol":     profile.Symbol,
+						"marketType": profile.MarketType,
+						"resolution": profile.Resolution,
+					})
+					continue
+				}
+
+				appLog.Info("history_bootstrap_started", map[string]any{
+					"symbol":       profile.Symbol,
+					"marketType":   profile.MarketType,
+					"resolution":   profile.Resolution,
+					"lookbackDays": cfg.History.InitialLookbackDays,
 				})
-				return
-			}
 
-			appLog.Info("history_bootstrap_started", map[string]any{
-				"symbol":       cfg.History.Symbol,
-				"marketType":   cfg.History.MarketType,
-				"resolution":   cfg.History.Resolution,
-				"lookbackDays": cfg.History.InitialLookbackDays,
-			})
+				if _, err := historyService.SyncWithOptions(appCtx, marketdata.SyncOptions{
+					ForceFull:    true,
+					BeforeToday:  true,
+					LookbackDays: cfg.History.InitialLookbackDays,
+					Symbol:       profile.Symbol,
+					MarketType:   profile.MarketType,
+					Resolution:   profile.Resolution,
+				}); err != nil {
+					appLog.Error("history_bootstrap_backfill_failed", map[string]any{
+						"symbol": profile.Symbol,
+						"error":  err.Error(),
+					})
+					continue
+				}
 
-			if _, err := historyService.BackfillBeforeToday(appCtx, cfg.History.InitialLookbackDays); err != nil {
-				appLog.Error("history_bootstrap_backfill_failed", map[string]any{"error": err.Error()})
-				return
+				if _, err := historyService.SyncWithOptions(appCtx, marketdata.SyncOptions{
+					TodayOnly:  true,
+					Symbol:     profile.Symbol,
+					MarketType: profile.MarketType,
+					Resolution: profile.Resolution,
+				}); err != nil {
+					appLog.Error("history_bootstrap_today_failed", map[string]any{
+						"symbol": profile.Symbol,
+						"error":  err.Error(),
+					})
+					continue
+				}
+
+				appLog.Info("history_bootstrap_completed", map[string]any{
+					"symbol":     profile.Symbol,
+					"marketType": profile.MarketType,
+					"resolution": profile.Resolution,
+				})
 			}
-			if _, err := historyService.SyncToday(appCtx); err != nil {
-				appLog.Error("history_bootstrap_today_failed", map[string]any{"error": err.Error()})
-				return
-			}
-			appLog.Info("history_bootstrap_completed", map[string]any{
-				"symbol": cfg.History.Symbol,
-			})
 		}()
 	} else {
 		appLog.Info("history_bootstrap_waiting_for_setup", map[string]any{
 			"historyEnabled": cfg.History.Enabled,
 			"hasCredentials": cfg.DNSE.HasUsableCredentials(),
 		})
+	}
+
+	if cfg.DNSE.HasUsableCredentials() && cfg.GmailOTP.Enabled {
+		go maintainDNSETradingToken(appCtx, dnseClient, appLog)
 	}
 
 	stop := make(chan os.Signal, 1)
@@ -151,5 +252,27 @@ func main() {
 	appLog.Info("server_stopping", nil)
 	if err := server.Shutdown(ctx); err != nil {
 		appLog.Error("server_shutdown_failed", map[string]any{"error": err.Error()})
+	}
+}
+
+func maintainDNSETradingToken(ctx context.Context, client *api.DNSEClient, appLog *logger.FileLogger) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		if err := client.EnsureTradingToken(ctx, 30*time.Minute); err != nil {
+			appLog.Error("dnse_trading_token_auto_refresh_failed", map[string]any{"error": err.Error()})
+		} else {
+			status := client.TradingTokenStatus()
+			appLog.Info("dnse_trading_token_ready", map[string]any{
+				"valid":            status.Valid,
+				"expiresAt":        status.ExpiresAt.UTC().Format(time.RFC3339),
+				"remainingSeconds": status.RemainingSeconds,
+			})
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }

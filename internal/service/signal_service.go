@@ -90,9 +90,7 @@ func (s *SignalService) Receive(ctx context.Context, req SignalRequest) (SignalR
 		s.log("error", "signal_rejected_validation", map[string]any{"error": err.Error(), "request": req})
 		return SignalResponse{}, err
 	}
-	if s.Mode() == ModeAuto {
-		return SignalResponse{}, errors.New("auto mode is disabled")
-	}
+	mode := s.Mode()
 
 	now := time.Now().UTC()
 	signal := Signal{
@@ -122,11 +120,32 @@ func (s *SignalService) Receive(ctx context.Context, req SignalRequest) (SignalR
 	}
 	s.recentSignals[key] = now
 	s.pruneExpiredLocked(now)
-	s.signals[signal.ID] = signal
+	if mode != ModeAuto {
+		s.signals[signal.ID] = signal
+	}
 	s.lastMT5Seen = now
 	s.mu.Unlock()
 
-	s.log("info", "signal_received", map[string]any{"signal": signal, "mode": s.Mode()})
+	s.log("info", "signal_received", map[string]any{"signal": signal, "mode": mode})
+	if mode == ModeAuto {
+		orderReq := OrderRequest{
+			ClientOrderID: "signal-" + signal.ID,
+			AccountNo:     signal.AccountNo,
+			Symbol:        signal.Symbol,
+			Side:          signal.Side,
+			Quantity:      signal.Quantity,
+			Price:         signal.Price,
+			OrderType:     signal.OrderType,
+			MarketType:    signal.MarketType,
+			OrderCategory: signal.OrderCategory,
+		}
+		resp, err := s.orders.PlaceOrder(ctx, orderReq)
+		if err != nil {
+			s.log("error", "signal_auto_order_failed", map[string]any{"signalId": signal.ID, "error": err.Error(), "signal": signal})
+			return SignalResponse{}, err
+		}
+		s.log("info", "signal_auto_order_submitted", map[string]any{"signalId": signal.ID, "orderId": resp.OrderID, "status": resp.Status})
+	}
 	return SignalResponse{SignalID: signal.ID, ExpiresAt: signal.ExpiresAt}, nil
 }
 
@@ -204,10 +223,12 @@ func (s *SignalService) Pending() []Signal {
 
 func (s *SignalService) SetMode(mode string) error {
 	mode = strings.ToLower(strings.TrimSpace(mode))
+	mode = strings.ReplaceAll(mode, "_", "-")
 	switch mode {
 	case ModeManual, ModeSemiAuto:
 	case ModeAuto:
-		return errors.New("auto mode is disabled in this MVP")
+		// Auto mode is allowed, but every order still passes through OrderService
+		// risk checks, idempotency, market-hour validation, and the kill switch.
 	default:
 		return errors.New("mode must be manual, semi-auto, or auto")
 	}

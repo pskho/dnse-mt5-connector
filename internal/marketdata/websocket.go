@@ -120,6 +120,8 @@ func (c *wsConn) ReadText() ([]byte, error) {
 		switch opcode {
 		case 0x1:
 			return payload, nil
+		case 0x2:
+			return payload, nil
 		case 0x8:
 			return nil, io.EOF
 		case 0x9:

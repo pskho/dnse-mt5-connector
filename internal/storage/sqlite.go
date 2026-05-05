@@ -84,6 +84,19 @@ func (s *SQLiteStore) Migrate(ctx context.Context) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_history_candles_lookup
 			ON history_candles(symbol, market_type, resolution, time_ms);`,
+		`CREATE TABLE IF NOT EXISTS ticker_metadata (
+			symbol TEXT PRIMARY KEY,
+			feed_symbol TEXT NOT NULL,
+			exchange TEXT NOT NULL,
+			type TEXT NOT NULL,
+			board_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			description TEXT NOT NULL,
+			raw_json TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_ticker_metadata_exchange
+			ON ticker_metadata(exchange, type, symbol);`,
 	}
 	for _, q := range queries {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
@@ -292,6 +305,90 @@ func (s *SQLiteStore) GetHistoryCoverage(ctx context.Context, symbol, marketType
 		symbol, marketType, resolution)
 	err = row.Scan(&minMS, &maxMS, &count)
 	return
+}
+
+func (s *SQLiteStore) UpsertTickerMetadata(ctx context.Context, records []TickerMetadataRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO ticker_metadata
+		(symbol, feed_symbol, exchange, type, board_id, name, description, raw_json, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(symbol) DO UPDATE SET
+			feed_symbol = excluded.feed_symbol,
+			exchange = excluded.exchange,
+			type = excluded.type,
+			board_id = excluded.board_id,
+			name = excluded.name,
+			description = excluded.description,
+			raw_json = excluded.raw_json,
+			updated_at = excluded.updated_at`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+	now := formatTime(time.Now().UTC())
+	for _, record := range records {
+		if _, err := stmt.ExecContext(ctx,
+			record.Symbol,
+			record.FeedSymbol,
+			record.Exchange,
+			record.Type,
+			record.BoardID,
+			record.Name,
+			record.Description,
+			record.RawJSON,
+			defaultStringTime(record.UpdatedAt, now),
+		); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) LoadTickerMetadata(ctx context.Context) ([]TickerMetadataRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT symbol, feed_symbol, exchange, type, board_id, name, description, raw_json, updated_at
+		FROM ticker_metadata
+		ORDER BY symbol ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []TickerMetadataRecord
+	for rows.Next() {
+		var record TickerMetadataRecord
+		var updatedAt string
+		if err := rows.Scan(&record.Symbol, &record.FeedSymbol, &record.Exchange, &record.Type, &record.BoardID, &record.Name, &record.Description, &record.RawJSON, &updatedAt); err != nil {
+			return nil, err
+		}
+		record.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+		out = append(out, record)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStore) GetTickerMetadataBySymbol(ctx context.Context, symbol string) (TickerMetadataRecord, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT symbol, feed_symbol, exchange, type, board_id, name, description, raw_json, updated_at
+		FROM ticker_metadata
+		WHERE symbol = ?`, symbol)
+	var record TickerMetadataRecord
+	var updatedAt string
+	err := row.Scan(&record.Symbol, &record.FeedSymbol, &record.Exchange, &record.Type, &record.BoardID, &record.Name, &record.Description, &record.RawJSON, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TickerMetadataRecord{}, ErrNotFound
+	}
+	if err != nil {
+		return TickerMetadataRecord{}, err
+	}
+	record.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	return record, nil
 }
 
 var ErrNotFound = errors.New("not found")

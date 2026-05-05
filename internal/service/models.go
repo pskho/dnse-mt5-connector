@@ -1,23 +1,25 @@
 package service
 
 type OrderRequest struct {
-	ClientOrderID string  `json:"clientOrderId"`
-	AccountNo     string  `json:"accountNo"`
-	Symbol        string  `json:"symbol"`
-	Side          string  `json:"side"`
-	Quantity      int     `json:"quantity"`
-	Price         float64 `json:"price"`
-	OrderType     string  `json:"orderType"`
-	LoanPackageID *int    `json:"loanPackageId,omitempty"`
-	MarketType    string  `json:"marketType,omitempty"`
-	OrderCategory string  `json:"orderCategory,omitempty"`
+	ClientOrderID string   `json:"clientOrderId"`
+	AccountNo     string   `json:"accountNo"`
+	AccountNos    []string `json:"accountNos,omitempty"`
+	Symbol        string   `json:"symbol"`
+	Side          string   `json:"side"`
+	Quantity      int      `json:"quantity"`
+	Price         float64  `json:"price"`
+	OrderType     string   `json:"orderType"`
+	LoanPackageID *int     `json:"loanPackageId,omitempty"`
+	MarketType    string   `json:"marketType,omitempty"`
+	OrderCategory string   `json:"orderCategory,omitempty"`
 }
 
 type OrderResponse struct {
-	Success bool   `json:"success"`
-	OrderID  string `json:"orderId,omitempty"`
-	Status   string `json:"status,omitempty"`
-	Message  string `json:"message,omitempty"`
+	Success   bool   `json:"success"`
+	OrderID   string `json:"orderId,omitempty"`
+	Status    string `json:"status,omitempty"`
+	Message   string `json:"message,omitempty"`
+	AccountNo string `json:"accountNo,omitempty"`
 }
 
 type Account struct {
@@ -27,10 +29,10 @@ type Account struct {
 }
 
 type CancelRequest struct {
-	AccountNo      string `json:"accountNo,omitempty"`
-	OrderID        string `json:"orderId"`
-	MarketType     string `json:"marketType,omitempty"`
-	OrderCategory  string `json:"orderCategory,omitempty"`
+	AccountNo     string `json:"accountNo,omitempty"`
+	OrderID       string `json:"orderId"`
+	MarketType    string `json:"marketType,omitempty"`
+	OrderCategory string `json:"orderCategory,omitempty"`
 }
 
 type CancelResponse struct {
@@ -51,9 +53,9 @@ type OrderStatusResponse struct {
 }
 
 type Position struct {
-	Symbol      string `json:"symbol"`
-	Direction   string `json:"direction"`
-	NetQuantity int    `json:"netQuantity"`
-	LongQuantity int    `json:"longQuantity"`
-	ShortQuantity int   `json:"shortQuantity"`
+	Symbol        string `json:"symbol"`
+	Direction     string `json:"direction"`
+	NetQuantity   int    `json:"netQuantity"`
+	LongQuantity  int    `json:"longQuantity"`
+	ShortQuantity int    `json:"shortQuantity"`
 }

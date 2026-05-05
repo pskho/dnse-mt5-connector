@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,12 +24,24 @@ type MarketDataClient interface {
 	FetchLatestTrade(ctx context.Context, symbol, boardID string) (any, error)
 }
 
+type FeedSymbolResolver interface {
+	ResolveMarketFeedSymbol(ctx context.Context, displaySymbol string) (string, bool, error)
+	ResolveTickerBoard(ctx context.Context, symbol string) (string, string, bool, error)
+}
+
 type symbolRuntimeState struct {
 	mu                  sync.RWMutex
 	lastWSTickAt        time.Time
 	resolvedBoardID     string
+	resolvedFeedSymbol  string
+	nextRESTAttemptAt   time.Time
 	sampleRawRemaining  int
 	sampleTickRemaining int
+}
+
+type restThrottleState struct {
+	mu            sync.Mutex
+	nextAllowedAt time.Time
 }
 
 type Engine struct {
@@ -40,11 +53,14 @@ type Engine struct {
 	history  *HistoryService
 	logger   *logger.FileLogger
 	profiles []SymbolProfile
+	statesMu sync.Mutex
 	states   map[string]*symbolRuntimeState
 	status   *BridgeStatus
+	restGate *restThrottleState
+	resolver FeedSymbolResolver
 }
 
-func NewEngine(cfg config.MarketDataConfig, apiKey, secret string, client MarketDataClient, history *HistoryService, appLog *logger.FileLogger) *Engine {
+func NewEngine(cfg config.MarketDataConfig, apiKey, secret string, client MarketDataClient, resolver FeedSymbolResolver, history *HistoryService, appLog *logger.FileLogger) *Engine {
 	profiles := BuildProfiles(cfg)
 	states := make(map[string]*symbolRuntimeState, len(profiles))
 	for _, profile := range profiles {
@@ -64,6 +80,8 @@ func NewEngine(cfg config.MarketDataConfig, apiKey, secret string, client Market
 		profiles: profiles,
 		states:   states,
 		status:   NewBridgeStatus(),
+		restGate: &restThrottleState{},
+		resolver: resolver,
 	}
 }
 
@@ -102,6 +120,7 @@ func (e *Engine) Start(ctx context.Context) {
 		return
 	}
 
+	primarySymbol := strings.ToUpper(strings.TrimSpace(e.cfg.Symbol))
 	for _, profile := range e.profiles {
 		profile := profile
 		if e.cfg.Mock {
@@ -109,8 +128,13 @@ func (e *Engine) Start(ctx context.Context) {
 			continue
 		}
 		go e.runWebSocketLoop(ctx, profile)
-		if e.client != nil && profile.SupportsRESTFallback {
+		if e.client != nil && profile.SupportsRESTFallback && strings.EqualFold(profile.Symbol, primarySymbol) {
 			go e.runRESTFallbackLoop(ctx, profile)
+		} else if e.client != nil && profile.SupportsRESTFallback {
+			e.logger.Info("marketdata_rest_fallback_skipped", map[string]any{
+				"symbol": profile.Symbol,
+				"reason": "ws_first_non_primary",
+			})
 		}
 	}
 }
@@ -144,29 +168,48 @@ func (e *Engine) runWebSocket(ctx context.Context, profile SymbolProfile) error 
 		return err
 	}
 	defer ws.Close()
+	if e.status != nil {
+		e.status.MarkWSConnected(profile.Symbol)
+	}
 	e.logger.Info("marketdata_ws_connected", map[string]any{
 		"url":      e.cfg.WebSocketURL,
 		"symbol":   profile.Symbol,
 		"channels": profile.Channels,
 	})
 
+	welcome, err := ws.ReadText()
+	if err != nil {
+		return fmt.Errorf("read websocket welcome: %w", err)
+	}
+	e.logger.Info("marketdata_ws_welcome", map[string]any{"symbol": profile.Symbol, "body": string(welcome)})
+
 	auth := e.authMessage()
 	if err := ws.WriteText(auth); err != nil {
 		return err
 	}
+	authResp, err := ws.ReadText()
+	if err != nil {
+		return fmt.Errorf("read websocket auth response: %w", err)
+	}
+	if action := wsAction(authResp); action != "auth_success" {
+		return fmt.Errorf("websocket auth failed: %s", strings.TrimSpace(string(authResp)))
+	}
+	e.logger.Info("marketdata_ws_authenticated", map[string]any{"symbol": profile.Symbol})
+
+	channels := e.subscribeChannels(profile)
 	subscribe, _ := json.Marshal(map[string]any{
 		"action":   "subscribe",
-		"channels": e.subscribeChannels(profile),
+		"channels": channels,
 	})
 	if err := ws.WriteText(subscribe); err != nil {
 		return err
 	}
-	e.logger.Info("marketdata_ws_subscribed", map[string]any{"symbol": profile.Symbol, "channels": profile.Channels})
+	e.logger.Info("marketdata_ws_subscribed", map[string]any{"symbol": profile.Symbol, "channels": channels})
 
 	pingDone := make(chan struct{})
 	defer close(pingDone)
 	go func() {
-		ticker := time.NewTicker(15 * time.Second)
+		ticker := time.NewTicker(25 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -175,7 +218,7 @@ func (e *Engine) runWebSocket(ctx context.Context, profile SymbolProfile) error 
 			case <-pingDone:
 				return
 			case <-ticker.C:
-				if err := ws.WritePing([]byte("keepalive")); err != nil {
+				if err := ws.WriteText([]byte(`{"action":"ping"}`)); err != nil {
 					e.logger.Error("marketdata_ws_ping_failed", map[string]any{"symbol": profile.Symbol, "error": err.Error()})
 					return
 				}
@@ -183,16 +226,39 @@ func (e *Engine) runWebSocket(ctx context.Context, profile SymbolProfile) error 
 		}
 	}()
 
+	sessionDeadline := time.Now().Add(7*time.Hour + 45*time.Minute)
 	for ctx.Err() == nil {
+		if time.Now().After(sessionDeadline) {
+			return errors.New("websocket proactive reconnect before 8h session limit")
+		}
 		raw, err := ws.ReadText()
 		if err != nil {
+			if e.status != nil {
+				e.status.MarkWSDisconnected(profile.Symbol, err)
+			}
 			return err
+		}
+		if len(raw) == 0 {
+			return errors.New("websocket empty market data frame")
 		}
 		if e.shouldLogRawSample(profile.Symbol, raw) {
 			e.logger.Info("marketdata_ws_market_sample", map[string]any{"symbol": profile.Symbol, "body": string(raw)})
 		}
-		if tick, ok := NormalizeTick(profile.Symbol, raw); ok {
+		switch action := wsAction(raw); action {
+		case "ping":
+			_ = ws.WriteText([]byte(`{"action":"pong"}`))
+			continue
+		case "pong", "subscribed", "welcome", "auth_success":
+			continue
+		case "error", "auth_error":
+			return fmt.Errorf("websocket server error: %s", strings.TrimSpace(string(raw)))
+		}
+		if tick, ok := NormalizeTick("", raw); ok {
+			tick.Symbol = strings.ToUpper(profile.Symbol)
 			e.recordWSTick(profile.Symbol)
+			if e.status != nil {
+				e.status.MarkMarketMessage(profile.Symbol, tick.Source)
+			}
 			e.store.Update(tick)
 			if e.consumeTickSample(profile.Symbol) {
 				e.logger.Info("marketdata_ws_tick_sample", map[string]any{
@@ -243,6 +309,9 @@ func (e *Engine) runRESTFallbackLoop(ctx context.Context, profile SymbolProfile)
 			}
 			lastSent = fallbackTick
 			hasLastSent = true
+			if e.status != nil {
+				e.status.MarkMarketMessage(profile.Symbol, fallbackTick.Source)
+			}
 			e.store.Update(fallbackTick)
 			if e.consumeTickSample(profile.Symbol) {
 				e.logger.Info("marketdata_rest_tick_sample", map[string]any{
@@ -259,63 +328,139 @@ func (e *Engine) runRESTFallbackLoop(ctx context.Context, profile SymbolProfile)
 }
 
 func (e *Engine) fetchFallbackTick(ctx context.Context, profile SymbolProfile) (Tick, bool) {
-	boardID := e.boardID(ctx, profile)
-	raw, err := e.client.FetchLatestTrade(ctx, profile.Symbol, boardID)
+	state := e.stateFor(profile.Symbol)
+	state.mu.RLock()
+	nextAttempt := state.nextRESTAttemptAt
+	state.mu.RUnlock()
+	if !nextAttempt.IsZero() && time.Now().Before(nextAttempt) {
+		return Tick{}, false
+	}
+
+	e.waitRESTTurn(ctx)
+
+	feedSymbol, boardID := e.resolveFeedSymbol(ctx, profile)
+	raw, err := e.client.FetchLatestTrade(ctx, feedSymbol, boardID)
 	if err != nil {
+		delay := 5 * time.Second
+		if strings.Contains(strings.ToLower(err.Error()), "429") || strings.Contains(strings.ToLower(err.Error()), "rate limit") {
+			delay = 15 * time.Second
+		}
+		state.mu.Lock()
+		state.nextRESTAttemptAt = time.Now().Add(delay)
+		state.mu.Unlock()
 		e.logger.Error("marketdata_rest_fallback_error", map[string]any{
-			"symbol":  profile.Symbol,
-			"boardId": boardID,
-			"error":   err.Error(),
+			"symbol":     profile.Symbol,
+			"feedSymbol": feedSymbol,
+			"boardId":    boardID,
+			"error":      err.Error(),
 		})
 		return Tick{}, false
 	}
-	tick, ok := normalizeAny(strings.ToUpper(profile.Symbol), raw)
+	state.mu.Lock()
+	state.nextRESTAttemptAt = time.Now().Add(3 * time.Second)
+	state.mu.Unlock()
+	tick, ok := normalizeAny("", raw)
 	if !ok {
 		payload, _ := json.Marshal(raw)
 		e.logger.Info("marketdata_rest_fallback_ignored", map[string]any{
-			"symbol":  profile.Symbol,
-			"boardId": boardID,
-			"body":    string(payload),
+			"symbol":     profile.Symbol,
+			"feedSymbol": feedSymbol,
+			"boardId":    boardID,
+			"body":       string(payload),
 		})
 		return Tick{}, false
 	}
+	tick.Symbol = strings.ToUpper(profile.Symbol)
 	return tick, true
 }
 
-func (e *Engine) boardID(ctx context.Context, profile SymbolProfile) string {
+func (e *Engine) resolveFeedSymbol(ctx context.Context, profile SymbolProfile) (string, string) {
 	state := e.stateFor(profile.Symbol)
 	state.mu.RLock()
 	boardID := state.resolvedBoardID
+	feedSymbol := state.resolvedFeedSymbol
 	state.mu.RUnlock()
-	if boardID != "" {
-		return boardID
+	if boardID != "" && feedSymbol != "" {
+		return feedSymbol, boardID
+	}
+	if feedSymbol == "" {
+		feedSymbol = strings.ToUpper(strings.TrimSpace(profile.Symbol))
 	}
 	if profile.BoardID != "" {
 		boardID = profile.BoardID
 	}
+	if e.resolver != nil {
+		if resolvedFeed, resolvedBoard, ok, err := e.resolver.ResolveTickerBoard(ctx, profile.Symbol); err != nil {
+			e.logger.Error("marketdata_ticker_metadata_resolve_failed", map[string]any{"symbol": profile.Symbol, "error": err.Error()})
+		} else if ok {
+			if strings.TrimSpace(resolvedFeed) != "" {
+				feedSymbol = strings.ToUpper(strings.TrimSpace(resolvedFeed))
+			}
+			if strings.TrimSpace(resolvedBoard) != "" {
+				boardID = strings.ToUpper(strings.TrimSpace(resolvedBoard))
+			}
+		}
+	}
+	if e.resolver != nil && isDerivativeSymbol(profile.Symbol) {
+		if resolved, ok, err := e.resolver.ResolveMarketFeedSymbol(ctx, profile.Symbol); err != nil {
+			e.logger.Error("marketdata_feed_symbol_resolve_failed", map[string]any{"symbol": profile.Symbol, "error": err.Error()})
+		} else if ok && strings.TrimSpace(resolved) != "" {
+			feedSymbol = strings.ToUpper(strings.TrimSpace(resolved))
+		}
+	}
 	items, err := e.client.GetSecurityDefinition(ctx, profile.Symbol)
 	if err != nil {
 		e.logger.Error("marketdata_board_resolve_failed", map[string]any{"symbol": profile.Symbol, "error": err.Error()})
-		return boardID
+		return feedSymbol, boardID
+	}
+	bestBoard := boardID
+	if found := preferredBoardID(items); found != "" {
+		bestBoard = found
 	}
 	for _, item := range items {
-		symbol := strings.ToUpper(strings.TrimSpace(firstStringFromMap(item, "symbol", "code", "ticker")))
-		if symbol != "" && symbol != strings.ToUpper(profile.Symbol) {
-			continue
+		foundSymbol := strings.ToUpper(strings.TrimSpace(firstStringFromMap(item, "symbol", "code", "ticker")))
+		if foundSymbol != "" && !isDerivativeSymbol(profile.Symbol) {
+			feedSymbol = foundSymbol
 		}
 		found := strings.TrimSpace(firstStringFromMap(item, "boardId", "boardID"))
-		if found != "" {
+		if found != "" && found == bestBoard {
 			boardID = found
 			break
 		}
 	}
-	if boardID != "" {
-		state.mu.Lock()
-		state.resolvedBoardID = boardID
-		state.mu.Unlock()
-		e.logger.Info("marketdata_board_resolved", map[string]any{"symbol": profile.Symbol, "boardId": boardID})
+	if boardID == "" {
+		boardID = bestBoard
 	}
-	return boardID
+	state.mu.Lock()
+	if boardID != "" {
+		state.resolvedBoardID = boardID
+	}
+	if feedSymbol != "" {
+		state.resolvedFeedSymbol = feedSymbol
+	}
+	state.mu.Unlock()
+	e.logger.Info("marketdata_board_resolved", map[string]any{"symbol": profile.Symbol, "feedSymbol": feedSymbol, "boardId": boardID})
+	return feedSymbol, boardID
+}
+
+func preferredBoardID(items []map[string]any) string {
+	preferred := []string{"G1", "G4", "G7", "T1", "T3", "T4", "T6"}
+	available := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		boardID := strings.TrimSpace(firstStringFromMap(item, "boardId", "boardID"))
+		if boardID != "" {
+			available[boardID] = struct{}{}
+		}
+	}
+	for _, boardID := range preferred {
+		if _, ok := available[boardID]; ok {
+			return boardID
+		}
+	}
+	for boardID := range available {
+		return boardID
+	}
+	return ""
 }
 
 func (e *Engine) wsRecentlyActive(symbol string, maxIdle time.Duration) bool {
@@ -400,18 +545,76 @@ func (e *Engine) authMessage() []byte {
 }
 
 func (e *Engine) subscribeChannels(profile SymbolProfile) []map[string]any {
+	feedSymbol, _ := e.resolveFeedSymbol(context.Background(), profile)
 	out := make([]map[string]any, 0, len(profile.Channels))
 	for _, channel := range profile.Channels {
-		channel = strings.TrimSpace(channel)
+		channel = normalizeConfiguredChannel(channel, profile.BoardID, profile.Resolution)
 		if channel == "" {
 			continue
 		}
-		out = append(out, map[string]any{
-			"name":    channel,
-			"symbols": []string{strings.ToUpper(profile.Symbol)},
-		})
+		entry := map[string]any{"name": channel}
+		if !strings.HasPrefix(strings.ToLower(channel), "market_index.") {
+			entry["symbols"] = []string{strings.ToUpper(feedSymbol)}
+		} else {
+			entry["symbols"] = []string{}
+		}
+		out = append(out, entry)
 	}
 	return out
+}
+
+func normalizeConfiguredChannel(channel, boardID string, resolution int) string {
+	boardID = strings.ToUpper(strings.TrimSpace(boardID))
+	if boardID == "" {
+		boardID = "G1"
+	}
+	if resolution <= 0 {
+		resolution = 1
+	}
+	switch strings.ToLower(strings.TrimSpace(channel)) {
+	case "trades.json", "trade.json", "tick.json", "trades":
+		return "tick." + boardID + ".json"
+	case "trade_extra.json", "trades_extra.json", "tick_extra.json":
+		return "tick_extra." + boardID + ".json"
+	case "quotes.json", "quote.json", "top_price.json", "quotes":
+		return "top_price." + boardID + ".json"
+	case "ohlc.json", "ohlc":
+		return "ohlc." + strconv.Itoa(resolution) + ".json"
+	case "ohlc_closed.json", "ohlc_closed":
+		return "ohlc_closed." + strconv.Itoa(resolution) + ".json"
+	default:
+		return strings.TrimSpace(channel)
+	}
+}
+
+func wsAction(raw []byte) string {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(firstStringFromMap(payload, "action", "a")))
+}
+
+func (e *Engine) waitRESTTurn(ctx context.Context) {
+	if e.restGate == nil {
+		return
+	}
+	for {
+		e.restGate.mu.Lock()
+		now := time.Now()
+		if now.After(e.restGate.nextAllowedAt) || now.Equal(e.restGate.nextAllowedAt) {
+			e.restGate.nextAllowedAt = now.Add(750 * time.Millisecond)
+			e.restGate.mu.Unlock()
+			return
+		}
+		wait := e.restGate.nextAllowedAt.Sub(now)
+		e.restGate.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+	}
 }
 
 func (e *Engine) runMock(ctx context.Context, profile SymbolProfile) {
@@ -442,6 +645,8 @@ func (e *Engine) runMock(ctx context.Context, profile SymbolProfile) {
 
 func (e *Engine) stateFor(symbol string) *symbolRuntimeState {
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	e.statesMu.Lock()
+	defer e.statesMu.Unlock()
 	if state, ok := e.states[symbol]; ok {
 		return state
 	}

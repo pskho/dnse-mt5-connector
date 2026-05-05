@@ -45,3 +45,15 @@ type HistoryCandleRecord struct {
 	TickVolume int64
 	UpdatedAt  time.Time
 }
+
+type TickerMetadataRecord struct {
+	Symbol      string
+	FeedSymbol  string
+	Exchange    string
+	Type        string
+	BoardID     string
+	Name        string
+	Description string
+	RawJSON     string
+	UpdatedAt   time.Time
+}
