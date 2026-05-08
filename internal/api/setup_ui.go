@@ -335,6 +335,40 @@ const settingsHTML = layoutTop + `
     </section>
 
     <section class="card">
+      <h2>Entrade order accounts</h2>
+      <div class="form-group">
+        <label>Trading provider</label>
+        <select id="entradeEnabled">
+          <option value="false">DNSE</option>
+          <option value="true">Entrade</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Entrade mode</label>
+        <select id="entradeEnvironment">
+          <option value="paper">Demo / Papertrade</option>
+          <option value="real">Real</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Entrade mock mode</label>
+        <select id="entradeMock">
+          <option value="false">Off</option>
+          <option value="true">On</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Default accounts for MT5 signals</label>
+        <input type="text" id="entradeDefaultAccounts" placeholder="ENTRADE_DEMO">
+      </div>
+      <div class="form-group">
+        <label>Account profiles</label>
+        <textarea id="entradeAccounts" rows="7" style="width:100%; resize:vertical;" placeholder="ENTRADE_DEMO|paper|username|password|investorId|investorAccountId|tradingToken"></textarea>
+      </div>
+      <div class="muted">One row per account: <code>ID|mode|username|password|investorId|investorAccountId|tradingToken</code>. Leave password/token blank to keep the saved value. SuperTrend sends only BUY/SELL/CLOSE; this list decides where orders go.</div>
+    </section>
+
+    <section class="card">
       <h2>Danh sách mã</h2>
       <div class="form-group">
         <label>Mã chính dùng để ưu tiên hiển thị và nạp dữ liệu đầu tiên</label>
@@ -504,12 +538,53 @@ const settingsHTML = layoutTop + `
       renderSymbolChoices();
     }
 
+    function splitAccounts(value) {
+      return (value || '').split(',').map((item) => item.trim().toUpperCase()).filter(Boolean);
+    }
+
+    function formatEntradeAccounts(accounts) {
+      if (!accounts || !accounts.length) {
+        return 'ENTRADE_DEMO|paper|||||';
+      }
+      return accounts.filter((account) => account.enabled !== false).map((account) => [
+        account.id || '',
+        account.environment || 'paper',
+        account.username || '',
+        '',
+        account.investorId || '',
+        account.accountNo || '',
+        ''
+      ].join('|')).join('\n');
+    }
+
+    function parseEntradeAccounts() {
+      const rows = (document.getElementById('entradeAccounts').value || '').split(/\r?\n/);
+      return rows.map((row) => {
+        const cols = row.split('|');
+        return {
+          id: (cols[0] || '').trim().toUpperCase(),
+          environment: (cols[1] || 'paper').trim().toLowerCase(),
+          username: (cols[2] || '').trim(),
+          password: (cols[3] || '').trim(),
+          investorId: (cols[4] || '').trim(),
+          accountNo: (cols[5] || '').trim(),
+          tradingToken: (cols[6] || '').trim(),
+          enabled: true
+        };
+      }).filter((account) => account.id);
+    }
+
     async function loadSettings() {
       const res = await fetch('/api/settings');
       const data = await res.json();
       document.getElementById('apiKey').value = data.dnse.apiKey || '';
       document.getElementById('accountNo').value = data.dnse.accountNo || '';
       document.getElementById('mockMode').value = data.dnse.mock ? 'true' : 'false';
+      document.getElementById('entradeEnabled').value = data.entrade && data.entrade.enabled ? 'true' : 'false';
+      document.getElementById('entradeMock').value = data.entrade && data.entrade.mock ? 'true' : 'false';
+      document.getElementById('entradeEnvironment').value = (data.entrade && data.entrade.environment) || 'paper';
+      document.getElementById('entradeDefaultAccounts').value = ((data.entrade && data.entrade.defaultAccountNos) || ['ENTRADE_DEMO']).join(',');
+      document.getElementById('entradeAccounts').value = formatEntradeAccounts((data.entrade && data.entrade.accounts) || []);
 
       const selectedSymbols = (data.marketData && data.marketData.symbols && data.marketData.symbols.length)
         ? data.marketData.symbols
@@ -535,7 +610,12 @@ const settingsHTML = layoutTop + `
         accountNo: document.getElementById('accountNo').value,
         mock: document.getElementById('mockMode').value === 'true',
         symbols: selectedSymbols,
-        primarySymbol: document.getElementById('primarySymbol').value
+        primarySymbol: document.getElementById('primarySymbol').value,
+        entradeEnabled: document.getElementById('entradeEnabled').value === 'true',
+        entradeMock: document.getElementById('entradeMock').value === 'true',
+        entradeEnvironment: document.getElementById('entradeEnvironment').value,
+        entradeDefaultAccountNos: splitAccounts(document.getElementById('entradeDefaultAccounts').value),
+        entradeAccounts: parseEntradeAccounts()
       };
 
       const res = await fetch('/api/settings', {

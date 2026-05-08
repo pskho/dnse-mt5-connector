@@ -1,6 +1,9 @@
 $mt5Path = Join-Path $env:APPDATA "MetaQuotes\Terminal"
 $sourceDll = Join-Path $PSScriptRoot "cpp\build\Release\DNSEBridge.dll"
-$sourceEa = Join-Path $PSScriptRoot "mql5\DNSE_MarketData_Bridge.mq5"
+$sourceEas = @(
+    (Join-Path $PSScriptRoot "mql5\DNSE_MarketData_Bridge.mq5"),
+    (Join-Path $PSScriptRoot "mql5\DNSE_SuperTrend_Bot.mq5")
+)
 
 function Find-MetaEditor {
     $candidates = @()
@@ -55,7 +58,9 @@ Write-Host "==================================================="
 Write-Host ""
 
 if (-Not (Test-Path $sourceDll)) { Write-Host "[ERROR] DLL not found: $sourceDll. Please build first." -ForegroundColor Red; exit 1 }
-if (-Not (Test-Path $sourceEa)) { Write-Host "[ERROR] EA not found: $sourceEa." -ForegroundColor Red; exit 1 }
+foreach ($sourceEa in $sourceEas) {
+    if (-Not (Test-Path $sourceEa)) { Write-Host "[ERROR] EA not found: $sourceEa." -ForegroundColor Red; exit 1 }
+}
 if (-Not (Test-Path $mt5Path)) { Write-Host "[ERROR] MT5 path not found: $mt5Path" -ForegroundColor Red; exit 1 }
 
 $metaEditor = Find-MetaEditor
@@ -76,7 +81,9 @@ foreach ($folder in $folders) {
         $destEaFolder = Join-Path $mql5Path "Experts\DNSE"
         $legacyEaFiles = @(
             (Join-Path $mql5Path "Experts\DNSE_MarketData_Bridge.mq5"),
-            (Join-Path $mql5Path "Experts\DNSE_MarketData_Bridge.ex5")
+            (Join-Path $mql5Path "Experts\DNSE_MarketData_Bridge.ex5"),
+            (Join-Path $mql5Path "Experts\DNSE_SuperTrend_Bot.mq5"),
+            (Join-Path $mql5Path "Experts\DNSE_SuperTrend_Bot.ex5")
         )
         
         if (-Not (Test-Path $destEaFolder)) { New-Item -ItemType Directory -Path $destEaFolder | Out-Null }
@@ -84,9 +91,10 @@ foreach ($folder in $folders) {
         Write-Host "  - Copying DLL to Libraries..."
         Copy-Item -Path $sourceDll -Destination $destLib -Force
         
-        Write-Host "  - Copying EA to Experts\DNSE..."
-        $destEa = Join-Path $destEaFolder "DNSE_MarketData_Bridge.mq5"
-        Copy-Item -Path $sourceEa -Destination $destEaFolder -Force
+        Write-Host "  - Copying EAs to Experts\DNSE..."
+        foreach ($sourceEa in $sourceEas) {
+            Copy-Item -Path $sourceEa -Destination $destEaFolder -Force
+        }
 
         foreach ($legacyEa in $legacyEaFiles) {
             if (Test-Path $legacyEa) {
@@ -95,7 +103,10 @@ foreach ($folder in $folders) {
             }
         }
 
-        Compile-EA $metaEditor $destEa
+        foreach ($sourceEa in $sourceEas) {
+            $destEa = Join-Path $destEaFolder (Split-Path $sourceEa -Leaf)
+            Compile-EA $metaEditor $destEa
+        }
         
         $deployCount++
         Write-Host ""

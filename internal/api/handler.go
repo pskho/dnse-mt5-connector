@@ -76,6 +76,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/order", h.order)
 	mux.HandleFunc("/order/", h.orderByID) // Will handle both /order/:id and /order/client/:id manually
 	mux.HandleFunc("/cancel", h.cancel)
+	mux.HandleFunc("/close-deal", h.closeDeal)
 	mux.HandleFunc("/history/sync", h.historySync)
 	mux.HandleFunc("/history/full", h.historyFull)
 	mux.HandleFunc("/history/backfill", h.historyBackfill)
@@ -440,6 +441,27 @@ func (h *Handler) cancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) closeDeal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var req service.CloseDealRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	results, err := h.orders.CloseDeals(r.Context(), req)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Success: false, Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "results": results})
 }
 
 func (h *Handler) positionsHandler(w http.ResponseWriter, r *http.Request) {
@@ -1203,21 +1225,33 @@ func (h *Handler) settingsAPI(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		// Mask secret
+		// Mask secrets while keeping account rows visible in the WebUI.
 		cfg.DNSE.APISecret = ""
 		cfg.DNSE.SecretKey = ""
+		cfg.DNSE.TradingToken = ""
+		cfg.Entrade.Password = ""
+		cfg.Entrade.TradingToken = ""
+		for i := range cfg.Entrade.Accounts {
+			cfg.Entrade.Accounts[i].Password = ""
+			cfg.Entrade.Accounts[i].TradingToken = ""
+		}
 		writeJSON(w, http.StatusOK, cfg)
 		return
 	}
 
 	if r.Method == http.MethodPost {
 		var req struct {
-			APIKey        string   `json:"apiKey"`
-			APISecret     string   `json:"apiSecret"`
-			AccountNo     string   `json:"accountNo"`
-			Mock          bool     `json:"mock"`
-			Symbols       []string `json:"symbols"`
-			PrimarySymbol string   `json:"primarySymbol"`
+			APIKey                   string                        `json:"apiKey"`
+			APISecret                string                        `json:"apiSecret"`
+			AccountNo                string                        `json:"accountNo"`
+			Mock                     bool                          `json:"mock"`
+			Symbols                  []string                      `json:"symbols"`
+			PrimarySymbol            string                        `json:"primarySymbol"`
+			EntradeEnabled           bool                          `json:"entradeEnabled"`
+			EntradeMock              bool                          `json:"entradeMock"`
+			EntradeEnvironment       string                        `json:"entradeEnvironment"`
+			EntradeDefaultAccountNos []string                      `json:"entradeDefaultAccountNos"`
+			EntradeAccounts          []config.EntradeAccountConfig `json:"entradeAccounts"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid json")
@@ -1241,6 +1275,17 @@ func (h *Handler) settingsAPI(w http.ResponseWriter, r *http.Request) {
 			cfg.DNSE.AccountNo = req.AccountNo
 		}
 		cfg.DNSE.Mock = req.Mock
+		cfg.Entrade.Enabled = req.EntradeEnabled
+		cfg.Entrade.Mock = req.EntradeMock
+		if strings.TrimSpace(req.EntradeEnvironment) != "" {
+			cfg.Entrade.Environment = strings.ToLower(strings.TrimSpace(req.EntradeEnvironment))
+		}
+		if req.EntradeDefaultAccountNos != nil {
+			cfg.Entrade.DefaultAccountNos = normalizeAPIAccountNos(req.EntradeDefaultAccountNos)
+		}
+		if req.EntradeAccounts != nil {
+			cfg.Entrade.Accounts = mergeEntradeAccountsForSave(req.EntradeAccounts, cfg.Entrade.Accounts)
+		}
 		if len(req.Symbols) > 0 {
 			cfg.MarketData.Symbols = h.canonicalizeSymbols(r.Context(), req.Symbols)
 		}
@@ -1286,6 +1331,66 @@ func (h *Handler) canonicalizeSymbols(ctx context.Context, symbols []string) []s
 		}
 		seen[symbol] = struct{}{}
 		out = append(out, symbol)
+	}
+	return out
+}
+
+func normalizeAPIAccountNos(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			part = strings.ToUpper(strings.TrimSpace(part))
+			if part == "" {
+				continue
+			}
+			if _, ok := seen[part]; ok {
+				continue
+			}
+			seen[part] = struct{}{}
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func mergeEntradeAccountsForSave(incoming, existing []config.EntradeAccountConfig) []config.EntradeAccountConfig {
+	existingByID := map[string]config.EntradeAccountConfig{}
+	for _, account := range existing {
+		id := strings.ToUpper(strings.TrimSpace(account.ID))
+		if id != "" {
+			existingByID[id] = account
+		}
+	}
+	out := make([]config.EntradeAccountConfig, 0, len(incoming))
+	seen := map[string]struct{}{}
+	for _, account := range incoming {
+		account.ID = strings.ToUpper(strings.TrimSpace(account.ID))
+		if account.ID == "" {
+			continue
+		}
+		if _, ok := seen[account.ID]; ok {
+			continue
+		}
+		seen[account.ID] = struct{}{}
+		account.Environment = strings.ToLower(strings.TrimSpace(account.Environment))
+		if account.Environment == "" {
+			account.Environment = "paper"
+		}
+		account.Username = strings.TrimSpace(account.Username)
+		account.Password = strings.TrimSpace(account.Password)
+		account.InvestorID = strings.TrimSpace(account.InvestorID)
+		account.AccountNo = strings.TrimSpace(account.AccountNo)
+		account.TradingToken = strings.TrimSpace(account.TradingToken)
+		if old, ok := existingByID[account.ID]; ok {
+			if account.Password == "" {
+				account.Password = old.Password
+			}
+			if account.TradingToken == "" {
+				account.TradingToken = old.TradingToken
+			}
+		}
+		out = append(out, account)
 	}
 	return out
 }

@@ -75,17 +75,30 @@ type DNSEConfig struct {
 }
 
 type EntradeConfig struct {
-	Enabled      bool   `json:"enabled"`
+	Enabled           bool                   `json:"enabled"`
+	Environment       string                 `json:"environment"`
+	AuthURL           string                 `json:"authUrl"`
+	BaseURL           string                 `json:"baseUrl"`
+	PaperBaseURL      string                 `json:"paperBaseUrl"`
+	Username          string                 `json:"username"`
+	Password          string                 `json:"password"`
+	InvestorID        string                 `json:"investorId"`
+	AccountNo         string                 `json:"accountNo"`
+	DefaultAccountNos []string               `json:"defaultAccountNos"`
+	Accounts          []EntradeAccountConfig `json:"accounts"`
+	TradingToken      string                 `json:"tradingToken"`
+	Mock              bool                   `json:"mock"`
+}
+
+type EntradeAccountConfig struct {
+	ID           string `json:"id"`
 	Environment  string `json:"environment"`
-	AuthURL      string `json:"authUrl"`
-	BaseURL      string `json:"baseUrl"`
-	PaperBaseURL string `json:"paperBaseUrl"`
 	Username     string `json:"username"`
-	Password     string `json:"password"`
-	InvestorID   string `json:"investorId"`
-	AccountNo    string `json:"accountNo"`
-	TradingToken string `json:"tradingToken"`
-	Mock         bool   `json:"mock"`
+	Password     string `json:"password,omitempty"`
+	InvestorID   string `json:"investorId,omitempty"`
+	AccountNo    string `json:"accountNo,omitempty"`
+	TradingToken string `json:"tradingToken,omitempty"`
+	Enabled      bool   `json:"enabled"`
 }
 
 type MarketDataConfig struct {
@@ -115,10 +128,11 @@ func Load(path string) (Config, error) {
 			Mock:    true,
 		},
 		Entrade: EntradeConfig{
-			Environment:  "paper",
-			AuthURL:      "https://services.entrade.com.vn/entrade-api/v2/auth",
-			BaseURL:      "https://services.entrade.com.vn/entrade-api",
-			PaperBaseURL: "https://services.entrade.com.vn/papertrade-entrade-api",
+			Environment:       "paper",
+			AuthURL:           "https://services.entrade.com.vn/entrade-api/v2/auth",
+			BaseURL:           "https://services.entrade.com.vn/entrade-api",
+			PaperBaseURL:      "https://services.entrade.com.vn/papertrade-entrade-api",
+			DefaultAccountNos: []string{"ENTRADE_DEMO"},
 		},
 		MarketData: MarketDataConfig{
 			Enabled:          true,
@@ -217,6 +231,11 @@ func normalize(cfg *Config) {
 	if cfg.Entrade.PaperBaseURL == "" {
 		cfg.Entrade.PaperBaseURL = "https://services.entrade.com.vn/papertrade-entrade-api"
 	}
+	cfg.Entrade.DefaultAccountNos = normalizeAccountNos(cfg.Entrade.DefaultAccountNos)
+	if len(cfg.Entrade.DefaultAccountNos) == 0 && strings.TrimSpace(cfg.Entrade.AccountNo) != "" {
+		cfg.Entrade.DefaultAccountNos = normalizeAccountNos([]string{cfg.Entrade.AccountNo})
+	}
+	cfg.Entrade.Accounts = normalizeEntradeAccounts(cfg.Entrade)
 	if cfg.Risk.MaxQuantity <= 0 {
 		cfg.Risk.MaxQuantity = 10
 	}
@@ -363,6 +382,10 @@ func parseSimpleYAML(data []byte, cfg *Config) error {
 				cfg.Entrade.InvestorID = value
 			case "account_no":
 				cfg.Entrade.AccountNo = value
+			case "default_accounts":
+				cfg.Entrade.DefaultAccountNos = splitCSV(value)
+			case "account_profiles":
+				cfg.Entrade.Accounts = parseEntradeAccountProfiles(value)
 			case "trading_token":
 				cfg.Entrade.TradingToken = value
 			case "mock":
@@ -530,6 +553,7 @@ dnse:
   base_url: "%s"
   api_key: "%s"
   api_secret: "%s"
+  trading_token: "%s"
   account_no: "%s"
   mock: %v
 
@@ -543,6 +567,8 @@ entrade:
   password: "%s"
   investor_id: "%s"
   account_no: "%s"
+  default_accounts: [%s]
+  account_profiles: "%s"
   trading_token: "%s"
   mock: %v
 
@@ -575,9 +601,11 @@ gmail_otp:
 `,
 		c.Host, c.Port, c.DatabasePath, c.LogFile,
 		c.Risk.MaxQuantity, c.Risk.MaxOpenPosition, c.Risk.DuplicateWindowSeconds,
-		c.DNSE.BaseURL, c.DNSE.APIKey, c.DNSE.APISecret, c.DNSE.AccountNo, c.DNSE.Mock,
+		c.DNSE.BaseURL, c.DNSE.APIKey, c.DNSE.APISecret, c.DNSE.TradingToken, c.DNSE.AccountNo, c.DNSE.Mock,
 		c.Entrade.Enabled, c.Entrade.Environment, c.Entrade.AuthURL, c.Entrade.BaseURL, c.Entrade.PaperBaseURL,
-		c.Entrade.Username, c.Entrade.Password, c.Entrade.InvestorID, c.Entrade.AccountNo, c.Entrade.TradingToken, c.Entrade.Mock,
+		c.Entrade.Username, c.Entrade.Password, c.Entrade.InvestorID, c.Entrade.AccountNo,
+		strings.Join(quoteChannels(c.Entrade.DefaultAccountNos), ", "), formatEntradeAccountProfiles(c.Entrade.Accounts),
+		c.Entrade.TradingToken, c.Entrade.Mock,
 		c.MarketData.Enabled, c.MarketData.Symbol, strings.Join(quoteChannels(c.MarketData.Symbols), ", "), c.MarketData.BridgeAddress, c.MarketData.WebSocketURL, strings.Join(quoteChannels(c.MarketData.Channels), ", "), c.MarketData.Mock, c.MarketData.ReconnectSeconds,
 		c.History.Enabled, c.History.Symbol, c.History.MarketType, c.History.Resolution, c.History.InitialLookbackDays, c.History.IncrementalSync, c.History.FullRebuild, c.History.MaxBatchDays,
 		c.GmailOTP.Enabled, c.GmailOTP.CredentialsFile, c.GmailOTP.TokenFile, c.GmailOTP.PollIntervalSeconds, c.GmailOTP.EmailDomainFilter,
@@ -612,4 +640,121 @@ func normalizeSymbols(symbols []string) []string {
 		out = append(out, symbol)
 	}
 	return out
+}
+
+func normalizeAccountNos(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.ToUpper(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func normalizeEntradeAccounts(cfg EntradeConfig) []EntradeAccountConfig {
+	accounts := make([]EntradeAccountConfig, 0, len(cfg.Accounts)+1)
+	seen := map[string]struct{}{}
+	add := func(account EntradeAccountConfig) {
+		account.ID = strings.ToUpper(strings.TrimSpace(account.ID))
+		if account.ID == "" {
+			return
+		}
+		if _, ok := seen[account.ID]; ok {
+			return
+		}
+		seen[account.ID] = struct{}{}
+		account.Environment = strings.ToLower(strings.TrimSpace(account.Environment))
+		if account.Environment == "" {
+			account.Environment = "paper"
+		}
+		if account.Username == "" {
+			account.Username = cfg.Username
+		}
+		if account.Password == "" {
+			account.Password = cfg.Password
+		}
+		if account.InvestorID == "" {
+			account.InvestorID = cfg.InvestorID
+		}
+		if account.AccountNo == "" {
+			account.AccountNo = cfg.AccountNo
+		}
+		if account.TradingToken == "" {
+			account.TradingToken = cfg.TradingToken
+		}
+		accounts = append(accounts, account)
+	}
+	for _, account := range cfg.Accounts {
+		if account.ID != "" {
+			add(account)
+		}
+	}
+	if len(accounts) == 0 && strings.TrimSpace(cfg.Username) != "" {
+		add(EntradeAccountConfig{ID: "ENTRADE_DEMO", Environment: "paper", Enabled: true})
+	}
+	return accounts
+}
+
+func parseEntradeAccountProfiles(value string) []EntradeAccountConfig {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	rows := strings.Split(value, ";")
+	out := make([]EntradeAccountConfig, 0, len(rows))
+	for _, row := range rows {
+		cols := strings.Split(row, "|")
+		if len(cols) < 4 {
+			continue
+		}
+		account := EntradeAccountConfig{
+			ID:          strings.ToUpper(strings.TrimSpace(cols[0])),
+			Environment: strings.ToLower(strings.TrimSpace(cols[1])),
+			Username:    strings.TrimSpace(cols[2]),
+			Password:    strings.TrimSpace(cols[3]),
+			Enabled:     true,
+		}
+		if len(cols) > 4 {
+			account.InvestorID = strings.TrimSpace(cols[4])
+		}
+		if len(cols) > 5 {
+			account.AccountNo = strings.TrimSpace(cols[5])
+		}
+		if len(cols) > 6 {
+			account.TradingToken = strings.TrimSpace(cols[6])
+		}
+		if len(cols) > 7 {
+			account.Enabled, _ = strconv.ParseBool(strings.TrimSpace(cols[7]))
+		}
+		out = append(out, account)
+	}
+	return out
+}
+
+func formatEntradeAccountProfiles(accounts []EntradeAccountConfig) string {
+	rows := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		if !account.Enabled || strings.TrimSpace(account.ID) == "" {
+			continue
+		}
+		rows = append(rows, strings.Join([]string{
+			strings.ToUpper(strings.TrimSpace(account.ID)),
+			strings.ToLower(strings.TrimSpace(account.Environment)),
+			strings.ReplaceAll(strings.TrimSpace(account.Username), "|", ""),
+			strings.ReplaceAll(strings.TrimSpace(account.Password), "|", ""),
+			strings.ReplaceAll(strings.TrimSpace(account.InvestorID), "|", ""),
+			strings.ReplaceAll(strings.TrimSpace(account.AccountNo), "|", ""),
+			strings.ReplaceAll(strings.TrimSpace(account.TradingToken), "|", ""),
+			strconv.FormatBool(account.Enabled),
+		}, "|"))
+	}
+	return strings.ReplaceAll(strings.Join(rows, ";"), `"`, `\"`)
 }

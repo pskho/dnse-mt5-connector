@@ -19,21 +19,25 @@ const (
 )
 
 type SignalRequest struct {
-	AccountNo     string  `json:"accountNo,omitempty"`
-	Symbol        string  `json:"symbol"`
-	Side          string  `json:"side"`
-	Quantity      int     `json:"quantity"`
-	Price         float64 `json:"price,omitempty"`
-	OrderType     string  `json:"orderType,omitempty"`
-	MarketType    string  `json:"marketType,omitempty"`
-	OrderCategory string  `json:"orderCategory,omitempty"`
+	Action        string   `json:"action,omitempty"`
+	AccountNo     string   `json:"accountNo,omitempty"`
+	AccountNos    []string `json:"accountNos,omitempty"`
+	Symbol        string   `json:"symbol"`
+	Side          string   `json:"side"`
+	Quantity      int      `json:"quantity"`
+	Price         float64  `json:"price,omitempty"`
+	OrderType     string   `json:"orderType,omitempty"`
+	MarketType    string   `json:"marketType,omitempty"`
+	OrderCategory string   `json:"orderCategory,omitempty"`
 }
 
 type Signal struct {
 	ID            string    `json:"id"`
 	Timestamp     time.Time `json:"timestamp"`
 	ExpiresAt     time.Time `json:"expiresAt"`
+	Action        string    `json:"action"`
 	AccountNo     string    `json:"accountNo,omitempty"`
+	AccountNos    []string  `json:"accountNos,omitempty"`
 	Symbol        string    `json:"symbol"`
 	Side          string    `json:"side"`
 	Quantity      int       `json:"quantity"`
@@ -97,7 +101,9 @@ func (s *SignalService) Receive(ctx context.Context, req SignalRequest) (SignalR
 		ID:            newSignalID(),
 		Timestamp:     now,
 		ExpiresAt:     now.Add(s.ttl),
+		Action:        normalized.Action,
 		AccountNo:     normalized.AccountNo,
+		AccountNos:    normalized.AccountNos,
 		Symbol:        normalized.Symbol,
 		Side:          normalized.Side,
 		Quantity:      normalized.Quantity,
@@ -128,9 +134,24 @@ func (s *SignalService) Receive(ctx context.Context, req SignalRequest) (SignalR
 
 	s.log("info", "signal_received", map[string]any{"signal": signal, "mode": mode})
 	if mode == ModeAuto {
+		if normalized.Action == "CLOSE_DEAL" {
+			resp, err := s.orders.CloseDeals(ctx, CloseDealRequest{
+				AccountNo:  signal.AccountNo,
+				AccountNos: signal.AccountNos,
+				Symbol:     signal.Symbol,
+				OrderType:  signal.OrderType,
+			})
+			if err != nil {
+				s.log("error", "signal_auto_close_deal_failed", map[string]any{"signalId": signal.ID, "error": err.Error(), "signal": signal})
+				return SignalResponse{}, err
+			}
+			s.log("info", "signal_auto_close_deal_submitted", map[string]any{"signalId": signal.ID, "results": resp})
+			return SignalResponse{SignalID: signal.ID, ExpiresAt: signal.ExpiresAt}, nil
+		}
 		orderReq := OrderRequest{
 			ClientOrderID: "signal-" + signal.ID,
 			AccountNo:     signal.AccountNo,
+			AccountNos:    signal.AccountNos,
 			Symbol:        signal.Symbol,
 			Side:          signal.Side,
 			Quantity:      signal.Quantity,
@@ -139,7 +160,7 @@ func (s *SignalService) Receive(ctx context.Context, req SignalRequest) (SignalR
 			MarketType:    signal.MarketType,
 			OrderCategory: signal.OrderCategory,
 		}
-		resp, err := s.orders.PlaceOrder(ctx, orderReq)
+		resp, err := s.placeSignalOrder(ctx, orderReq)
 		if err != nil {
 			s.log("error", "signal_auto_order_failed", map[string]any{"signalId": signal.ID, "error": err.Error(), "signal": signal})
 			return SignalResponse{}, err
@@ -173,6 +194,7 @@ func (s *SignalService) Confirm(ctx context.Context, signalID string) (OrderResp
 	orderReq := OrderRequest{
 		ClientOrderID: "signal-" + signal.ID,
 		AccountNo:     signal.AccountNo,
+		AccountNos:    signal.AccountNos,
 		Symbol:        signal.Symbol,
 		Side:          signal.Side,
 		Quantity:      signal.Quantity,
@@ -181,13 +203,45 @@ func (s *SignalService) Confirm(ctx context.Context, signalID string) (OrderResp
 		MarketType:    signal.MarketType,
 		OrderCategory: signal.OrderCategory,
 	}
-	resp, err := s.orders.PlaceOrder(ctx, orderReq)
+	if signal.Action == "CLOSE_DEAL" {
+		results, err := s.orders.CloseDeals(ctx, CloseDealRequest{
+			AccountNo:  signal.AccountNo,
+			AccountNos: signal.AccountNos,
+			Symbol:     signal.Symbol,
+			OrderType:  signal.OrderType,
+		})
+		if err != nil {
+			s.log("error", "signal_close_deal_failed", map[string]any{"signalId": signalID, "error": err.Error(), "signal": signal})
+			return OrderResponse{}, err
+		}
+		s.log("info", "signal_close_deal_confirmed", map[string]any{"signalId": signalID, "results": results})
+		return OrderResponse{Success: true, Status: "CLOSE_DEAL_SUBMITTED", Message: "close deal submitted"}, nil
+	}
+	resp, err := s.placeSignalOrder(ctx, orderReq)
 	if err != nil {
 		s.log("error", "signal_confirm_failed", map[string]any{"signalId": signalID, "error": err.Error(), "signal": signal})
 		return OrderResponse{}, err
 	}
 	s.log("info", "signal_confirmed", map[string]any{"signalId": signalID, "orderId": resp.OrderID})
 	return resp, nil
+}
+
+func (s *SignalService) placeSignalOrder(ctx context.Context, req OrderRequest) (OrderResponse, error) {
+	responses, err := s.orders.PlaceOrders(ctx, req)
+	if err != nil {
+		return OrderResponse{}, err
+	}
+	return OrderResponse{Success: true, Status: "BATCH_SUBMITTED", Message: "batch order submitted", OrderID: batchOrderIDs(responses)}, nil
+}
+
+func batchOrderIDs(responses []OrderResponse) string {
+	ids := make([]string, 0, len(responses))
+	for _, resp := range responses {
+		if resp.OrderID != "" {
+			ids = append(ids, resp.AccountNo+":"+resp.OrderID)
+		}
+	}
+	return strings.Join(ids, ",")
 }
 
 func (s *SignalService) Reject(signalID string) error {
@@ -277,17 +331,45 @@ func (s *SignalService) pruneExpiredLocked(now time.Time) {
 }
 
 func normalizeSignal(req SignalRequest) (SignalRequest, error) {
+	req.Action = strings.ToUpper(strings.TrimSpace(req.Action))
 	req.AccountNo = strings.TrimSpace(req.AccountNo)
+	req.AccountNos = normalizeAccountList(req.AccountNos)
 	req.Symbol = strings.ToUpper(strings.TrimSpace(req.Symbol))
 	req.Side = strings.ToUpper(strings.TrimSpace(req.Side))
 	req.OrderType = strings.ToUpper(strings.TrimSpace(req.OrderType))
 	req.MarketType = strings.ToUpper(strings.TrimSpace(req.MarketType))
 	req.OrderCategory = strings.ToUpper(strings.TrimSpace(req.OrderCategory))
+	if req.Action == "" {
+		switch req.Side {
+		case "BUY":
+			req.Action = "BUY"
+		case "SELL":
+			req.Action = "SELL"
+		default:
+			req.Action = "ORDER"
+		}
+	}
 	if req.Symbol == "" {
-		return req, errors.New("symbol is required")
+		req.Symbol = "VN30F1M"
+	}
+	if req.Action == "CLOSE" || req.Action == "CLOSE_DEAL" {
+		req.Action = "CLOSE_DEAL"
+		if req.OrderType == "" {
+			req.OrderType = "MTL"
+		}
+		if req.MarketType == "" {
+			req.MarketType = "DERIVATIVE"
+		}
+		if req.OrderCategory == "" {
+			req.OrderCategory = "NORMAL"
+		}
+		return req, nil
+	}
+	if req.Side == "" {
+		req.Side = req.Action
 	}
 	if req.Side != "BUY" && req.Side != "SELL" {
-		return req, errors.New("side must be BUY or SELL")
+		return req, errors.New("side/action must be BUY, SELL, or CLOSE_DEAL")
 	}
 	if req.Quantity <= 0 {
 		return req, errors.New("quantity must be greater than zero")

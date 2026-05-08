@@ -29,11 +29,15 @@ func NewPositionService(dnse PositionClient, appLog *logger.FileLogger, defaultA
 }
 
 func (s *PositionService) GetCurrentPosition(ctx context.Context, symbol string) (Position, error) {
+	return s.GetCurrentPositionForAccount(ctx, s.defaultAccountNo, symbol)
+}
+
+func (s *PositionService) GetCurrentPositionForAccount(ctx context.Context, accountNo, symbol string) (Position, error) {
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
 	if symbol == "" {
 		return Position{}, errors.New("symbol is required")
 	}
-	positions, err := s.GetAllPositions(ctx)
+	positions, err := s.GetAllPositionsForAccount(ctx, accountNo)
 	if err != nil {
 		return Position{}, err
 	}
@@ -46,12 +50,17 @@ func (s *PositionService) GetCurrentPosition(ctx context.Context, symbol string)
 }
 
 func (s *PositionService) GetAllPositions(ctx context.Context) ([]Position, error) {
-	if s.defaultAccountNo == "" {
+	return s.GetAllPositionsForAccount(ctx, s.defaultAccountNo)
+}
+
+func (s *PositionService) GetAllPositionsForAccount(ctx context.Context, accountNo string) ([]Position, error) {
+	accountNo = strings.TrimSpace(accountNo)
+	if accountNo == "" {
 		return nil, errors.New("accountNo is required for position lookup")
 	}
-	rawPositions, err := s.dnse.GetPositions(ctx, s.defaultAccountNo, "DERIVATIVE")
+	rawPositions, err := s.dnse.GetPositions(ctx, accountNo, "DERIVATIVE")
 	if err != nil {
-		s.log("error", "position_fetch_failed", map[string]any{"error": err.Error()})
+		s.log("error", "position_fetch_failed", map[string]any{"accountNo": accountNo, "error": err.Error()})
 		return nil, err
 	}
 
@@ -87,7 +96,7 @@ func (s *PositionService) GetAllPositions(ctx context.Context) ([]Position, erro
 	for _, position := range bySymbol {
 		out = append(out, position)
 	}
-	s.log("info", "positions_loaded", map[string]any{"count": len(out)})
+	s.log("info", "positions_loaded", map[string]any{"accountNo": accountNo, "count": len(out)})
 	return out, nil
 }
 

@@ -25,6 +25,7 @@ $requiredFiles = @(
     (Join-Path $root "deploy_mt5.ps1"),
     (Join-Path $root "deploy_mt5.bat"),
     (Join-Path $root "mql5\DNSE_MarketData_Bridge.mq5"),
+    (Join-Path $root "mql5\DNSE_SuperTrend_Bot.mq5"),
     (Join-Path $root "cpp\build\Release\DNSEBridge.dll")
 )
 
@@ -56,6 +57,7 @@ Copy-Item $bridgePath (Join-Path $packageRoot "bridge.exe") -Force
 Copy-Item (Join-Path $root "deploy_mt5.ps1") (Join-Path $packageRoot "deploy_mt5.ps1") -Force
 Copy-Item (Join-Path $root "deploy_mt5.bat") (Join-Path $packageRoot "deploy_mt5.bat") -Force
 Copy-Item (Join-Path $root "mql5\DNSE_MarketData_Bridge.mq5") (Join-Path $packageRoot "mql5\DNSE_MarketData_Bridge.mq5") -Force
+Copy-Item (Join-Path $root "mql5\DNSE_SuperTrend_Bot.mq5") (Join-Path $packageRoot "mql5\DNSE_SuperTrend_Bot.mq5") -Force
 Copy-Item (Join-Path $root "cpp\build\Release\DNSEBridge.dll") (Join-Path $packageRoot "cpp\build\Release\DNSEBridge.dll") -Force
 Copy-Item (Join-Path $root "README_TRIAL_VN30F1M.md") (Join-Path $packageRoot "README_TRIAL_VN30F1M.md") -Force
 Copy-Item (Join-Path $root "start_trial.bat") (Join-Path $packageRoot "start_trial.bat") -Force

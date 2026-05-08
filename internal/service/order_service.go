@@ -32,6 +32,10 @@ type DNSEClient interface {
 	CancelOrder(ctx context.Context, accountNo, orderID, marketType, orderCategory string) (dnsemodel.CancelOrderResponse, error)
 }
 
+type DealCloser interface {
+	CloseDealsBySymbol(ctx context.Context, accountNo, symbol, orderType string) ([]dnsemodel.CloseDealResponse, error)
+}
+
 type securityDefinitionClient interface {
 	GetSecurityDefinition(ctx context.Context, symbol string) ([]map[string]any, error)
 }
@@ -41,16 +45,17 @@ type RiskEngine interface {
 }
 
 type OrderService struct {
-	store            Store
-	dnse             DNSEClient
-	risk             RiskEngine
-	logger           *logger.FileLogger
-	defaultAccountNo string
-	positions        *PositionService
-	maxOpenPosition  int
-	systemEnabled    bool
-	idempotency      map[string]idempotencyEntry
-	mu               sync.Mutex
+	store             Store
+	dnse              DNSEClient
+	risk              RiskEngine
+	logger            *logger.FileLogger
+	defaultAccountNo  string
+	defaultAccountNos []string
+	positions         *PositionService
+	maxOpenPosition   int
+	systemEnabled     bool
+	idempotency       map[string]idempotencyEntry
+	mu                sync.Mutex
 }
 
 type idempotencyEntry struct {
@@ -62,16 +67,25 @@ func NewOrderService(store Store, dnseClient DNSEClient, riskEngine RiskEngine, 
 	if maxOpenPosition <= 0 {
 		maxOpenPosition = 10
 	}
+	defaultAccounts := normalizeAccountList(strings.Split(defaultAccountNo, ","))
+	if len(defaultAccounts) == 0 && strings.TrimSpace(defaultAccountNo) != "" {
+		defaultAccounts = []string{strings.TrimSpace(defaultAccountNo)}
+	}
+	primaryAccount := ""
+	if len(defaultAccounts) > 0 {
+		primaryAccount = defaultAccounts[0]
+	}
 	return &OrderService{
-		store:            store,
-		dnse:             dnseClient,
-		risk:             riskEngine,
-		logger:           appLog,
-		defaultAccountNo: strings.TrimSpace(defaultAccountNo),
-		positions:        positions,
-		maxOpenPosition:  maxOpenPosition,
-		systemEnabled:    true,
-		idempotency:      make(map[string]idempotencyEntry),
+		store:             store,
+		dnse:              dnseClient,
+		risk:              riskEngine,
+		logger:            appLog,
+		defaultAccountNo:  primaryAccount,
+		defaultAccountNos: defaultAccounts,
+		positions:         positions,
+		maxOpenPosition:   maxOpenPosition,
+		systemEnabled:     true,
+		idempotency:       make(map[string]idempotencyEntry),
 	}
 }
 
@@ -183,6 +197,9 @@ func (s *OrderService) PlaceOrders(ctx context.Context, req OrderRequest) ([]Ord
 		accounts = []string{strings.TrimSpace(req.AccountNo)}
 	}
 	if len(accounts) == 0 {
+		accounts = append(accounts, s.defaultAccountNos...)
+	}
+	if len(accounts) == 0 {
 		resp, err := s.PlaceOrder(ctx, req)
 		if err != nil {
 			return nil, err
@@ -212,6 +229,64 @@ func (s *OrderService) PlaceOrders(ctx context.Context, req OrderRequest) ([]Ord
 		allFailed := true
 		for _, resp := range out {
 			if resp.Success {
+				allFailed = false
+				break
+			}
+		}
+		if allFailed {
+			return out, firstErr
+		}
+	}
+	return out, nil
+}
+
+func (s *OrderService) CloseDeals(ctx context.Context, req CloseDealRequest) ([]dnsemodel.CloseDealResponse, error) {
+	closer, ok := s.dnse.(DealCloser)
+	if !ok {
+		return nil, errors.New("close deal is not supported by the selected trading provider")
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(req.Symbol))
+	if symbol == "" {
+		symbol = "VN30F1M"
+	}
+	orderType := strings.ToUpper(strings.TrimSpace(req.OrderType))
+	if orderType == "" {
+		orderType = "MTL"
+	}
+	accounts := normalizeAccountList(req.AccountNos)
+	if len(accounts) == 0 && strings.TrimSpace(req.AccountNo) != "" {
+		accounts = []string{strings.TrimSpace(req.AccountNo)}
+	}
+	if len(accounts) == 0 {
+		accounts = append(accounts, s.defaultAccountNos...)
+	}
+	if len(accounts) == 0 {
+		return nil, errors.New("accountNo or accountNos is required for close deal")
+	}
+	out := make([]dnsemodel.CloseDealResponse, 0, len(accounts))
+	var firstErr error
+	for _, accountNo := range accounts {
+		items, err := closer.CloseDealsBySymbol(ctx, accountNo, symbol, orderType)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			out = append(out, dnsemodel.CloseDealResponse{Success: false, AccountNo: accountNo, Status: "ERROR", RawResponse: err.Error()})
+			continue
+		}
+		if len(items) == 0 {
+			out = append(out, dnsemodel.CloseDealResponse{Success: true, AccountNo: accountNo, Status: "NO_OPEN_DEAL"})
+			continue
+		}
+		for _, item := range items {
+			item.AccountNo = accountNo
+			out = append(out, item)
+		}
+	}
+	if firstErr != nil {
+		allFailed := true
+		for _, item := range out {
+			if item.Success {
 				allFailed = false
 				break
 			}
@@ -447,7 +522,7 @@ func (s *OrderService) checkPositionLimit(ctx context.Context, req OrderRequest)
 	if s.positions == nil {
 		return errors.New("position service is not configured")
 	}
-	position, err := s.positions.GetCurrentPosition(ctx, req.Symbol)
+	position, err := s.positions.GetCurrentPositionForAccount(ctx, req.AccountNo, req.Symbol)
 	if err != nil {
 		return fmt.Errorf("cannot fetch current position: %w", err)
 	}
@@ -604,7 +679,7 @@ func (s *OrderService) log(ctx context.Context, level, event string, details map
 }
 
 func orderIdempotencyKey(req OrderRequest) string {
-	raw := fmt.Sprintf("%s|%s|%d", req.Symbol, req.Side, req.Quantity)
+	raw := fmt.Sprintf("%s|%s|%s|%d", req.AccountNo, req.Symbol, req.Side, req.Quantity)
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
 }

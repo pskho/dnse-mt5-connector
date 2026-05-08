@@ -1,21 +1,21 @@
 package dnsemodel
 
 type Account struct {
-	AccountNo                string `json:"accountNo"`
+	AccountNo               string `json:"accountNo"`
 	DerivativeAccountStatus string `json:"derivativeAccountStatus"`
 }
 
 type PlaceOrderRequest struct {
-	ClientOrderID string   `json:"clientOrderId,omitempty"`
-	AccountNo     string   `json:"accountNo"`
-	Symbol        string   `json:"symbol"`
-	Side          string   `json:"side"`
-	Quantity      int      `json:"quantity"`
-	Price         float64  `json:"price,omitempty"`
-	OrderType     string   `json:"orderType"`
-	LoanPackageID *int     `json:"loanPackageId,omitempty"`
-	MarketType    string   `json:"-"`
-	OrderCategory string   `json:"-"`
+	ClientOrderID string  `json:"clientOrderId,omitempty"`
+	AccountNo     string  `json:"accountNo"`
+	Symbol        string  `json:"symbol"`
+	Side          string  `json:"side"`
+	Quantity      int     `json:"quantity"`
+	Price         float64 `json:"price,omitempty"`
+	OrderType     string  `json:"orderType"`
+	LoanPackageID *int    `json:"loanPackageId,omitempty"`
+	MarketType    string  `json:"-"`
+	OrderCategory string  `json:"-"`
 }
 
 type PlaceOrderResponse struct {
@@ -25,11 +25,11 @@ type PlaceOrderResponse struct {
 }
 
 type OrderStatus struct {
-	OrderID          string `json:"orderId"`
-	Status           string `json:"status"`
-	FilledQuantity   int    `json:"filledQuantity"`
-	RemainingQuantity int   `json:"remainingQuantity"`
-	RawResponse      string `json:"-"`
+	OrderID           string `json:"orderId"`
+	Status            string `json:"status"`
+	FilledQuantity    int    `json:"filledQuantity"`
+	RemainingQuantity int    `json:"remainingQuantity"`
+	RawResponse       string `json:"-"`
 }
 
 type CancelOrderResponse struct {
@@ -62,4 +62,13 @@ type Position struct {
 	Symbol   string `json:"symbol"`
 	Side     string `json:"side,omitempty"`
 	Quantity int    `json:"quantity"`
+}
+
+type CloseDealResponse struct {
+	Success     bool   `json:"success"`
+	DealID      string `json:"dealId,omitempty"`
+	OrderID     string `json:"orderId,omitempty"`
+	Status      string `json:"status,omitempty"`
+	AccountNo   string `json:"accountNo,omitempty"`
+	RawResponse string `json:"-"`
 }

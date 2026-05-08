@@ -28,11 +28,24 @@ type Client struct {
 	token      string
 	expiresAt  time.Time
 	investorID string
+	states     map[string]*accountState
+}
+
+type accountState struct {
+	token      string
+	expiresAt  time.Time
+	investorID string
 }
 
 type authResponse struct {
 	Token string `json:"token"`
 }
+
+const (
+	AccountDemo     = "ENTRADE_DEMO"
+	AccountReal     = "ENTRADE_REAL"
+	defaultStateKey = "__DEFAULT__"
+)
 
 func NewClient(cfg config.EntradeConfig, appLog *logger.FileLogger) *Client {
 	return &Client{
@@ -42,42 +55,160 @@ func NewClient(cfg config.EntradeConfig, appLog *logger.FileLogger) *Client {
 		},
 		logger:     appLog,
 		investorID: strings.TrimSpace(cfg.InvestorID),
+		states:     make(map[string]*accountState),
 	}
+}
+
+func (c *Client) configuredAccountIDs() []string {
+	out := make([]string, 0, len(c.cfg.Accounts)+len(c.cfg.DefaultAccountNos)+1)
+	seen := map[string]struct{}{}
+	add := func(value string) {
+		value = strings.ToUpper(strings.TrimSpace(value))
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	for _, account := range c.cfg.Accounts {
+		if !account.Enabled {
+			continue
+		}
+		add(account.ID)
+	}
+	if len(out) == 0 {
+		for _, accountNo := range c.cfg.DefaultAccountNos {
+			add(accountNo)
+		}
+	}
+	if len(out) == 0 {
+		add(c.cfg.AccountNo)
+	}
+	if len(out) == 0 && strings.TrimSpace(c.cfg.Username) != "" {
+		add(AccountDemo)
+	}
+	return out
+}
+
+func (c *Client) accountProfile(accountNo string) config.EntradeAccountConfig {
+	key := strings.ToUpper(strings.TrimSpace(accountNo))
+	if key == "" {
+		if len(c.cfg.DefaultAccountNos) > 0 {
+			key = strings.ToUpper(strings.TrimSpace(c.cfg.DefaultAccountNos[0]))
+		}
+		if key == "" && len(c.cfg.Accounts) > 0 {
+			key = strings.ToUpper(strings.TrimSpace(c.cfg.Accounts[0].ID))
+		}
+	}
+	for _, account := range c.cfg.Accounts {
+		if !account.Enabled {
+			continue
+		}
+		if strings.EqualFold(account.ID, key) {
+			return fillAccountProfile(account, c.cfg)
+		}
+	}
+	if key == "" {
+		key = defaultStateKey
+	}
+	return fillAccountProfile(config.EntradeAccountConfig{
+		ID:          key,
+		Environment: accountEnvironment(key, c.cfg.Environment),
+	}, c.cfg)
+}
+
+func fillAccountProfile(account config.EntradeAccountConfig, cfg config.EntradeConfig) config.EntradeAccountConfig {
+	account.ID = strings.ToUpper(strings.TrimSpace(account.ID))
+	account.Environment = strings.ToLower(strings.TrimSpace(account.Environment))
+	if account.Environment == "" {
+		account.Environment = accountEnvironment(account.ID, cfg.Environment)
+	}
+	if account.Username == "" {
+		account.Username = cfg.Username
+	}
+	if account.Password == "" {
+		account.Password = cfg.Password
+	}
+	if account.InvestorID == "" {
+		account.InvestorID = cfg.InvestorID
+	}
+	if account.AccountNo == "" && !knownVirtualAccount(account.ID) {
+		account.AccountNo = cfg.AccountNo
+	}
+	if account.TradingToken == "" {
+		account.TradingToken = cfg.TradingToken
+	}
+	return account
+}
+
+func profileStateKey(profile config.EntradeAccountConfig, fallback string) string {
+	key := strings.ToUpper(strings.TrimSpace(profile.ID))
+	if key == "" {
+		key = strings.ToUpper(strings.TrimSpace(fallback))
+	}
+	if key == "" {
+		return defaultStateKey
+	}
+	return key
 }
 
 func (c *Client) GetAccounts(ctx context.Context) ([]dnsemodel.Account, error) {
 	if c.cfg.Mock {
-		return []dnsemodel.Account{{AccountNo: defaultString(c.cfg.AccountNo, "1000000036"), DerivativeAccountStatus: "ACTIVE"}}, nil
+		accounts := c.configuredAccountIDs()
+		if len(accounts) == 0 {
+			accounts = []string{AccountDemo, AccountReal}
+		}
+		out := make([]dnsemodel.Account, 0, len(accounts))
+		for _, accountNo := range accounts {
+			out = append(out, dnsemodel.Account{AccountNo: accountNo, DerivativeAccountStatus: "ACTIVE"})
+		}
+		return out, nil
 	}
-	investorID, err := c.ensureInvestorID(ctx)
-	if err != nil {
-		return nil, err
+	accounts := make([]dnsemodel.Account, 0, 2)
+	for _, accountNo := range c.configuredAccountIDs() {
+		profile := c.accountProfile(accountNo)
+		investorID, err := c.ensureInvestorID(ctx, accountNo)
+		if err != nil {
+			if c.logger != nil {
+				c.logger.Error("entrade_account_login_failed", map[string]any{"accountNo": accountNo, "error": err.Error()})
+			}
+			continue
+		}
+		var raw map[string]any
+		if err := c.doForAccount(ctx, accountNo, http.MethodGet, fmt.Sprintf("/investors/%s/investor_account", url.PathEscape(investorID)), nil, &raw); err != nil {
+			if c.logger != nil {
+				c.logger.Error("entrade_account_lookup_failed", map[string]any{"accountNo": accountNo, "error": err.Error()})
+			}
+			continue
+		}
+		status := firstString(raw, "status")
+		if status == "" {
+			status = "UNKNOWN"
+		}
+		accounts = append(accounts, dnsemodel.Account{
+			AccountNo:               defaultString(profile.ID, accountNo),
+			DerivativeAccountStatus: status,
+		})
 	}
-	var raw map[string]any
-	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/investors/%s/investor_account", url.PathEscape(investorID)), nil, &raw); err != nil {
-		return nil, err
+	if len(accounts) == 0 {
+		return nil, errors.New("entrade returned no orderable demo/real accounts")
 	}
-	accountNo := firstString(raw, "investorAccountId", "id", "investorId")
-	if accountNo == "" {
-		accountNo = investorID
-	}
-	status := firstString(raw, "status")
-	if status == "" {
-		status = "UNKNOWN"
-	}
-	return []dnsemodel.Account{{AccountNo: accountNo, DerivativeAccountStatus: status}}, nil
+	return accounts, nil
 }
 
 func (c *Client) GetLoanPackages(ctx context.Context, accountNo, symbol, marketType string) ([]dnsemodel.LoanPackage, error) {
 	if c.cfg.Mock {
 		return []dnsemodel.LoanPackage{{ID: 34, Name: "Mock Entrade derivative margin", Type: "DERIVATIVE", InitialRate: 0.05}}, nil
 	}
-	investorID, err := c.ensureInvestorID(ctx)
+	investorID, err := c.ensureInvestorID(ctx, accountNo)
 	if err != nil {
 		return nil, err
 	}
 	var raw map[string]any
-	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/investors/%s/derivative_margin_portfolios", url.PathEscape(investorID)), nil, &raw); err != nil {
+	if err := c.doForAccount(ctx, accountNo, http.MethodGet, fmt.Sprintf("/investors/%s/derivative_margin_portfolios", url.PathEscape(investorID)), nil, &raw); err != nil {
 		return nil, err
 	}
 	return simplifyLoanPackages(raw, symbol), nil
@@ -94,11 +225,11 @@ func (c *Client) PlaceOrder(ctx context.Context, req dnsemodel.PlaceOrderRequest
 	if !strings.EqualFold(strings.TrimSpace(req.Symbol), "VN30F1M") {
 		return dnsemodel.PlaceOrderResponse{}, errors.New("entrade provider supports VN30F1M only")
 	}
-	investorID, err := c.ensureInvestorID(ctx)
+	investorID, err := c.ensureInvestorID(ctx, req.AccountNo)
 	if err != nil {
 		return dnsemodel.PlaceOrderResponse{}, err
 	}
-	symbol, err := c.ResolveDerivativeSymbol(ctx, req.Symbol)
+	symbol, err := c.resolveDerivativeSymbol(ctx, req.AccountNo, req.Symbol)
 	if err != nil {
 		return dnsemodel.PlaceOrderResponse{}, err
 	}
@@ -132,7 +263,7 @@ func (c *Client) PlaceOrder(ctx context.Context, req dnsemodel.PlaceOrderRequest
 		"quantity":              req.Quantity,
 	}
 	var raw map[string]any
-	if err := c.do(ctx, http.MethodPost, "/derivative/orders", payload, &raw); err != nil {
+	if err := c.doForAccount(ctx, req.AccountNo, http.MethodPost, "/derivative/orders", payload, &raw); err != nil {
 		return dnsemodel.PlaceOrderResponse{}, err
 	}
 	rawBody, _ := json.Marshal(raw)
@@ -152,7 +283,7 @@ func (c *Client) GetOrderStatus(ctx context.Context, accountNo, orderID, marketT
 		return dnsemodel.OrderStatus{OrderID: orderID, Status: "New", RemainingQuantity: 1}, nil
 	}
 	var raw map[string]any
-	if err := c.do(ctx, http.MethodGet, "/derivative/orders/"+url.PathEscape(orderID), nil, &raw); err != nil {
+	if err := c.doForAccount(ctx, accountNo, http.MethodGet, "/derivative/orders/"+url.PathEscape(orderID), nil, &raw); err != nil {
 		return dnsemodel.OrderStatus{}, err
 	}
 	rawBody, _ := json.Marshal(raw)
@@ -176,7 +307,7 @@ func (c *Client) CancelOrder(ctx context.Context, accountNo, orderID, marketType
 		return dnsemodel.CancelOrderResponse{Success: true, OrderID: orderID, Status: "Canceled"}, nil
 	}
 	var raw map[string]any
-	if err := c.do(ctx, http.MethodDelete, "/derivative/orders/"+url.PathEscape(orderID), nil, &raw); err != nil {
+	if err := c.doForAccount(ctx, accountNo, http.MethodDelete, "/derivative/orders/"+url.PathEscape(orderID), nil, &raw); err != nil {
 		return dnsemodel.CancelOrderResponse{}, err
 	}
 	rawBody, _ := json.Marshal(raw)
@@ -195,19 +326,13 @@ func (c *Client) GetPositions(ctx context.Context, accountNo, marketType string)
 		return []dnsemodel.Position{}, nil
 	}
 	accountNo = strings.TrimSpace(accountNo)
-	if accountNo == "" {
-		accountNo = strings.TrimSpace(c.cfg.AccountNo)
+	investorAccountID, err := c.resolveInvestorAccountID(ctx, accountNo)
+	if err != nil {
+		return nil, err
 	}
-	if accountNo == "" {
-		investorID, err := c.ensureInvestorID(ctx)
-		if err != nil {
-			return nil, err
-		}
-		accountNo = investorID
-	}
-	path := fmt.Sprintf("/derivative/deals?investorAccountId=%s&_start=0&_end=100&_sort=modifiedDate&_order=DESC", url.QueryEscape(accountNo))
+	path := fmt.Sprintf("/derivative/deals?investorAccountId=%s&_start=0&_end=100&_sort=modifiedDate&_order=DESC", url.QueryEscape(investorAccountID))
 	var raw map[string]any
-	if err := c.do(ctx, http.MethodGet, path, nil, &raw); err != nil {
+	if err := c.doForAccount(ctx, accountNo, http.MethodGet, path, nil, &raw); err != nil {
 		return nil, err
 	}
 	items, _ := raw["data"].([]any)
@@ -240,13 +365,85 @@ func (c *Client) GetPositions(ctx context.Context, accountNo, marketType string)
 	return out, nil
 }
 
+func (c *Client) CloseDealsBySymbol(ctx context.Context, accountNo, symbol, orderType string) ([]dnsemodel.CloseDealResponse, error) {
+	if c.cfg.Mock {
+		return []dnsemodel.CloseDealResponse{{Success: true, DealID: "MOCK-DEAL", Status: "CLOSE_SUBMITTED", AccountNo: accountNo}}, nil
+	}
+	symbol = strings.ToUpper(strings.TrimSpace(defaultString(symbol, "VN30F1M")))
+	if symbol != "VN30F1M" {
+		return nil, errors.New("entrade provider supports closing VN30F1M only")
+	}
+	orderType = strings.ToUpper(strings.TrimSpace(orderType))
+	if orderType == "" {
+		orderType = "MTL"
+	}
+	deals, err := c.fetchDeals(ctx, accountNo)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]dnsemodel.CloseDealResponse, 0, len(deals))
+	for _, deal := range deals {
+		dealID := firstString(deal, "id")
+		if dealID == "" || isClosedDeal(deal) {
+			continue
+		}
+		payload := map[string]any{
+			"orderType":   orderType,
+			"triggeredBy": "mt5-bot-close-deal",
+		}
+		var raw map[string]any
+		if err := c.doForAccount(ctx, accountNo, http.MethodPost, "/derivative/deals/"+url.PathEscape(dealID)+"/_close_deal", payload, &raw); err != nil {
+			out = append(out, dnsemodel.CloseDealResponse{Success: false, DealID: dealID, AccountNo: accountNo, Status: "ERROR", RawResponse: err.Error()})
+			continue
+		}
+		rawBody, _ := json.Marshal(raw)
+		out = append(out, dnsemodel.CloseDealResponse{
+			Success:     true,
+			DealID:      dealID,
+			Status:      defaultString(firstString(raw, "status", "state"), "CLOSE_SUBMITTED"),
+			AccountNo:   accountNo,
+			RawResponse: string(rawBody),
+		})
+	}
+	return out, nil
+}
+
+func (c *Client) fetchDeals(ctx context.Context, accountNo string) ([]map[string]any, error) {
+	investorAccountID, err := c.resolveInvestorAccountID(ctx, accountNo)
+	if err != nil {
+		return nil, err
+	}
+	path := fmt.Sprintf("/derivative/deals?investorAccountId=%s&_start=0&_end=100&_sort=modifiedDate&_order=DESC", url.QueryEscape(investorAccountID))
+	var raw map[string]any
+	if err := c.doForAccount(ctx, accountNo, http.MethodGet, path, nil, &raw); err != nil {
+		return nil, err
+	}
+	items, _ := raw["data"].([]any)
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if firstInt(m, "openQuantity", "remainingTradeableQuantity") <= 0 || isClosedDeal(m) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
 func (c *Client) ResolveDerivativeSymbol(ctx context.Context, displaySymbol string) (string, error) {
+	return c.resolveDerivativeSymbol(ctx, "", displaySymbol)
+}
+
+func (c *Client) resolveDerivativeSymbol(ctx context.Context, accountNo, displaySymbol string) (string, error) {
 	displaySymbol = strings.ToUpper(strings.TrimSpace(displaySymbol))
 	if displaySymbol == "" || displaySymbol == "VN30F1M" {
 		displaySymbol = "VN30F1M"
 	}
 	var raw map[string]any
-	if err := c.do(ctx, http.MethodGet, "/derivatives", nil, &raw); err != nil {
+	if err := c.doForAccount(ctx, accountNo, http.MethodGet, "/derivatives", nil, &raw); err != nil {
 		return "", err
 	}
 	items, _ := raw["data"].([]any)
@@ -268,45 +465,71 @@ func (c *Client) ResolveDerivativeSymbol(ctx context.Context, displaySymbol stri
 	return displaySymbol, nil
 }
 
-func (c *Client) ensureToken(ctx context.Context) error {
+func (c *Client) ensureToken(ctx context.Context, accountNo string) error {
+	profile := c.accountProfile(accountNo)
+	key := profileStateKey(profile, accountNo)
 	c.mu.RLock()
-	token := c.token
-	expiresAt := c.expiresAt
+	state := c.states[key]
+	token := ""
+	expiresAt := time.Time{}
+	if state != nil {
+		token = state.token
+		expiresAt = state.expiresAt
+	}
 	c.mu.RUnlock()
 	if token != "" && time.Now().UTC().Before(expiresAt.Add(-5*time.Minute)) {
 		return nil
 	}
-	return c.login(ctx)
+	return c.login(ctx, accountNo)
 }
 
-func (c *Client) ensureInvestorID(ctx context.Context) (string, error) {
+func (c *Client) ensureInvestorID(ctx context.Context, accountNo string) (string, error) {
+	profile := c.accountProfile(accountNo)
 	if c.cfg.Mock {
-		return defaultString(c.cfg.InvestorID, "1000000036"), nil
+		return defaultString(profile.InvestorID, defaultString(c.cfg.InvestorID, "1000000036")), nil
 	}
-	if strings.TrimSpace(c.investorID) != "" {
-		return strings.TrimSpace(c.investorID), nil
+	if strings.TrimSpace(profile.InvestorID) != "" {
+		return strings.TrimSpace(profile.InvestorID), nil
 	}
-	if err := c.ensureToken(ctx); err != nil {
+	key := profileStateKey(profile, accountNo)
+	c.mu.RLock()
+	if state := c.states[key]; state != nil && strings.TrimSpace(state.investorID) != "" {
+		investorID := strings.TrimSpace(state.investorID)
+		c.mu.RUnlock()
+		return investorID, nil
+	}
+	c.mu.RUnlock()
+	if err := c.ensureToken(ctx, accountNo); err != nil {
 		return "", err
 	}
 	c.mu.RLock()
-	token := c.token
+	state := c.states[key]
+	token := ""
+	if state != nil {
+		token = state.token
+	}
 	c.mu.RUnlock()
 	investorID := investorIDFromJWT(token)
 	if investorID == "" {
 		return "", errors.New("entrade investor_id is missing and cannot be decoded from token")
 	}
 	c.mu.Lock()
-	c.investorID = investorID
+	state = c.states[key]
+	if state == nil {
+		state = &accountState{}
+		c.states[key] = state
+	}
+	state.investorID = investorID
 	c.mu.Unlock()
 	return investorID, nil
 }
 
-func (c *Client) login(ctx context.Context) error {
-	if strings.TrimSpace(c.cfg.Username) == "" || strings.TrimSpace(c.cfg.Password) == "" {
-		return errors.New("entrade username/password are required")
+func (c *Client) login(ctx context.Context, accountNo string) error {
+	profile := c.accountProfile(accountNo)
+	if strings.TrimSpace(profile.Username) == "" || strings.TrimSpace(profile.Password) == "" {
+		return fmt.Errorf("entrade username/password are required for account %s", profileStateKey(profile, accountNo))
 	}
-	payload := map[string]string{"username": c.cfg.Username, "password": c.cfg.Password}
+	payload := map[string]string{"username": profile.Username, "password": profile.Password}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.AuthURL, bytes.NewReader(body))
 	if err != nil {
@@ -338,7 +561,18 @@ func (c *Client) login(ctx context.Context) error {
 		expiresAt = time.Now().UTC().Add(8 * time.Hour)
 	}
 	investorID := investorIDFromJWT(auth.Token)
+	key := profileStateKey(profile, accountNo)
 	c.mu.Lock()
+	state := c.states[key]
+	if state == nil {
+		state = &accountState{}
+		c.states[key] = state
+	}
+	state.token = auth.Token
+	state.expiresAt = expiresAt
+	if state.investorID == "" {
+		state.investorID = defaultString(profile.InvestorID, investorID)
+	}
 	c.token = auth.Token
 	c.expiresAt = expiresAt
 	if c.investorID == "" {
@@ -346,24 +580,24 @@ func (c *Client) login(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 	if c.logger != nil {
-		c.logger.Info("entrade_login_success", map[string]any{"expiresAt": expiresAt.UTC().Format(time.RFC3339), "investorId": investorID})
+		c.logger.Info("entrade_login_success", map[string]any{"accountNo": key, "expiresAt": expiresAt.UTC().Format(time.RFC3339), "investorId": investorID})
 	}
 	return nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, payload any, out any) error {
-	return c.doInternal(ctx, method, path, payload, out, true)
+	return c.doForAccount(ctx, "", method, path, payload, out)
 }
 
-func (c *Client) doInternal(ctx context.Context, method, path string, payload any, out any, allowRetry bool) error {
+func (c *Client) doForAccount(ctx context.Context, accountNo, method, path string, payload any, out any) error {
+	return c.doInternal(ctx, accountNo, method, path, payload, out, true)
+}
+
+func (c *Client) doInternal(ctx context.Context, accountNo, method, path string, payload any, out any, allowRetry bool) error {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	if !strings.Contains(path, "/derivatives") && !strings.Contains(path, "/investor_account") {
-		if err := c.ensureToken(ctx); err != nil {
-			return err
-		}
-	} else if err := c.ensureToken(ctx); err != nil {
+	if err := c.ensureToken(ctx, accountNo); err != nil {
 		return err
 	}
 	var body []byte
@@ -374,7 +608,7 @@ func (c *Client) doInternal(ctx context.Context, method, path string, payload an
 			return err
 		}
 	}
-	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(c.baseURL(), "/")+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(c.baseURLForAccount(accountNo), "/")+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -383,12 +617,17 @@ func (c *Client) doInternal(ctx context.Context, method, path string, payload an
 		req.Header.Set("Content-Type", "application/json")
 	}
 	c.mu.RLock()
-	token := c.token
+	profile := c.accountProfile(accountNo)
+	key := profileStateKey(profile, accountNo)
+	token := ""
+	if state := c.states[key]; state != nil {
+		token = state.token
+	}
 	c.mu.RUnlock()
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	if tradingToken := strings.TrimSpace(c.cfg.TradingToken); tradingToken != "" {
+	if tradingToken := strings.TrimSpace(defaultString(profile.TradingToken, c.cfg.TradingToken)); tradingToken != "" {
 		req.Header.Set("Trading-Token", tradingToken)
 	}
 	resp, err := c.http.Do(req)
@@ -401,8 +640,8 @@ func (c *Client) doInternal(ctx context.Context, method, path string, payload an
 		return err
 	}
 	if allowRetry && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
-		if err := c.login(ctx); err == nil {
-			return c.doInternal(ctx, method, path, payload, out, false)
+		if err := c.login(ctx, accountNo); err == nil {
+			return c.doInternal(ctx, accountNo, method, path, payload, out, false)
 		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -417,10 +656,66 @@ func (c *Client) doInternal(ctx context.Context, method, path string, payload an
 }
 
 func (c *Client) baseURL() string {
-	if strings.EqualFold(strings.TrimSpace(c.cfg.Environment), "real") || strings.EqualFold(strings.TrimSpace(c.cfg.Environment), "prod") {
+	return c.baseURLForAccount("")
+}
+
+func (c *Client) baseURLForAccount(accountNo string) string {
+	profile := c.accountProfile(accountNo)
+	env := accountEnvironment(defaultString(profile.ID, accountNo), defaultString(profile.Environment, c.cfg.Environment))
+	if env == "real" {
 		return c.cfg.BaseURL
 	}
 	return c.cfg.PaperBaseURL
+}
+
+func accountEnvironment(accountNo, fallback string) string {
+	accountNo = strings.ToUpper(strings.TrimSpace(accountNo))
+	switch accountNo {
+	case AccountReal:
+		return "real"
+	case AccountDemo:
+		return "paper"
+	}
+	fallback = strings.ToLower(strings.TrimSpace(fallback))
+	if fallback == "real" || fallback == "prod" {
+		return "real"
+	}
+	return "paper"
+}
+
+func knownVirtualAccount(accountNo string) bool {
+	accountNo = strings.ToUpper(strings.TrimSpace(accountNo))
+	return accountNo == "" || accountNo == AccountDemo || accountNo == AccountReal || accountNo == defaultStateKey
+}
+
+func (c *Client) resolveInvestorAccountID(ctx context.Context, accountNo string) (string, error) {
+	accountNo = strings.TrimSpace(accountNo)
+	profile := c.accountProfile(accountNo)
+	if strings.TrimSpace(profile.AccountNo) != "" {
+		return strings.TrimSpace(profile.AccountNo), nil
+	}
+	if accountNo != "" && !knownVirtualAccount(accountNo) {
+		return accountNo, nil
+	}
+	investorID, err := c.ensureInvestorID(ctx, accountNo)
+	if err != nil {
+		return "", err
+	}
+	var raw map[string]any
+	if err := c.doForAccount(ctx, accountNo, http.MethodGet, fmt.Sprintf("/investors/%s/investor_account", url.PathEscape(investorID)), nil, &raw); err != nil {
+		return "", err
+	}
+	id := firstString(raw, "investorAccountId", "id", "investorId")
+	if id == "" {
+		id = investorID
+	}
+	return id, nil
+}
+
+func isClosedDeal(item map[string]any) bool {
+	return strings.EqualFold(firstString(item, "closed"), "true") ||
+		strings.EqualFold(firstString(item, "state"), "CLOSED") ||
+		strings.EqualFold(firstString(item, "status"), "CLOSED")
 }
 
 func simplifyLoanPackages(raw map[string]any, symbol string) []dnsemodel.LoanPackage {

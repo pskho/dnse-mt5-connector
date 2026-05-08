@@ -102,19 +102,31 @@ func main() {
 	tradingClient := service.DNSEClient(dnseClient)
 	positionClient := service.PositionClient(dnseClient)
 	defaultTradingAccountNo := cfg.DNSE.AccountNo
+	defaultPositionAccountNo := cfg.DNSE.AccountNo
 	if cfg.Entrade.Enabled {
 		entradeClient := entrade.NewClient(cfg.Entrade, appLog)
 		tradingClient = entradeClient
 		positionClient = entradeClient
-		defaultTradingAccountNo = cfg.Entrade.AccountNo
+		defaultTradingAccountNo = strings.Join(cfg.Entrade.DefaultAccountNos, ",")
+		if defaultTradingAccountNo == "" {
+			defaultTradingAccountNo = cfg.Entrade.AccountNo
+		}
+		defaultPositionAccountNo = ""
+		if len(cfg.Entrade.DefaultAccountNos) > 0 {
+			defaultPositionAccountNo = cfg.Entrade.DefaultAccountNos[0]
+		}
+		if defaultPositionAccountNo == "" {
+			defaultPositionAccountNo = cfg.Entrade.AccountNo
+		}
 		appLog.Info("trading_provider_selected", map[string]any{
-			"provider":    "entrade",
-			"environment": cfg.Entrade.Environment,
+			"provider":        "entrade",
+			"environment":     cfg.Entrade.Environment,
+			"defaultAccounts": cfg.Entrade.DefaultAccountNos,
 		})
 	} else {
 		appLog.Info("trading_provider_selected", map[string]any{"provider": "dnse"})
 	}
-	positionService := service.NewPositionService(positionClient, appLog, defaultTradingAccountNo)
+	positionService := service.NewPositionService(positionClient, appLog, defaultPositionAccountNo)
 	orderService := service.NewOrderService(store, tradingClient, riskEngine, appLog, defaultTradingAccountNo, positionService, cfg.Risk.MaxOpenPosition)
 	signalService := service.NewSignalService(orderService, appLog)
 	symbolCatalogService := service.NewSymbolCatalogService(appLog, "", instrumentCatalogAdapter{client: dnseClient}, instrumentCatalogAdapter{client: dnseClient}, store)
@@ -259,15 +271,26 @@ func maintainDNSETradingToken(ctx context.Context, client *api.DNSEClient, appLo
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
-		if err := client.EnsureTradingToken(ctx, 30*time.Minute); err != nil {
-			appLog.Error("dnse_trading_token_auto_refresh_failed", map[string]any{"error": err.Error()})
-		} else {
+		allowed, minValidity, reason := dnseTokenRefreshPolicy(time.Now())
+		if !allowed {
 			status := client.TradingTokenStatus()
-			appLog.Info("dnse_trading_token_ready", map[string]any{
+			appLog.Info("dnse_trading_token_refresh_skipped", map[string]any{
+				"reason":           reason,
 				"valid":            status.Valid,
-				"expiresAt":        status.ExpiresAt.UTC().Format(time.RFC3339),
 				"remainingSeconds": status.RemainingSeconds,
 			})
+		} else {
+			if err := client.EnsureTradingToken(ctx, minValidity); err != nil {
+				appLog.Error("dnse_trading_token_auto_refresh_failed", map[string]any{"error": err.Error(), "reason": reason})
+			} else {
+				status := client.TradingTokenStatus()
+				appLog.Info("dnse_trading_token_ready", map[string]any{
+					"reason":           reason,
+					"valid":            status.Valid,
+					"expiresAt":        status.ExpiresAt.UTC().Format(time.RFC3339),
+					"remainingSeconds": status.RemainingSeconds,
+				})
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -275,4 +298,25 @@ func maintainDNSETradingToken(ctx context.Context, client *api.DNSEClient, appLo
 		case <-ticker.C:
 		}
 	}
+}
+
+func dnseTokenRefreshPolicy(now time.Time) (bool, time.Duration, string) {
+	local, err := time.LoadLocation("Asia/Ho_Chi_Minh")
+	if err != nil {
+		local = time.FixedZone("Asia/Ho_Chi_Minh", 7*60*60)
+	}
+	t := now.In(local)
+	if t.Weekday() == time.Saturday || t.Weekday() == time.Sunday {
+		return false, 0, "outside_weekday"
+	}
+	minute := t.Hour()*60 + t.Minute()
+	openRefresh := 8 * 60
+	closeRefresh := 15 * 60
+	if minute < openRefresh || minute > closeRefresh {
+		return false, 0, "outside_refresh_window_0800_1500"
+	}
+	if minute >= openRefresh && minute < openRefresh+10 {
+		return true, 8 * time.Hour, "daily_0800_refresh"
+	}
+	return true, 30 * time.Minute, "trading_session_refresh"
 }

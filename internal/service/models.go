@@ -14,6 +14,13 @@ type OrderRequest struct {
 	OrderCategory string   `json:"orderCategory,omitempty"`
 }
 
+type CloseDealRequest struct {
+	AccountNo  string   `json:"accountNo,omitempty"`
+	AccountNos []string `json:"accountNos,omitempty"`
+	Symbol     string   `json:"symbol"`
+	OrderType  string   `json:"orderType,omitempty"`
+}
+
 type OrderResponse struct {
 	Success   bool   `json:"success"`
 	OrderID   string `json:"orderId,omitempty"`

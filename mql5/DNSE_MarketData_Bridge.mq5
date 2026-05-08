@@ -127,7 +127,7 @@ void PollPendingSignals()
 void SendSignal(string side)
 {
    string url = "http://127.0.0.1:8080/signal";
-   string payload = StringFormat("{\"symbol\":\"%s\",\"side\":\"%s\",\"quantity\":1,\"source\":\"MT5\"}", InpSourceSymbol, side);
+   string payload = StringFormat("{\"action\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"quantity\":1,\"source\":\"MT5\"}", side, InpSourceSymbol, side);
    
    char data[];
    StringToCharArray(payload, data, 0, StringLen(payload), CP_UTF8);
@@ -156,6 +156,26 @@ void SendSignal(string side)
       string errorMsg = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
       PrintFormat("DNSE bridge: Failed to send %s signal. Code: %d, Msg: %s", side, res, errorMsg);
    }
+}
+
+void SendCloseDealSignal()
+{
+   string url = "http://127.0.0.1:8080/signal";
+   string payload = StringFormat("{\"action\":\"CLOSE_DEAL\",\"symbol\":\"%s\",\"orderType\":\"MTL\",\"source\":\"MT5\"}", InpSourceSymbol);
+   
+   char data[];
+   StringToCharArray(payload, data, 0, StringLen(payload), CP_UTF8);
+   
+   char result[];
+   string result_headers;
+   string headers = "Content-Type: application/json\r\n";
+   
+   int res = WebRequest("POST", url, headers, 1000, data, result, result_headers);
+   string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+   if(res == 200)
+      PrintFormat("DNSE bridge: Close-deal signal sent. Response: %s", response);
+   else
+      PrintFormat("DNSE bridge: Failed to send close-deal signal. Code: %d, Msg: %s", res, response);
 }
 
 void CheckForSignal()
