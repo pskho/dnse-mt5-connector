@@ -303,6 +303,10 @@ func (c *Client) PlaceOrder(ctx context.Context, req dnsemodel.PlaceOrderRequest
 		portfolioID = *req.LoanPackageID
 	}
 	if portfolioID <= 0 {
+		profile := c.accountProfile(req.AccountNo)
+		portfolioID = profile.LoanPackageID
+	}
+	if portfolioID <= 0 {
 		packages, err := c.GetLoanPackages(ctx, req.AccountNo, req.Symbol, "DERIVATIVE")
 		if err != nil {
 			return dnsemodel.PlaceOrderResponse{}, err

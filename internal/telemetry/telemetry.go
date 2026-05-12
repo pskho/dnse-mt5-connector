@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"dnse-mt5-connector/internal/config"
@@ -17,10 +18,13 @@ import (
 )
 
 type Client struct {
-	cfg      config.TelemetryConfig
-	http     *http.Client
-	clientID string
-	logger   *logger.FileLogger
+	cfg       config.TelemetryConfig
+	http      *http.Client
+	clientID  string
+	sessionID int64
+	mu        sync.Mutex
+	lastSent  time.Time
+	logger    *logger.FileLogger
 }
 
 func NewClient(cfg config.TelemetryConfig, appLog *logger.FileLogger) *Client {
@@ -30,8 +34,9 @@ func NewClient(cfg config.TelemetryConfig, appLog *logger.FileLogger) *Client {
 		http: &http.Client{
 			Timeout: 5 * time.Second,
 		},
-		clientID: clientID,
-		logger:   appLog,
+		clientID:  clientID,
+		sessionID: time.Now().UTC().Unix(),
+		logger:    appLog,
 	}
 }
 
@@ -46,11 +51,21 @@ func (c *Client) Track(ctx context.Context, name string, params map[string]any) 
 	if name == "" {
 		return
 	}
+	params = sanitizeParams(params)
+	params["session_id"] = c.sessionID
+	params["engagement_time_msec"] = c.engagementMS()
+	if strings.TrimSpace(c.cfg.AppVersion) != "" {
+		params["app_version"] = truncate(c.cfg.AppVersion, 100)
+	}
 	payload := map[string]any{
 		"client_id": c.clientID,
+		"consent": map[string]string{
+			"ad_user_data":       "DENIED",
+			"ad_personalization": "DENIED",
+		},
 		"events": []map[string]any{{
 			"name":   name,
-			"params": sanitizeParams(params),
+			"params": params,
 		}},
 	}
 	body, _ := json.Marshal(payload)
@@ -70,6 +85,26 @@ func (c *Client) Track(ctx context.Context, name string, params map[string]any) 
 		}
 		_ = resp.Body.Close()
 	}()
+}
+
+func (c *Client) engagementMS() int64 {
+	now := time.Now().UTC()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastSent.IsZero() {
+		c.lastSent = now
+		return 100
+	}
+	elapsed := now.Sub(c.lastSent).Milliseconds()
+	c.lastSent = now
+	if elapsed < 100 {
+		return 100
+	}
+	if elapsed > int64((30 * time.Minute).Milliseconds()) {
+		c.sessionID = now.Unix()
+		return 100
+	}
+	return elapsed
 }
 
 func sanitizeEventName(name string) string {

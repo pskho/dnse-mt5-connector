@@ -88,11 +88,16 @@ func main() {
 	defer appLog.Close()
 	telemetryClient := telemetry.NewClient(cfg.Telemetry, appLog)
 	telemetryClient.Track(appCtx, "app_start", map[string]any{
-		"app_version": appVersion,
-		"symbols":     len(cfg.MarketData.Symbols),
-		"provider":    tradingProviderName(cfg),
-		"history":     cfg.History.Enabled,
-		"market_data": cfg.MarketData.Enabled,
+		"app_version":           appVersion,
+		"provider":              tradingProviderName(cfg),
+		"symbol_count":          len(cfg.MarketData.Symbols),
+		"default_target_count":  len(cfg.Entrade.DefaultAccountNos),
+		"entrade_profile_count": len(cfg.Entrade.Accounts),
+		"primary_symbol":        cfg.MarketData.Symbol,
+		"history_enabled":       cfg.History.Enabled,
+		"market_data_enabled":   cfg.MarketData.Enabled,
+		"gmail_otp_enabled":     cfg.GmailOTP.Enabled,
+		"mock_mode":             cfg.DNSE.Mock || cfg.Entrade.Mock || cfg.MarketData.Mock,
 	})
 
 	store, err := storage.NewSQLiteStore(cfg.DatabasePath)

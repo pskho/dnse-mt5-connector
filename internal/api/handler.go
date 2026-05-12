@@ -174,6 +174,13 @@ func (h *Handler) order(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			status = http.StatusBadRequest
 		}
+		h.track(r.Context(), "order_batch_result", orderParams(req, map[string]any{
+			"success":       err == nil,
+			"result_count":  len(responses),
+			"success_count": countSuccessfulOrders(responses),
+			"error_kind":    classifyError(err),
+			"source":        "direct",
+		}))
 		writeJSON(w, status, map[string]any{
 			"success": err == nil,
 			"orders":  responses,
@@ -183,9 +190,19 @@ func (h *Handler) order(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.orders.PlaceOrder(r.Context(), req)
 	if err != nil {
+		h.track(r.Context(), "order_result", orderParams(req, map[string]any{
+			"success":    false,
+			"error_kind": classifyError(err),
+			"source":     "direct",
+		}))
 		writeJSON(w, http.StatusBadRequest, errorResponse{Success: false, Error: err.Error()})
 		return
 	}
+	h.track(r.Context(), "order_result", orderParams(req, map[string]any{
+		"success": true,
+		"status":  resp.Status,
+		"source":  "direct",
+	}))
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -205,9 +222,15 @@ func (h *Handler) signal(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.signals.Receive(r.Context(), req)
 	if err != nil {
+		h.track(r.Context(), "signal_rejected", signalParams(req, map[string]any{
+			"error_kind": classifyError(err),
+		}))
 		writeJSON(w, http.StatusBadRequest, errorResponse{Success: false, Error: err.Error()})
 		return
 	}
+	h.track(r.Context(), "signal_received", signalParams(req, map[string]any{
+		"mode": h.signals.Mode(),
+	}))
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -235,9 +258,11 @@ func (h *Handler) confirm(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.signals.Confirm(r.Context(), req.SignalID)
 	if err != nil {
+		h.track(r.Context(), "signal_confirm_failed", map[string]any{"error_kind": classifyError(err)})
 		writeJSON(w, http.StatusBadRequest, errorResponse{Success: false, Error: err.Error()})
 		return
 	}
+	h.track(r.Context(), "signal_confirmed", map[string]any{"status": resp.Status, "success": resp.Success})
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -256,9 +281,11 @@ func (h *Handler) reject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.signals.Reject(req.SignalID); err != nil {
+		h.track(r.Context(), "signal_reject_failed", map[string]any{"error_kind": classifyError(err)})
 		writeJSON(w, http.StatusBadRequest, errorResponse{Success: false, Error: err.Error()})
 		return
 	}
+	h.track(r.Context(), "signal_rejected_by_user", map[string]any{"success": true})
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "signalId": req.SignalID})
 }
 
@@ -279,6 +306,7 @@ func (h *Handler) mode(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, errorResponse{Success: false, Error: err.Error()})
 			return
 		}
+		h.track(r.Context(), "trading_mode_changed", map[string]any{"mode": h.signals.Mode()})
 		writeJSON(w, http.StatusOK, map[string]any{"mode": h.signals.Mode()})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -890,6 +918,107 @@ func errorString(err error) string {
 	return err.Error()
 }
 
+func (h *Handler) track(ctx context.Context, name string, params map[string]any) {
+	if h != nil && h.telemetry != nil {
+		h.telemetry.Track(ctx, name, params)
+	}
+}
+
+func orderParams(req service.OrderRequest, extra map[string]any) map[string]any {
+	params := map[string]any{
+		"symbol":          strings.ToUpper(strings.TrimSpace(req.Symbol)),
+		"side":            strings.ToUpper(strings.TrimSpace(req.Side)),
+		"order_type":      strings.ToUpper(strings.TrimSpace(req.OrderType)),
+		"market_type":     strings.ToUpper(strings.TrimSpace(req.MarketType)),
+		"target_count":    targetCount(req.AccountNo, req.AccountNos),
+		"quantity_bucket": quantityBucket(req.Quantity),
+		"has_price":       req.Price > 0,
+	}
+	for key, value := range extra {
+		params[key] = value
+	}
+	return params
+}
+
+func signalParams(req service.SignalRequest, extra map[string]any) map[string]any {
+	params := map[string]any{
+		"action":          strings.ToUpper(strings.TrimSpace(req.Action)),
+		"symbol":          strings.ToUpper(strings.TrimSpace(req.Symbol)),
+		"side":            strings.ToUpper(strings.TrimSpace(req.Side)),
+		"order_type":      strings.ToUpper(strings.TrimSpace(req.OrderType)),
+		"market_type":     strings.ToUpper(strings.TrimSpace(req.MarketType)),
+		"target_count":    targetCount(req.AccountNo, req.AccountNos),
+		"quantity_bucket": quantityBucket(req.Quantity),
+		"has_price":       req.Price > 0,
+	}
+	for key, value := range extra {
+		params[key] = value
+	}
+	return params
+}
+
+func targetCount(accountNo string, accountNos []string) int {
+	seen := map[string]struct{}{}
+	for _, value := range accountNos {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			seen[value] = struct{}{}
+		}
+	}
+	if len(seen) == 0 && strings.TrimSpace(accountNo) != "" {
+		return 1
+	}
+	return len(seen)
+}
+
+func quantityBucket(quantity int) string {
+	switch {
+	case quantity <= 0:
+		return "none"
+	case quantity == 1:
+		return "1"
+	case quantity <= 5:
+		return "2_5"
+	case quantity <= 10:
+		return "6_10"
+	default:
+		return "gt_10"
+	}
+}
+
+func countSuccessfulOrders(responses []service.OrderResponse) int {
+	count := 0
+	for _, resp := range responses {
+		if resp.Success {
+			count++
+		}
+	}
+	return count
+}
+
+func classifyError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "duplicate"):
+		return "duplicate"
+	case strings.Contains(text, "market") && strings.Contains(text, "closed"):
+		return "market_closed"
+	case strings.Contains(text, "loan") || strings.Contains(text, "margin"):
+		return "loan_package"
+	case strings.Contains(text, "token") || strings.Contains(text, "unauthorized") || strings.Contains(text, "forbidden"):
+		return "auth"
+	case strings.Contains(text, "risk") || strings.Contains(text, "position"):
+		return "risk"
+	case strings.Contains(text, "validation") || strings.Contains(text, "required") || strings.Contains(text, "invalid"):
+		return "validation"
+	default:
+		return "other"
+	}
+}
+
 func (h *Handler) historySync(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -917,17 +1046,21 @@ func (h *Handler) historySync(w http.ResponseWriter, r *http.Request) {
 			Resolution: req.Resolution,
 		})
 		if err != nil {
+			h.track(r.Context(), "history_sync_result", map[string]any{"mode": "range", "success": false, "error_kind": classifyError(err), "symbol": req.Symbol, "market_type": req.MarketType})
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		h.track(r.Context(), "history_sync_result", map[string]any{"mode": "range", "success": true, "symbol": req.Symbol, "market_type": req.MarketType})
 		writeJSON(w, http.StatusOK, result)
 		return
 	}
 	result, err := h.history.Sync(r.Context(), req.FirstTime, req.LastTime)
 	if err != nil {
+		h.track(r.Context(), "history_sync_result", map[string]any{"mode": "range", "success": false, "error_kind": classifyError(err)})
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.track(r.Context(), "history_sync_result", map[string]any{"mode": "range", "success": true})
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -957,17 +1090,21 @@ func (h *Handler) historyFull(w http.ResponseWriter, r *http.Request) {
 			Resolution:   req.Resolution,
 		})
 		if err != nil {
+			h.track(r.Context(), "history_sync_result", map[string]any{"mode": "full", "success": false, "error_kind": classifyError(err), "lookback_days": req.LookbackDays, "symbol": req.Symbol, "market_type": req.MarketType})
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		h.track(r.Context(), "history_sync_result", map[string]any{"mode": "full", "success": true, "lookback_days": req.LookbackDays, "symbol": req.Symbol, "market_type": req.MarketType})
 		writeJSON(w, http.StatusOK, result)
 		return
 	}
 	result, err := h.history.FullSync(r.Context(), req.LookbackDays)
 	if err != nil {
+		h.track(r.Context(), "history_sync_result", map[string]any{"mode": "full", "success": false, "error_kind": classifyError(err), "lookback_days": req.LookbackDays})
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.track(r.Context(), "history_sync_result", map[string]any{"mode": "full", "success": true, "lookback_days": req.LookbackDays})
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -998,9 +1135,11 @@ func (h *Handler) historyBackfill(w http.ResponseWriter, r *http.Request) {
 			Resolution:   req.Resolution,
 		})
 		if err != nil {
+			h.track(r.Context(), "history_sync_result", map[string]any{"mode": "backfill", "success": false, "error_kind": classifyError(err), "lookback_days": req.LookbackDays, "symbol": req.Symbol, "market_type": req.MarketType})
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		h.track(r.Context(), "history_sync_result", map[string]any{"mode": "backfill", "success": true, "lookback_days": req.LookbackDays, "symbol": req.Symbol, "market_type": req.MarketType})
 		writeJSON(w, http.StatusOK, result)
 		return
 	}
@@ -1031,9 +1170,11 @@ func (h *Handler) historyToday(w http.ResponseWriter, r *http.Request) {
 			Resolution: req.Resolution,
 		})
 		if err != nil {
+			h.track(r.Context(), "history_sync_result", map[string]any{"mode": "today", "success": false, "error_kind": classifyError(err), "symbol": req.Symbol, "market_type": req.MarketType})
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		h.track(r.Context(), "history_sync_result", map[string]any{"mode": "today", "success": true, "symbol": req.Symbol, "market_type": req.MarketType})
 		writeJSON(w, http.StatusOK, result)
 		return
 	}
@@ -1168,6 +1309,13 @@ func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode st
 		}
 	}
 
+	h.track(r.Context(), "history_sync_all_result", map[string]any{
+		"mode":          mode,
+		"success":       successCount == len(results),
+		"total_symbols": len(results),
+		"success_count": successCount,
+		"lookback_days": lookbackDays,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":      successCount == len(results),
 		"mode":         mode,
@@ -1300,6 +1448,14 @@ func (h *Handler) settingsAPI(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "failed to save config")
 			return
 		}
+		h.track(r.Context(), "settings_saved", map[string]any{
+			"provider":              map[bool]string{true: "entrade", false: "dnse"}[cfg.Entrade.Enabled],
+			"symbol_count":          len(cfg.MarketData.Symbols),
+			"entrade_profile_count": len(cfg.Entrade.Accounts),
+			"default_target_count":  len(cfg.Entrade.DefaultAccountNos),
+			"primary_symbol":        cfg.MarketData.Symbol,
+			"mock_mode":             cfg.DNSE.Mock || cfg.Entrade.Mock || cfg.MarketData.Mock,
+		})
 		writeJSON(w, http.StatusOK, map[string]bool{"success": true})
 		return
 	}
@@ -1366,16 +1522,23 @@ func (h *Handler) entradeLinkAPI(w http.ResponseWriter, r *http.Request) {
 	cfg.Entrade.Password = req.Password
 	cfg.Entrade.InvestorID = result.InvestorID
 	cfg.Entrade.AccountNo = accountID
-	cfg.Entrade.DefaultAccountNos = []string{entrade.AccountReal}
-	cfg.Entrade.Accounts = []config.EntradeAccountConfig{{
-		ID:          entrade.AccountReal,
-		Environment: result.Environment,
-		Username:    req.Username,
-		Password:    req.Password,
-		InvestorID:  result.InvestorID,
-		AccountNo:   accountID,
-		Enabled:     true,
-	}}
+	profileID := entradeProfileID(result, req.Username)
+	loanPackageID := 0
+	if len(result.LoanPackages) > 0 {
+		loanPackageID = result.LoanPackages[0].ID
+	}
+	linkedAccount := config.EntradeAccountConfig{
+		ID:            profileID,
+		Environment:   result.Environment,
+		Username:      req.Username,
+		Password:      req.Password,
+		InvestorID:    result.InvestorID,
+		AccountNo:     accountID,
+		LoanPackageID: loanPackageID,
+		Enabled:       true,
+	}
+	cfg.Entrade.Accounts = upsertEntradeAccount(cfg.Entrade.Accounts, linkedAccount)
+	cfg.Entrade.DefaultAccountNos = addDefaultEntradeAccount(cfg.Entrade.DefaultAccountNos, profileID)
 	if err := cfg.Save("config/config.yaml"); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save config")
 		return
@@ -1392,6 +1555,57 @@ func (h *Handler) entradeLinkAPI(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"account": result,
 	})
+}
+
+func entradeProfileID(result entrade.LinkAccountResult, username string) string {
+	key := strings.TrimSpace(result.InvestorAccountID)
+	if key == "" {
+		key = strings.TrimSpace(result.InvestorID)
+	}
+	if key == "" {
+		key = strings.TrimSpace(username)
+	}
+	key = strings.ToUpper(strings.TrimSpace(key))
+	if key == "" {
+		return entrade.AccountReal
+	}
+	return "ENTRADE_" + key
+}
+
+func upsertEntradeAccount(accounts []config.EntradeAccountConfig, linked config.EntradeAccountConfig) []config.EntradeAccountConfig {
+	linked.ID = strings.ToUpper(strings.TrimSpace(linked.ID))
+	out := make([]config.EntradeAccountConfig, 0, len(accounts)+1)
+	replaced := false
+	for _, account := range accounts {
+		account.ID = strings.ToUpper(strings.TrimSpace(account.ID))
+		if account.ID == "" {
+			continue
+		}
+		if account.ID == linked.ID {
+			out = append(out, linked)
+			replaced = true
+			continue
+		}
+		out = append(out, account)
+	}
+	if !replaced {
+		out = append(out, linked)
+	}
+	return out
+}
+
+func addDefaultEntradeAccount(values []string, accountID string) []string {
+	accountID = strings.ToUpper(strings.TrimSpace(accountID))
+	out := normalizeAPIAccountNos(values)
+	for _, value := range out {
+		if value == accountID {
+			return out
+		}
+	}
+	if accountID != "" {
+		out = append(out, accountID)
+	}
+	return out
 }
 
 func (h *Handler) canonicalizeSymbols(ctx context.Context, symbols []string) []string {
@@ -1463,6 +1677,9 @@ func mergeEntradeAccountsForSave(incoming, existing []config.EntradeAccountConfi
 		account.InvestorID = strings.TrimSpace(account.InvestorID)
 		account.AccountNo = strings.TrimSpace(account.AccountNo)
 		account.TradingToken = strings.TrimSpace(account.TradingToken)
+		if account.LoanPackageID < 0 {
+			account.LoanPackageID = 0
+		}
 		if old, ok := existingByID[account.ID]; ok {
 			if account.Password == "" {
 				account.Password = old.Password
@@ -1503,10 +1720,12 @@ func (h *Handler) setupInstallAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	folders, err := setup.DetectMT5Folders()
 	if err != nil {
+		h.track(r.Context(), "setup_install_result", map[string]any{"success": false, "error_kind": "detect_mt5"})
 		writeError(w, http.StatusInternalServerError, "Failed to detect MT5: "+err.Error())
 		return
 	}
 	if len(folders) == 0 {
+		h.track(r.Context(), "setup_install_result", map[string]any{"success": false, "error_kind": "mt5_not_found"})
 		writeJSON(w, http.StatusOK, map[string]any{"success": false, "message": "No MetaTrader 5 folders detected at standard paths."})
 		return
 	}
@@ -1514,10 +1733,12 @@ func (h *Handler) setupInstallAPI(w http.ResponseWriter, r *http.Request) {
 	// Just install into the first detected folder for MVP
 	logs, err := setup.InstallFiles(folders[0].Path, h.logger)
 	if err != nil {
+		h.track(r.Context(), "setup_install_result", map[string]any{"success": false, "error_kind": classifyError(err), "mt5_folder_count": len(folders)})
 		writeJSON(w, http.StatusOK, map[string]any{"success": false, "message": "Failed to install: " + err.Error(), "logs": logs})
 		return
 	}
 
+	h.track(r.Context(), "setup_install_result", map[string]any{"success": true, "mt5_folder_count": len(folders)})
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "Successfully copied files.", "logs": logs})
 }
 

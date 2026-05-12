@@ -101,14 +101,15 @@ type EntradeConfig struct {
 }
 
 type EntradeAccountConfig struct {
-	ID           string `json:"id"`
-	Environment  string `json:"environment"`
-	Username     string `json:"username"`
-	Password     string `json:"password,omitempty"`
-	InvestorID   string `json:"investorId,omitempty"`
-	AccountNo    string `json:"accountNo,omitempty"`
-	TradingToken string `json:"tradingToken,omitempty"`
-	Enabled      bool   `json:"enabled"`
+	ID            string `json:"id"`
+	Environment   string `json:"environment"`
+	Username      string `json:"username"`
+	Password      string `json:"password,omitempty"`
+	InvestorID    string `json:"investorId,omitempty"`
+	AccountNo     string `json:"accountNo,omitempty"`
+	LoanPackageID int    `json:"loanPackageId,omitempty"`
+	TradingToken  string `json:"tradingToken,omitempty"`
+	Enabled       bool   `json:"enabled"`
 }
 
 type MarketDataConfig struct {
@@ -786,6 +787,9 @@ func parseEntradeAccountProfiles(value string) []EntradeAccountConfig {
 		if len(cols) > 7 {
 			account.Enabled, _ = strconv.ParseBool(strings.TrimSpace(cols[7]))
 		}
+		if len(cols) > 8 {
+			account.LoanPackageID, _ = strconv.Atoi(strings.TrimSpace(cols[8]))
+		}
 		out = append(out, account)
 	}
 	return out
@@ -806,6 +810,7 @@ func formatEntradeAccountProfiles(accounts []EntradeAccountConfig) string {
 			strings.ReplaceAll(strings.TrimSpace(account.AccountNo), "|", ""),
 			strings.ReplaceAll(strings.TrimSpace(account.TradingToken), "|", ""),
 			strconv.FormatBool(account.Enabled),
+			strconv.Itoa(account.LoanPackageID),
 		}, "|"))
 	}
 	return strings.ReplaceAll(strings.Join(rows, ";"), `"`, `\"`)

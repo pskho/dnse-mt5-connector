@@ -158,6 +158,32 @@ input, select, textarea {
   gap: 12px;
   margin-top: 18px;
 }
+.account-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+.account-row {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  background: #171717;
+}
+.account-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+.account-meta {
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.mini-btn {
+  padding: 7px 10px;
+  font-size: 12px;
+}
 .muted {
   color: var(--text-muted);
 }
@@ -332,6 +358,14 @@ const settingsHTML = layoutTop + `
           <option value="true">Bật (kiểm thử offline)</option>
         </select>
       </div>
+      <div class="form-group">
+        <label>Nguồn đặt lệnh</label>
+        <select id="tradingProvider">
+          <option value="dnse">DNSE</option>
+          <option value="entrade">Entrade</option>
+        </select>
+      </div>
+      <p class="muted">Nếu chọn Entrade, bot sẽ đặt lệnh vào nhóm tài khoản Entrade bên cạnh. Nếu chọn DNSE, bot dùng số tài khoản DNSE ở trên.</p>
     </section>
 
     <section class="card">
@@ -350,6 +384,11 @@ const settingsHTML = layoutTop + `
         <button class="btn" type="button" onclick="linkEntradeAccount()">Li&ecirc;n k&#7871;t t&agrave;i kho&#7843;n</button>
       </div>
       <p id="entradeLinkResult" class="muted" style="margin-top:16px;"></p>
+      <div style="margin-top:22px;">
+        <h3 style="font-size:16px;">Tài khoản đã liên kết</h3>
+        <p class="muted">Chọn các tài khoản trong nhóm đặt lệnh. Khi bot gửi tín hiệu không chỉ rõ tài khoản, bridge sẽ gửi lệnh tới toàn bộ nhóm này.</p>
+        <div id="entradeAccountsList" class="account-list"></div>
+      </div>
     </section>
 
     <section class="card">
@@ -523,8 +562,18 @@ const settingsHTML = layoutTop + `
       renderSymbolChoices();
     }
 
-    function splitAccounts(value) {
-      return (value || '').split(',').map((item) => item.trim().toUpperCase()).filter(Boolean);
+    function escapeHtml(value) {
+      return String(value || '').replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[ch]));
+    }
+
+    function entradeAccounts() {
+      return (currentEntrade && Array.isArray(currentEntrade.accounts)) ? currentEntrade.accounts : [];
+    }
+
+    function entradeDefaultSet() {
+      return new Set(((currentEntrade && currentEntrade.defaultAccountNos) || []).map((value) => String(value || '').trim().toUpperCase()).filter(Boolean));
     }
 
     function renderEntradeStatus() {
@@ -539,6 +588,78 @@ const settingsHTML = layoutTop + `
       } else {
         status.innerHTML = '<span class="status-indicator status-warn"></span>Ch&#432;a li&ecirc;n k&#7871;t t&agrave;i kho&#7843;n Entrade.';
       }
+    }
+
+    function renderEntradeAccounts() {
+      const box = document.getElementById('entradeAccountsList');
+      if (!box) return;
+      const accounts = entradeAccounts();
+      const defaults = entradeDefaultSet();
+      if (!accounts.length) {
+        box.innerHTML = '<div class="muted">Chưa có tài khoản Entrade nào.</div>';
+        return;
+      }
+      box.innerHTML = accounts.map((account, index) => {
+        const id = String(account.id || '').toUpperCase();
+        const inGroup = defaults.has(id);
+        const loanID = Number(account.loanPackageId || 0);
+        return '<div class="account-row">' +
+          '<div class="account-head">' +
+            '<div>' +
+              '<div style="font-weight:700">' + escapeHtml(id) + (account.enabled === false ? ' <span class="muted">(đang tắt)</span>' : '') + '</div>' +
+              '<div class="account-meta">' +
+                'Username: <code>' + escapeHtml(account.username) + '</code><br>' +
+                'InvestorId: <code>' + escapeHtml(account.investorId || '-') + '</code><br>' +
+                'Master account: <code>' + escapeHtml(account.accountNo || '-') + '</code><br>' +
+                'Loan package ID dùng đặt lệnh: <code>' + (loanID > 0 ? loanID : 'tự lấy') + '</code>' +
+              '</div>' +
+            '</div>' +
+            '<div class="inline-actions" style="margin-top:0; justify-content:flex-end;">' +
+              '<button class="btn secondary mini-btn" type="button" onclick="editEntradeAccount(' + index + ')">Sửa</button>' +
+              '<button class="btn secondary mini-btn" type="button" onclick="deleteEntradeAccount(' + index + ')">Xóa</button>' +
+            '</div>' +
+          '</div>' +
+          '<label class="chip" style="margin-top:10px; width:max-content;">' +
+            '<input type="checkbox" ' + (inGroup ? 'checked' : '') + ' onchange="toggleEntradeDefault(' + index + ', this.checked)">' +
+            '<span>Đặt lệnh trong nhóm mặc định</span>' +
+          '</label>' +
+        '</div>';
+      }).join('');
+    }
+
+    function editEntradeAccount(index) {
+      const account = entradeAccounts()[index];
+      if (!account) return;
+      const accountNo = window.prompt('Master account / investorAccountId', account.accountNo || '');
+      if (accountNo === null) return;
+      const loanPackageId = window.prompt('Loan package ID / bankMarginPortfolioId. Để trống nếu muốn tự lấy gói đầu tiên.', account.loanPackageId || '');
+      if (loanPackageId === null) return;
+      account.accountNo = accountNo.trim();
+      account.loanPackageId = Number(loanPackageId || 0);
+      renderEntradeAccounts();
+    }
+
+    function deleteEntradeAccount(index) {
+      const account = entradeAccounts()[index];
+      if (!account) return;
+      if (!window.confirm('Xóa tài khoản ' + account.id + ' khỏi danh sách liên kết?')) return;
+      currentEntrade.accounts.splice(index, 1);
+      const removedID = String(account.id || '').toUpperCase();
+      currentEntrade.defaultAccountNos = ((currentEntrade.defaultAccountNos || []).filter((id) => String(id || '').toUpperCase() !== removedID));
+      if (!currentEntrade.accounts.length) currentEntrade.enabled = false;
+      renderEntradeStatus();
+      renderEntradeAccounts();
+    }
+
+    function toggleEntradeDefault(index, checked) {
+      const account = entradeAccounts()[index];
+      if (!account) return;
+      const id = String(account.id || '').toUpperCase();
+      const defaults = entradeDefaultSet();
+      if (checked) defaults.add(id);
+      else defaults.delete(id);
+      currentEntrade.defaultAccountNos = Array.from(defaults);
+      renderEntradeAccounts();
     }
 
     async function linkEntradeAccount() {
@@ -578,7 +699,9 @@ const settingsHTML = layoutTop + `
       document.getElementById('accountNo').value = data.dnse.accountNo || '';
       document.getElementById('mockMode').value = data.dnse.mock ? 'true' : 'false';
       currentEntrade = data.entrade || {};
+      document.getElementById('tradingProvider').value = currentEntrade.enabled ? 'entrade' : 'dnse';
       renderEntradeStatus();
+      renderEntradeAccounts();
 
       const selectedSymbols = (data.marketData && data.marketData.symbols && data.marketData.symbols.length)
         ? data.marketData.symbols
@@ -605,7 +728,7 @@ const settingsHTML = layoutTop + `
         mock: document.getElementById('mockMode').value === 'true',
         symbols: selectedSymbols,
         primarySymbol: document.getElementById('primarySymbol').value,
-        entradeEnabled: currentEntrade.enabled === true,
+        entradeEnabled: document.getElementById('tradingProvider').value === 'entrade' && entradeAccounts().length > 0,
         entradeMock: currentEntrade.mock === true,
         entradeEnvironment: currentEntrade.environment || 'real',
         entradeDefaultAccountNos: currentEntrade.defaultAccountNos || [],

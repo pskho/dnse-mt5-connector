@@ -81,7 +81,7 @@ func InstallFiles(mt5Path string, appLog *logger.FileLogger) ([]string, error) {
 		filepath.Join(mt5Path, "MQL5", "Experts", "DNSE_MarketData_Bridge.ex5"),
 	}
 
-	logs = append(logs, "Found MT5 Installation at: " + mt5Path)
+	logs = append(logs, "Found MT5 Installation at: "+mt5Path)
 
 	backedUpDll, err := backupAndCopy(dllSrc, dllDest)
 	if err != nil {
@@ -91,7 +91,7 @@ func InstallFiles(mt5Path string, appLog *logger.FileLogger) ([]string, error) {
 	if backedUpDll {
 		logs = append(logs, "Backed up existing DNSEBridge.dll to DNSEBridge.dll.bak")
 	}
-	logs = append(logs, "Successfully copied DNSEBridge.dll to: " + dllDest)
+	logs = append(logs, "Successfully copied DNSEBridge.dll to: "+dllDest)
 	appLog.Info("dll_installed", map[string]any{"dest": dllDest})
 
 	backedUpEa, err := backupAndCopy(eaSrc, eaDest)
@@ -102,30 +102,30 @@ func InstallFiles(mt5Path string, appLog *logger.FileLogger) ([]string, error) {
 	if backedUpEa {
 		logs = append(logs, "Backed up existing DNSE_MarketData_Bridge.mq5 to DNSE_MarketData_Bridge.mq5.bak")
 	}
-	logs = append(logs, "Successfully copied DNSE_MarketData_Bridge.mq5 to: " + eaDest)
+	logs = append(logs, "Successfully copied DNSE_MarketData_Bridge.mq5 to: "+eaDest)
 	appLog.Info("ea_installed", map[string]any{"dest": eaDest})
 
 	for _, legacyPath := range legacyEAFiles {
 		if _, err := os.Stat(legacyPath); err == nil {
 			if err := os.Remove(legacyPath); err == nil {
-				logs = append(logs, "Removed legacy root EA copy: " + legacyPath)
+				logs = append(logs, "Removed legacy root EA copy: "+legacyPath)
 				appLog.Info("ea_legacy_removed", map[string]any{"dest": legacyPath})
 			} else {
-				logs = append(logs, "WARNING: Could not remove legacy root EA copy: " + legacyPath)
+				logs = append(logs, "WARNING: Could not remove legacy root EA copy: "+legacyPath)
 				appLog.Error("ea_legacy_remove_failed", map[string]any{"dest": legacyPath, "error": err.Error()})
 			}
 		}
 	}
 
 	if metaEditor := findMetaEditor(); metaEditor != "" {
-		logs = append(logs, "Found MetaEditor: " + metaEditor)
+		logs = append(logs, "Found MetaEditor: "+metaEditor)
 		if compileLog, err := compileEA(metaEditor, eaDest); err != nil {
-			logs = append(logs, "WARNING: Auto-compile failed: " + err.Error())
+			logs = append(logs, "WARNING: Auto-compile failed: "+err.Error())
 			appLog.Error("ea_compile_failed", map[string]any{"ea": eaDest, "error": err.Error()})
 		} else {
 			logs = append(logs, "Auto-compiled EA successfully.")
 			if compileLog != "" {
-				logs = append(logs, "Compile log: " + compileLog)
+				logs = append(logs, "Compile log: "+compileLog)
 			}
 			appLog.Info("ea_compiled", map[string]any{"ea": eaDest, "metaEditor": metaEditor})
 		}
@@ -216,9 +216,33 @@ func compileEA(metaEditorPath, eaPath string) (string, error) {
 	}
 	cmd := exec.Command(metaEditorPath, args...)
 	if err := cmd.Run(); err != nil {
+		if compileLogSucceeded(logPath) {
+			return logPath, nil
+		}
 		return logPath, err
 	}
+	if compileLogFailed(logPath) {
+		return logPath, fmt.Errorf("compile log reports errors: %s", logPath)
+	}
 	return logPath, nil
+}
+
+func compileLogSucceeded(logPath string) bool {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return false
+	}
+	text := strings.ToLower(string(data))
+	return strings.Contains(text, "result: 0 errors")
+}
+
+func compileLogFailed(logPath string) bool {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return false
+	}
+	text := strings.ToLower(string(data))
+	return strings.Contains(text, "result:") && !strings.Contains(text, "result: 0 errors")
 }
 
 // ExportSupportPackage creates a zip archive containing masked logs and config.
@@ -244,7 +268,7 @@ func ExportSupportPackage(configPath, logPath string) ([]byte, error) {
 			offset = size - 1024*1024
 		}
 		logFile.Seek(offset, 0)
-		
+
 		if f, err := zipWriter.Create("app.jsonl"); err == nil {
 			io.Copy(f, logFile)
 		}
@@ -253,7 +277,7 @@ func ExportSupportPackage(configPath, logPath string) ([]byte, error) {
 	// Add a system status summary
 	if f, err := zipWriter.Create("system_status.json"); err == nil {
 		status := map[string]any{
-			"os": "windows",
+			"os":        "windows",
 			"timestamp": os.Getenv("DATE"),
 		}
 		b, _ := json.MarshalIndent(status, "", "  ")
