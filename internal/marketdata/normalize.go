@@ -222,9 +222,41 @@ func firstInt64(item map[string]any, keys ...string) int64 {
 			case int64:
 				return v
 			case string:
-				n, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
-				return n
+				text := strings.TrimSpace(v)
+				if n, err := strconv.ParseInt(text, 10, 64); err == nil {
+					return n
+				}
+				if ts := parseDNSETimestampMS(text); ts > 0 {
+					return ts
+				}
 			}
+		}
+	}
+	return 0
+}
+
+func parseDNSETimestampMS(value string) int64 {
+	if value == "" {
+		return 0
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04",
+	} {
+		var (
+			t   time.Time
+			err error
+		)
+		if strings.Contains(layout, "Z07") {
+			t, err = time.Parse(layout, value)
+		} else {
+			t, err = time.ParseInLocation(layout, value, time.UTC)
+		}
+		if err == nil {
+			return t.UnixMilli()
 		}
 	}
 	return 0

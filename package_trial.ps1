@@ -1,6 +1,9 @@
 param(
     [string]$OutputRoot = "dist",
     [string]$PackageName = "DNSE-MT5-Connector-VN30F1M-Trial",
+    [string]$TelemetryMeasurementID = $(if ($env:DNSE_GA4_MEASUREMENT_ID) { $env:DNSE_GA4_MEASUREMENT_ID } else { "G-C0J6H1FF81" }),
+    [string]$TelemetryAPISecret = $(if ($env:DNSE_GA4_API_SECRET) { $env:DNSE_GA4_API_SECRET } else { "j7WPYh2gRGyOFZu-kWs2xg" }),
+    [switch]$AllowMissingTelemetry,
     [switch]$SkipBridgeBuild
 )
 
@@ -13,6 +16,34 @@ $zipPath = Join-Path $bundleRoot ($PackageName + ".zip")
 $bridgePath = Join-Path $root "bridge.exe"
 $configExamplePath = Join-Path $root "config\config.yaml.example"
 
+function Escape-YamlValue([string]$Value) {
+    return ($Value -replace '\\', '\\' -replace '"', '\"')
+}
+
+function Set-TelemetryValue([string]$Path, [string]$Key, [string]$Value) {
+    $escaped = Escape-YamlValue $Value
+    $lines = Get-Content -Path $Path
+    $inTelemetry = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $trimmed = $lines[$i].Trim()
+        if ($trimmed -eq "telemetry:") {
+            $inTelemetry = $true
+            continue
+        }
+        if ($inTelemetry -and $trimmed -ne "" -and -not $lines[$i].StartsWith("  ")) {
+            $inTelemetry = $false
+        }
+        if ($inTelemetry -and $lines[$i] -match "^  $Key`:") {
+            $lines[$i] = "  ${Key}: `"$escaped`""
+        }
+    }
+    Set-Content -Path $Path -Value $lines -Encoding UTF8
+}
+
+if (([string]::IsNullOrWhiteSpace($TelemetryMeasurementID) -or [string]::IsNullOrWhiteSpace($TelemetryAPISecret)) -and -not $AllowMissingTelemetry) {
+    throw "Telemetry bat buoc cho ban phat hanh. Hay truyen -TelemetryMeasurementID va -TelemetryAPISecret, hoac dat bien moi truong DNSE_GA4_MEASUREMENT_ID / DNSE_GA4_API_SECRET."
+}
+
 if (-not $SkipBridgeBuild) {
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "build_bridge.ps1") -Output $bridgePath
     if ($LASTEXITCODE -ne 0) {
@@ -24,6 +55,7 @@ $requiredFiles = @(
     $bridgePath,
     (Join-Path $root "deploy_mt5.ps1"),
     (Join-Path $root "deploy_mt5.bat"),
+    (Join-Path $root "launch_dnse_mt5.bat"),
     (Join-Path $root "mql5\DNSE_MarketData_Bridge.mq5"),
     (Join-Path $root "mql5\DNSE_SuperTrend_Bot.mq5"),
     (Join-Path $root "cpp\build\Release\DNSEBridge.dll")
@@ -56,6 +88,7 @@ New-Item -ItemType Directory -Path (Join-Path $packageRoot "cpp\build\Release") 
 Copy-Item $bridgePath (Join-Path $packageRoot "bridge.exe") -Force
 Copy-Item (Join-Path $root "deploy_mt5.ps1") (Join-Path $packageRoot "deploy_mt5.ps1") -Force
 Copy-Item (Join-Path $root "deploy_mt5.bat") (Join-Path $packageRoot "deploy_mt5.bat") -Force
+Copy-Item (Join-Path $root "launch_dnse_mt5.bat") (Join-Path $packageRoot "launch_dnse_mt5.bat") -Force
 Copy-Item (Join-Path $root "mql5\DNSE_MarketData_Bridge.mq5") (Join-Path $packageRoot "mql5\DNSE_MarketData_Bridge.mq5") -Force
 Copy-Item (Join-Path $root "mql5\DNSE_SuperTrend_Bot.mq5") (Join-Path $packageRoot "mql5\DNSE_SuperTrend_Bot.mq5") -Force
 Copy-Item (Join-Path $root "cpp\build\Release\DNSEBridge.dll") (Join-Path $packageRoot "cpp\build\Release\DNSEBridge.dll") -Force
@@ -112,10 +145,28 @@ gmail_otp:
   token_file: "config/token.json"
   poll_interval_seconds: 3
   email_domain_filter: "dnse.com.vn"
+
+telemetry:
+  enabled: true
+  provider: "ga4"
+  measurement_id: ""
+  api_secret: ""
+  client_id_file: "data/client_id"
+  app_version: "0.1.0-trial"
 '@
 
     Set-Content -Path (Join-Path $packageRoot "config\config.yaml.example") -Value $configContent -Encoding UTF8
     Set-Content -Path (Join-Path $packageRoot "config\config.yaml") -Value $configContent -Encoding UTF8
+}
+
+if (-not [string]::IsNullOrWhiteSpace($TelemetryMeasurementID) -and -not [string]::IsNullOrWhiteSpace($TelemetryAPISecret)) {
+    foreach ($targetConfig in @(
+        (Join-Path $packageRoot "config\config.yaml"),
+        (Join-Path $packageRoot "config\config.yaml.example")
+    )) {
+        Set-TelemetryValue -Path $targetConfig -Key "measurement_id" -Value $TelemetryMeasurementID
+        Set-TelemetryValue -Path $targetConfig -Key "api_secret" -Value $TelemetryAPISecret
+    }
 }
 
 if (Test-Path $zipPath) {

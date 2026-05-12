@@ -56,3 +56,11 @@ gmail_otp:
   token_file: "config/token.json"
   poll_interval_seconds: 3
   email_domain_filter: "dnse.com.vn"
+
+telemetry:
+  enabled: true
+  provider: "ga4"
+  measurement_id: "G-C0J6H1FF81"
+  api_secret: "j7WPYh2gRGyOFZu-kWs2xg"
+  client_id_file: "data/client_id"
+  app_version: "0.1.0-trial"

@@ -41,6 +41,18 @@ type authResponse struct {
 	Token string `json:"token"`
 }
 
+type LinkAccountResult struct {
+	Username          string                  `json:"username"`
+	Environment       string                  `json:"environment"`
+	InvestorID        string                  `json:"investorId"`
+	InvestorAccountID string                  `json:"investorAccountId"`
+	Status            string                  `json:"status"`
+	TotalCash         float64                 `json:"totalCash,omitempty"`
+	AvailableCash     float64                 `json:"availableCash,omitempty"`
+	LoanPackages      []dnsemodel.LoanPackage `json:"loanPackages,omitempty"`
+	TokenExpiresAt    time.Time               `json:"tokenExpiresAt,omitempty"`
+}
+
 const (
 	AccountDemo     = "ENTRADE_DEMO"
 	AccountReal     = "ENTRADE_REAL"
@@ -197,6 +209,59 @@ func (c *Client) GetAccounts(ctx context.Context) ([]dnsemodel.Account, error) {
 		return nil, errors.New("entrade returned no orderable demo/real accounts")
 	}
 	return accounts, nil
+}
+
+func (c *Client) LinkAccount(ctx context.Context, username, password, environment string) (LinkAccountResult, error) {
+	username = strings.TrimSpace(username)
+	password = strings.TrimSpace(password)
+	environment = strings.ToLower(strings.TrimSpace(environment))
+	if environment == "" || environment == "prod" {
+		environment = "real"
+	}
+	if environment != "real" && environment != "paper" {
+		environment = "real"
+	}
+	if username == "" || password == "" {
+		return LinkAccountResult{}, errors.New("username and password are required")
+	}
+
+	token, expiresAt, investorID, err := c.authenticate(ctx, username, password)
+	if err != nil {
+		return LinkAccountResult{}, err
+	}
+	if investorID == "" {
+		return LinkAccountResult{}, errors.New("entrade investor_id is missing and cannot be decoded from token")
+	}
+
+	baseURL := c.cfg.BaseURL
+	if environment != "real" {
+		baseURL = c.cfg.PaperBaseURL
+	}
+	baseURL = strings.TrimRight(baseURL, "/")
+
+	var accountRaw map[string]any
+	if err := c.doWithToken(ctx, token, http.MethodGet, baseURL+fmt.Sprintf("/investors/%s/investor_account", url.PathEscape(investorID)), nil, &accountRaw); err != nil {
+		return LinkAccountResult{}, fmt.Errorf("load entrade master account: %w", err)
+	}
+
+	var packagesRaw map[string]any
+	var loanPackages []dnsemodel.LoanPackage
+	if err := c.doWithToken(ctx, token, http.MethodGet, baseURL+fmt.Sprintf("/investors/%s/derivative_margin_portfolios", url.PathEscape(investorID)), nil, &packagesRaw); err == nil {
+		loanPackages = simplifyLoanPackages(packagesRaw, "VN30F1M")
+	}
+
+	accountID := firstString(accountRaw, "investorAccountId", "id", "investorId")
+	return LinkAccountResult{
+		Username:          username,
+		Environment:       environment,
+		InvestorID:        investorID,
+		InvestorAccountID: accountID,
+		Status:            defaultString(firstString(accountRaw, "status"), "UNKNOWN"),
+		TotalCash:         firstFloat(accountRaw, "totalCash"),
+		AvailableCash:     firstFloat(accountRaw, "availableCash"),
+		LoanPackages:      loanPackages,
+		TokenExpiresAt:    expiresAt,
+	}, nil
 }
 
 func (c *Client) GetLoanPackages(ctx context.Context, accountNo, symbol, marketType string) ([]dnsemodel.LoanPackage, error) {
@@ -529,38 +594,10 @@ func (c *Client) login(ctx context.Context, accountNo string) error {
 	if strings.TrimSpace(profile.Username) == "" || strings.TrimSpace(profile.Password) == "" {
 		return fmt.Errorf("entrade username/password are required for account %s", profileStateKey(profile, accountNo))
 	}
-	payload := map[string]string{"username": profile.Username, "password": profile.Password}
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.AuthURL, bytes.NewReader(body))
+	auth, expiresAt, investorID, err := c.authenticate(ctx, profile.Username, profile.Password)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("entrade auth returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
-	}
-	var auth authResponse
-	if err := json.Unmarshal(respBody, &auth); err != nil {
-		return err
-	}
-	if auth.Token == "" {
-		return errors.New("entrade auth response missing token")
-	}
-	expiresAt := jwtExpiresAt(auth.Token)
-	if expiresAt.IsZero() {
-		expiresAt = time.Now().UTC().Add(8 * time.Hour)
-	}
-	investorID := investorIDFromJWT(auth.Token)
 	key := profileStateKey(profile, accountNo)
 	c.mu.Lock()
 	state := c.states[key]
@@ -568,12 +605,12 @@ func (c *Client) login(ctx context.Context, accountNo string) error {
 		state = &accountState{}
 		c.states[key] = state
 	}
-	state.token = auth.Token
+	state.token = auth
 	state.expiresAt = expiresAt
 	if state.investorID == "" {
 		state.investorID = defaultString(profile.InvestorID, investorID)
 	}
-	c.token = auth.Token
+	c.token = auth
 	c.expiresAt = expiresAt
 	if c.investorID == "" {
 		c.investorID = investorID
@@ -585,12 +622,88 @@ func (c *Client) login(ctx context.Context, accountNo string) error {
 	return nil
 }
 
+func (c *Client) authenticate(ctx context.Context, username, password string) (string, time.Time, string, error) {
+	payload := map[string]string{"username": username, "password": password}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.AuthURL, bytes.NewReader(body))
+	if err != nil {
+		return "", time.Time{}, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", time.Time{}, "", err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", time.Time{}, "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", time.Time{}, "", fmt.Errorf("entrade auth returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	var auth authResponse
+	if err := json.Unmarshal(respBody, &auth); err != nil {
+		return "", time.Time{}, "", err
+	}
+	if auth.Token == "" {
+		return "", time.Time{}, "", errors.New("entrade auth response missing token")
+	}
+	expiresAt := jwtExpiresAt(auth.Token)
+	if expiresAt.IsZero() {
+		expiresAt = time.Now().UTC().Add(8 * time.Hour)
+	}
+	investorID := investorIDFromJWT(auth.Token)
+	return auth.Token, expiresAt, investorID, nil
+}
+
 func (c *Client) do(ctx context.Context, method, path string, payload any, out any) error {
 	return c.doForAccount(ctx, "", method, path, payload, out)
 }
 
 func (c *Client) doForAccount(ctx context.Context, accountNo, method, path string, payload any, out any) error {
 	return c.doInternal(ctx, accountNo, method, path, payload, out, true)
+}
+
+func (c *Client) doWithToken(ctx context.Context, token, method, fullURL string, payload any, out any) error {
+	var body []byte
+	var err error
+	if payload != nil {
+		body, err = json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if strings.TrimSpace(token) != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("entrade api returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	if out != nil && len(respBody) > 0 {
+		if err := json.Unmarshal(respBody, out); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Client) doInternal(ctx context.Context, accountNo, method, path string, payload any, out any, allowRetry bool) error {

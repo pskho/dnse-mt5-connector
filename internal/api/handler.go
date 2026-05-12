@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"dnse-mt5-connector/internal/config"
+	"dnse-mt5-connector/internal/entrade"
 	"dnse-mt5-connector/internal/logger"
 	"dnse-mt5-connector/internal/marketdata"
 	"dnse-mt5-connector/internal/service"
@@ -28,6 +29,10 @@ type MarketDataStatusProvider interface {
 	Status() marketdata.BridgeStatusSnapshot
 }
 
+type TelemetrySink interface {
+	Track(ctx context.Context, name string, params map[string]any)
+}
+
 type Handler struct {
 	orders    *service.OrderService
 	positions *service.PositionService
@@ -39,6 +44,7 @@ type Handler struct {
 	history   HistorySyncer
 	otp       OTPFetcher
 	logger    *logger.FileLogger
+	telemetry TelemetrySink
 	statusMu  sync.Mutex
 	lastAPIOK bool
 	lastAPIAt time.Time
@@ -58,8 +64,8 @@ type killSwitchRequest struct {
 	Enabled bool `json:"enabled"`
 }
 
-func NewHandler(orderService *service.OrderService, positionService *service.PositionService, signalService *service.SignalService, symbolService *service.SymbolCatalogService, profiles []marketdata.SymbolProfile, marketStatus MarketDataStatusProvider, dnseClient *DNSEClient, historyService HistorySyncer, otpFetcher OTPFetcher, appLog *logger.FileLogger) *Handler {
-	return &Handler{orders: orderService, positions: positionService, signals: signalService, symbols: symbolService, profiles: profiles, market: marketStatus, dnse: dnseClient, history: historyService, otp: otpFetcher, logger: appLog}
+func NewHandler(orderService *service.OrderService, positionService *service.PositionService, signalService *service.SignalService, symbolService *service.SymbolCatalogService, profiles []marketdata.SymbolProfile, marketStatus MarketDataStatusProvider, dnseClient *DNSEClient, historyService HistorySyncer, otpFetcher OTPFetcher, appLog *logger.FileLogger, telemetrySink TelemetrySink) *Handler {
+	return &Handler{orders: orderService, positions: positionService, signals: signalService, symbols: symbolService, profiles: profiles, market: marketStatus, dnse: dnseClient, history: historyService, otp: otpFetcher, logger: appLog, telemetry: telemetrySink}
 }
 
 func (h *Handler) Routes() http.Handler {
@@ -107,6 +113,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/settings", h.settingsUI)
 	mux.HandleFunc("/logs", h.logsUI)
 	mux.HandleFunc("/api/settings", h.settingsAPI)
+	mux.HandleFunc("/api/entrade/link", h.entradeLinkAPI)
 	mux.HandleFunc("/api/logs/raw", h.logsRawAPI)
 	mux.HandleFunc("/api/setup/install", h.setupInstallAPI)
 	mux.HandleFunc("/support/export", h.supportExport)
@@ -1070,14 +1077,6 @@ func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode st
 		CloneSnapshot(sourceSymbol, targetSymbol, marketType string, resolution int) bool
 	}
 	cloner, _ := h.history.(historySnapshotCloner)
-	type tickerLookup interface {
-		GetTickerMetadataBySymbol(ctx context.Context, symbol string) (storage.TickerMetadataRecord, error)
-	}
-	var tickerSvc tickerLookup
-	if h.symbols != nil {
-		tickerSvc, _ = any(h.symbols).(tickerLookup)
-	}
-
 	type item struct {
 		Symbol     string `json:"symbol"`
 		MarketType string `json:"marketType"`
@@ -1102,13 +1101,6 @@ func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode st
 	order := make([]string, 0, len(h.profiles))
 	for _, profile := range h.profiles {
 		canonical := strings.ToUpper(strings.TrimSpace(profile.Symbol))
-		if tickerSvc != nil {
-			if record, err := tickerSvc.GetTickerMetadataBySymbol(r.Context(), profile.Symbol); err == nil {
-				if feed := strings.ToUpper(strings.TrimSpace(record.FeedSymbol)); feed != "" {
-					canonical = feed
-				}
-			}
-		}
 		job := jobsByCanonical[canonical]
 		if job == nil {
 			job = &syncJob{
@@ -1235,6 +1227,7 @@ func (h *Handler) settingsAPI(w http.ResponseWriter, r *http.Request) {
 			cfg.Entrade.Accounts[i].Password = ""
 			cfg.Entrade.Accounts[i].TradingToken = ""
 		}
+		cfg.Telemetry.APISecret = ""
 		writeJSON(w, http.StatusOK, cfg)
 		return
 	}
@@ -1311,6 +1304,94 @@ func (h *Handler) settingsAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+}
+
+func (h *Handler) entradeLinkAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+
+	var req struct {
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		Environment string `json:"environment"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	req.Username = strings.TrimSpace(req.Username)
+	req.Password = strings.TrimSpace(req.Password)
+	req.Environment = strings.ToLower(strings.TrimSpace(req.Environment))
+	if req.Environment == "" {
+		req.Environment = "real"
+	}
+	if req.Username == "" || req.Password == "" {
+		writeError(w, http.StatusBadRequest, "username and password are required")
+		return
+	}
+
+	cfg, err := config.Load("config/config.yaml")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	linkCfg := cfg.Entrade
+	linkCfg.Enabled = true
+	linkCfg.Mock = false
+	linkCfg.Environment = req.Environment
+	linkCfg.Username = req.Username
+	linkCfg.Password = req.Password
+
+	client := entrade.NewClient(linkCfg, h.logger)
+	result, err := client.LinkAccount(r.Context(), req.Username, req.Password, req.Environment)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	accountID := strings.TrimSpace(result.InvestorAccountID)
+	if accountID == "" {
+		accountID = strings.TrimSpace(result.InvestorID)
+	}
+	cfg.Entrade.Enabled = true
+	cfg.Entrade.Mock = false
+	cfg.Entrade.Environment = result.Environment
+	cfg.Entrade.Username = req.Username
+	cfg.Entrade.Password = req.Password
+	cfg.Entrade.InvestorID = result.InvestorID
+	cfg.Entrade.AccountNo = accountID
+	cfg.Entrade.DefaultAccountNos = []string{entrade.AccountReal}
+	cfg.Entrade.Accounts = []config.EntradeAccountConfig{{
+		ID:          entrade.AccountReal,
+		Environment: result.Environment,
+		Username:    req.Username,
+		Password:    req.Password,
+		InvestorID:  result.InvestorID,
+		AccountNo:   accountID,
+		Enabled:     true,
+	}}
+	if err := cfg.Save("config/config.yaml"); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save config")
+		return
+	}
+	if h.telemetry != nil {
+		h.telemetry.Track(r.Context(), "entrade_linked", map[string]any{
+			"environment": result.Environment,
+			"status":      result.Status,
+			"packages":    len(result.LoanPackages),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"account": result,
+	})
 }
 
 func (h *Handler) canonicalizeSymbols(ctx context.Context, symbols []string) []string {

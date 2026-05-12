@@ -22,7 +22,10 @@ import (
 	"dnse-mt5-connector/internal/service"
 	"dnse-mt5-connector/internal/setup"
 	"dnse-mt5-connector/internal/storage"
+	"dnse-mt5-connector/internal/telemetry"
 )
+
+const appVersion = "0.1.0-trial"
 
 type instrumentCatalogAdapter struct {
 	client *api.DNSEClient
@@ -83,6 +86,14 @@ func main() {
 		log.Fatalf("init logger: %v", err)
 	}
 	defer appLog.Close()
+	telemetryClient := telemetry.NewClient(cfg.Telemetry, appLog)
+	telemetryClient.Track(appCtx, "app_start", map[string]any{
+		"app_version": appVersion,
+		"symbols":     len(cfg.MarketData.Symbols),
+		"provider":    tradingProviderName(cfg),
+		"history":     cfg.History.Enabled,
+		"market_data": cfg.MarketData.Enabled,
+	})
 
 	store, err := storage.NewSQLiteStore(cfg.DatabasePath)
 	if err != nil {
@@ -141,7 +152,7 @@ func main() {
 	dnseClient.SetOTPFetcher(otpService)
 
 	marketDataEngine := marketdata.NewEngine(cfg.MarketData, cfg.DNSE.APIKey, cfg.DNSE.APISecret, dnseClient, symbolCatalogService, historyService, appLog)
-	handler := api.NewHandler(orderService, positionService, signalService, symbolCatalogService, marketDataEngine.Profiles(), marketDataEngine, dnseClient, historyService, otpService, appLog)
+	handler := api.NewHandler(orderService, positionService, signalService, symbolCatalogService, marketDataEngine.Profiles(), marketDataEngine, dnseClient, historyService, otpService, appLog, telemetryClient)
 	marketDataEngine.Start(appCtx)
 
 	server := &http.Server{
@@ -319,4 +330,11 @@ func dnseTokenRefreshPolicy(now time.Time) (bool, time.Duration, string) {
 		return true, 8 * time.Hour, "daily_0800_refresh"
 	}
 	return true, 30 * time.Minute, "trading_session_refresh"
+}
+
+func tradingProviderName(cfg config.Config) string {
+	if cfg.Entrade.Enabled {
+		return "entrade"
+	}
+	return "dnse"
 }

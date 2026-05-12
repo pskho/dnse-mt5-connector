@@ -5,6 +5,8 @@ param(
     [string]$GhRepo = "pskho/dnse-mt5-connector",
     [string]$InstallerName = "DNSE-MT5-Connector-VN30F1M-Setup.exe",
     [string]$PackageName = "DNSE-MT5-Connector-VN30F1M-Trial",
+    [string]$TelemetryMeasurementID = $(if ($env:DNSE_GA4_MEASUREMENT_ID) { $env:DNSE_GA4_MEASUREMENT_ID } else { "G-C0J6H1FF81" }),
+    [string]$TelemetryAPISecret = $(if ($env:DNSE_GA4_API_SECRET) { $env:DNSE_GA4_API_SECRET } else { "j7WPYh2gRGyOFZu-kWs2xg" }),
     [switch]$SkipDeployMt5,
     [switch]$SkipGit,
     [switch]$SkipRelease
@@ -166,13 +168,13 @@ if (-not $SkipDeployMt5) {
 }
 
 Write-Host "5. Dong goi zip trial..." -ForegroundColor Cyan
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\package_trial.ps1 -PackageName $PackageName
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\package_trial.ps1 -PackageName $PackageName -TelemetryMeasurementID $TelemetryMeasurementID -TelemetryAPISecret $TelemetryAPISecret
 if ($LASTEXITCODE -ne 0) {
     throw "Dong goi zip that bai."
 }
 
 Write-Host "6. Tao installer .exe..." -ForegroundColor Cyan
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build_installer.ps1 -InstallerName $InstallerName -PackageName $PackageName
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build_installer.ps1 -InstallerName $InstallerName -PackageName $PackageName -TelemetryMeasurementID $TelemetryMeasurementID -TelemetryAPISecret $TelemetryAPISecret
 if ($LASTEXITCODE -ne 0) {
     throw "Build installer that bai."
 }

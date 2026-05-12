@@ -60,6 +60,10 @@ func (s *Store) Update(tick Tick) {
 		s.mu.Unlock()
 		return
 	}
+	if !isVNTradingTimestampMS(tick.TimestampMS) {
+		s.mu.Unlock()
+		return
+	}
 	if tick.Bid <= 0 {
 		tick.Bid = tick.Last
 	}

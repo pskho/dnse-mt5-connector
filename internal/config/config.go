@@ -37,6 +37,7 @@ type Config struct {
 	MarketData   MarketDataConfig `json:"marketData"`
 	History      HistoryConfig    `json:"history"`
 	GmailOTP     GmailOTPConfig   `json:"gmailOTP"`
+	Telemetry    TelemetryConfig  `json:"telemetry"`
 }
 
 type GmailOTPConfig struct {
@@ -45,6 +46,15 @@ type GmailOTPConfig struct {
 	TokenFile           string `json:"tokenFile"`
 	PollIntervalSeconds int    `json:"pollIntervalSeconds"`
 	EmailDomainFilter   string `json:"emailDomainFilter"`
+}
+
+type TelemetryConfig struct {
+	Enabled       bool   `json:"enabled"`
+	Provider      string `json:"provider"`
+	MeasurementID string `json:"measurementId"`
+	APISecret     string `json:"apiSecret"`
+	ClientIDFile  string `json:"clientIdFile"`
+	AppVersion    string `json:"appVersion"`
 }
 
 type HistoryConfig struct {
@@ -152,6 +162,12 @@ func Load(path string) (Config, error) {
 			IncrementalSync:     true,
 			FullRebuild:         false,
 			MaxBatchDays:        30,
+		},
+		Telemetry: TelemetryConfig{
+			Enabled:      true,
+			Provider:     "ga4",
+			ClientIDFile: "data/client_id",
+			AppVersion:   "0.1.0-trial",
 		},
 	}
 
@@ -301,6 +317,14 @@ func normalize(cfg *Config) {
 	if cfg.GmailOTP.EmailDomainFilter == "" {
 		cfg.GmailOTP.EmailDomainFilter = "dnse.com.vn"
 	}
+	cfg.Telemetry.Provider = "ga4"
+	cfg.Telemetry.Enabled = true
+	if cfg.Telemetry.ClientIDFile == "" {
+		cfg.Telemetry.ClientIDFile = "data/client_id"
+	}
+	if cfg.Telemetry.AppVersion == "" {
+		cfg.Telemetry.AppVersion = "0.1.0-trial"
+	}
 }
 
 func parseSimpleYAML(data []byte, cfg *Config) error {
@@ -428,6 +452,25 @@ func parseSimpleYAML(data []byte, cfg *Config) error {
 				cfg.GmailOTP.PollIntervalSeconds = n
 			case "email_domain_filter":
 				cfg.GmailOTP.EmailDomainFilter = value
+			}
+		case "telemetry":
+			switch key {
+			case "enabled":
+				enabled, err := strconv.ParseBool(value)
+				if err != nil {
+					return fmt.Errorf("invalid telemetry.enabled: %w", err)
+				}
+				cfg.Telemetry.Enabled = enabled
+			case "provider":
+				cfg.Telemetry.Provider = value
+			case "measurement_id":
+				cfg.Telemetry.MeasurementID = value
+			case "api_secret":
+				cfg.Telemetry.APISecret = value
+			case "client_id_file":
+				cfg.Telemetry.ClientIDFile = value
+			case "app_version":
+				cfg.Telemetry.AppVersion = value
 			}
 		case "market_data":
 			switch key {
@@ -598,6 +641,14 @@ gmail_otp:
   token_file: "%s"
   poll_interval_seconds: %d
   email_domain_filter: "%s"
+
+telemetry:
+  enabled: %v
+  provider: "%s"
+  measurement_id: "%s"
+  api_secret: "%s"
+  client_id_file: "%s"
+  app_version: "%s"
 `,
 		c.Host, c.Port, c.DatabasePath, c.LogFile,
 		c.Risk.MaxQuantity, c.Risk.MaxOpenPosition, c.Risk.DuplicateWindowSeconds,
@@ -609,6 +660,7 @@ gmail_otp:
 		c.MarketData.Enabled, c.MarketData.Symbol, strings.Join(quoteChannels(c.MarketData.Symbols), ", "), c.MarketData.BridgeAddress, c.MarketData.WebSocketURL, strings.Join(quoteChannels(c.MarketData.Channels), ", "), c.MarketData.Mock, c.MarketData.ReconnectSeconds,
 		c.History.Enabled, c.History.Symbol, c.History.MarketType, c.History.Resolution, c.History.InitialLookbackDays, c.History.IncrementalSync, c.History.FullRebuild, c.History.MaxBatchDays,
 		c.GmailOTP.Enabled, c.GmailOTP.CredentialsFile, c.GmailOTP.TokenFile, c.GmailOTP.PollIntervalSeconds, c.GmailOTP.EmailDomainFilter,
+		c.Telemetry.Enabled, c.Telemetry.Provider, c.Telemetry.MeasurementID, c.Telemetry.APISecret, c.Telemetry.ClientIDFile, c.Telemetry.AppVersion,
 	)
 
 	return os.WriteFile(path, []byte(yaml), 0644)

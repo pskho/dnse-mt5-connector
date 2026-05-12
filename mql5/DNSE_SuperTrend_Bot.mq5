@@ -3,7 +3,7 @@
 //| Sends BUY/SELL signals to the local DNSE/Entrade bridge.         |
 //+------------------------------------------------------------------+
 #property strict
-#property version "1.00"
+#property version "1.01"
 
 input string          InpBridgeURL          = "http://127.0.0.1:8080";
 input string          InpSourceSymbol       = "VN30F1M";
@@ -18,6 +18,14 @@ input bool            InpCloseBeforeReverse = true;
 input bool            InpEnableTrading      = false;
 input int             InpTimerSeconds       = 1;
 input int             InpBarsToCalculate    = 300;
+input bool            InpShowChartObjects   = true;
+input int             InpVisualBars         = 200;
+input int             InpTrendLineWidth     = 2;
+input color           InpUpTrendColor       = clrLime;
+input color           InpDownTrendColor     = clrTomato;
+input color           InpBuyMarkerColor     = clrLime;
+input color           InpSellMarkerColor    = clrTomato;
+input bool            InpKeepDrawingsOnStop = false;
 
 int      g_atr_handle = INVALID_HANDLE;
 datetime g_last_closed_bar_time = 0;
@@ -53,6 +61,8 @@ void OnDeinit(const int reason)
    EventKillTimer();
    if(g_atr_handle != INVALID_HANDLE)
       IndicatorRelease(g_atr_handle);
+   if(!InpKeepDrawingsOnStop)
+      ClearChartObjects();
    Print("SuperTrend bot stopped.");
 }
 
@@ -87,6 +97,8 @@ void CheckSuperTrendSignal()
 
    if(!CalculateSuperTrend(rates, atr, copied, supertrend, direction))
       return;
+
+   DrawSuperTrendObjects(rates, supertrend, direction, copied);
 
    int currentDirection = direction[1];
    int previousDirection = direction[2];
@@ -194,6 +206,129 @@ bool CalculateSuperTrend(MqlRates &rates[], double &atr[], int count, double &su
    }
 
    return true;
+}
+
+void DrawSuperTrendObjects(MqlRates &rates[], double &supertrend[], int &direction[], int count)
+{
+   if(!InpShowChartObjects)
+      return;
+   if(count < InpATRPeriod + 5)
+      return;
+
+   int drawBars = InpVisualBars;
+   if(drawBars > count - 2)
+      drawBars = count - 2;
+   if(drawBars < 2)
+      return;
+
+   string prefix = ChartObjectPrefix();
+   DeleteObjectsByPrefix(prefix + "LINE_");
+   DeleteObjectsByPrefix(prefix + "SIGNAL_");
+
+   for(int i = drawBars; i >= 2; i--)
+   {
+      if(supertrend[i] <= 0.0 || supertrend[i - 1] <= 0.0)
+         continue;
+      color lineColor = direction[i - 1] >= 0 ? InpUpTrendColor : InpDownTrendColor;
+      DrawTrendSegment(prefix, rates[i].time, supertrend[i], rates[i - 1].time, supertrend[i - 1], lineColor);
+   }
+
+   for(int i = drawBars - 1; i >= 1; i--)
+   {
+      bool crossUp = rates[i + 1].close <= supertrend[i + 1] &&
+                     rates[i].close > supertrend[i] &&
+                     direction[i] == 1 &&
+                     direction[i + 1] == -1;
+      bool crossDown = rates[i + 1].close >= supertrend[i + 1] &&
+                       rates[i].close < supertrend[i] &&
+                       direction[i] == -1 &&
+                       direction[i + 1] == 1;
+
+      if(crossUp)
+         DrawSignalMarker(prefix, "BUY", rates[i].time, rates[i].low, rates[i].close, InpBuyMarkerColor, true);
+      else if(crossDown)
+         DrawSignalMarker(prefix, "SELL", rates[i].time, rates[i].high, rates[i].close, InpSellMarkerColor, false);
+   }
+
+   ChartRedraw(0);
+}
+
+void DrawTrendSegment(string prefix, datetime time1, double price1, datetime time2, double price2, color lineColor)
+{
+   string name = prefix + "LINE_" + IntegerToString((long)time1) + "_" + IntegerToString((long)time2);
+   if(!ObjectCreate(0, name, OBJ_TREND, 0, time1, price1, time2, price2))
+      return;
+   int width = InpTrendLineWidth;
+   if(width < 1)
+      width = 1;
+   ObjectSetInteger(0, name, OBJPROP_COLOR, lineColor);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, width);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, name, OBJPROP_RAY_LEFT, false);
+   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+void DrawSignalMarker(string prefix, string side, datetime signalTime, double anchorPrice, double tradePrice, color markerColor, bool isBuy)
+{
+   double point = SymbolInfoDouble(InpCustomSymbol, SYMBOL_POINT);
+   if(point <= 0.0)
+      point = 0.1;
+   double markerOffset = point * 12.0;
+   double textOffset = point * 24.0;
+   double markerPrice = isBuy ? anchorPrice - markerOffset : anchorPrice + markerOffset;
+   double textPrice = isBuy ? anchorPrice - textOffset : anchorPrice + textOffset;
+
+   string signalKey = IntegerToString((long)signalTime) + "_" + side;
+   string arrowName = prefix + "SIGNAL_ARROW_" + signalKey;
+   string textName = prefix + "SIGNAL_TEXT_" + signalKey;
+
+   if(ObjectCreate(0, arrowName, OBJ_ARROW, 0, signalTime, markerPrice))
+   {
+      ObjectSetInteger(0, arrowName, OBJPROP_ARROWCODE, isBuy ? 233 : 234);
+      ObjectSetInteger(0, arrowName, OBJPROP_COLOR, markerColor);
+      ObjectSetInteger(0, arrowName, OBJPROP_WIDTH, 2);
+      ObjectSetInteger(0, arrowName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, arrowName, OBJPROP_HIDDEN, true);
+   }
+
+   int digits = (int)SymbolInfoInteger(InpCustomSymbol, SYMBOL_DIGITS);
+   if(digits <= 0)
+      digits = 1;
+   string label = side + " " + DoubleToString(tradePrice, digits);
+   if(ObjectCreate(0, textName, OBJ_TEXT, 0, signalTime, textPrice))
+   {
+      ObjectSetString(0, textName, OBJPROP_TEXT, label);
+      ObjectSetString(0, textName, OBJPROP_FONT, "Arial");
+      ObjectSetInteger(0, textName, OBJPROP_FONTSIZE, 9);
+      ObjectSetInteger(0, textName, OBJPROP_COLOR, markerColor);
+      ObjectSetInteger(0, textName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, textName, OBJPROP_HIDDEN, true);
+   }
+}
+
+void ClearChartObjects()
+{
+   string prefix = ChartObjectPrefix();
+   DeleteObjectsByPrefix(prefix + "LINE_");
+   DeleteObjectsByPrefix(prefix + "SIGNAL_");
+}
+
+void DeleteObjectsByPrefix(string prefix)
+{
+   int total = ObjectsTotal(0, 0, -1);
+   for(int i = total - 1; i >= 0; i--)
+   {
+      string name = ObjectName(0, i, 0, -1);
+      if(StringFind(name, prefix) == 0)
+         ObjectDelete(0, name);
+   }
+}
+
+string ChartObjectPrefix()
+{
+   return "DNSE_ST_" + InpCustomSymbol + "_" + EnumToString(InpTimeframe) + "_";
 }
 
 void SendOrderSignal(string side)

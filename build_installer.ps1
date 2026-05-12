@@ -1,7 +1,10 @@
 param(
     [string]$OutputRoot = "dist",
     [string]$PackageName = "DNSE-MT5-Connector-VN30F1M-Trial",
-    [string]$InstallerName = "DNSE-MT5-Connector-VN30F1M-Setup.exe"
+    [string]$InstallerName = "DNSE-MT5-Connector-VN30F1M-Setup.exe",
+    [string]$TelemetryMeasurementID = $(if ($env:DNSE_GA4_MEASUREMENT_ID) { $env:DNSE_GA4_MEASUREMENT_ID } else { "G-C0J6H1FF81" }),
+    [string]$TelemetryAPISecret = $(if ($env:DNSE_GA4_API_SECRET) { $env:DNSE_GA4_API_SECRET } else { "j7WPYh2gRGyOFZu-kWs2xg" }),
+    [switch]$AllowMissingTelemetry
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,7 +33,24 @@ $packageZip = Join-Path $bundleRoot ($PackageName + ".zip")
 $installerPath = Join-Path $bundleRoot $InstallerName
 $bootstrapSource = Join-Path $root "installer_bootstrap.cs"
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "package_trial.ps1") -OutputRoot $OutputRoot -PackageName $PackageName
+$packageArgs = @(
+    "-NoProfile",
+    "-ExecutionPolicy", "Bypass",
+    "-File", (Join-Path $root "package_trial.ps1"),
+    "-OutputRoot", $OutputRoot,
+    "-PackageName", $PackageName
+)
+if (-not [string]::IsNullOrWhiteSpace($TelemetryMeasurementID)) {
+    $packageArgs += @("-TelemetryMeasurementID", $TelemetryMeasurementID)
+}
+if (-not [string]::IsNullOrWhiteSpace($TelemetryAPISecret)) {
+    $packageArgs += @("-TelemetryAPISecret", $TelemetryAPISecret)
+}
+if ($AllowMissingTelemetry) {
+    $packageArgs += "-AllowMissingTelemetry"
+}
+
+powershell.exe @packageArgs
 if ($LASTEXITCODE -ne 0) {
     throw "Khong the tao goi trial moi. Package build that bai."
 }

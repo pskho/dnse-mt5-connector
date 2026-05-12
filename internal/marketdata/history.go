@@ -131,14 +131,25 @@ func (s *HistoryService) NeedsBootstrap(ctx context.Context, symbol, marketType 
 	if resolution <= 0 {
 		resolution = s.cfg.Resolution
 	}
-	_, _, count, err := s.cache.GetHistoryCoverage(ctx, symbol, marketType, resolution)
+	_, maxMS, count, err := s.cache.GetHistoryCoverage(ctx, symbol, marketType, resolution)
 	if err != nil {
 		s.logger.Error("history_bootstrap_coverage_failed", map[string]any{
 			"symbol": symbol, "marketType": marketType, "resolution": resolution, "error": err.Error(),
 		})
 		return true
 	}
-	return count == 0
+	if count == 0 {
+		return true
+	}
+	requiredFromMS := latestRequiredBootstrapDayStartMS()
+	if requiredFromMS > 0 && maxMS < requiredFromMS {
+		s.logger.Info("history_bootstrap_stale_cache", map[string]any{
+			"symbol": symbol, "marketType": marketType, "resolution": resolution,
+			"maxMS": maxMS, "requiredFromMS": requiredFromMS,
+		})
+		return true
+	}
+	return false
 }
 
 func (s *HistoryService) Sync(ctx context.Context, firstTime, lastTime int64) (any, error) {
@@ -242,7 +253,7 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 
 	fromMS := from * 1000
 	toMS := to * 1000
-	if s.cache != nil {
+	if s.cache != nil && !opt.ForceFull {
 		minMS, maxMS, count, err := s.cache.GetHistoryCoverage(ctx, symbol, marketType, resolution)
 		if err == nil && count > 0 && minMS <= fromMS && maxMS >= toMS {
 			cached, loadErr := s.cache.LoadHistoryCandles(ctx, symbol, marketType, resolution, fromMS, toMS)
@@ -723,13 +734,21 @@ func isWeekday(t time.Time) bool {
 func sessionID(t time.Time) int {
 	minuteOfDay := t.Hour()*60 + t.Minute()
 	switch {
-	case minuteOfDay >= 8*60+45 && minuteOfDay <= 11*60+29:
+	case minuteOfDay >= 8*60+45 && minuteOfDay <= 11*60+30:
 		return 1
-	case minuteOfDay >= 13*60 && minuteOfDay <= 14*60+44:
+	case minuteOfDay >= 13*60 && minuteOfDay <= 14*60+45:
 		return 2
 	default:
 		return 0
 	}
+}
+
+func isVNTradingTimestampMS(timestampMS int64) bool {
+	if timestampMS <= 0 {
+		return false
+	}
+	t := time.UnixMilli(timestampMS).In(vnLocation)
+	return isWeekday(t) && sessionID(t) != 0
 }
 
 func endOfPreviousDayUnix() int64 {
@@ -741,4 +760,16 @@ func endOfPreviousDayUnix() int64 {
 func startOfTodayUnix() int64 {
 	nowVN := time.Now().In(vnLocation)
 	return time.Date(nowVN.Year(), nowVN.Month(), nowVN.Day(), 0, 0, 0, 0, vnLocation).Unix()
+}
+
+func latestRequiredBootstrapDayStartMS() int64 {
+	day := time.Now().In(vnLocation)
+	for i := 0; i < 7; i++ {
+		day = day.AddDate(0, 0, -1)
+		if isWeekday(day) {
+			start := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, vnLocation)
+			return start.UnixMilli()
+		}
+	}
+	return 0
 }

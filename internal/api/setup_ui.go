@@ -335,37 +335,21 @@ const settingsHTML = layoutTop + `
     </section>
 
     <section class="card">
-      <h2>Entrade order accounts</h2>
+      <h2>Li&ecirc;n k&#7871;t t&agrave;i kho&#7843;n Entrade</h2>
+      <p class="muted">Kh&aacute;ch h&agrave;ng ch&#7881; c&#7847;n nh&#7853;p username/password Entrade. H&#7879; th&#7889;ng s&#7869; t&#7921; &#273;&#259;ng nh&#7853;p, l&#7845;y th&ocirc;ng tin t&agrave;i kho&#7843;n master v&agrave; g&oacute;i vay ph&aacute;i sinh.</p>
+      <div id="entradeLinkStatus" class="muted" style="margin-bottom:16px;">Ch&#432;a li&ecirc;n k&#7871;t t&agrave;i kho&#7843;n Entrade.</div>
       <div class="form-group">
-        <label>Trading provider</label>
-        <select id="entradeEnabled">
-          <option value="false">DNSE</option>
-          <option value="true">Entrade</option>
-        </select>
+        <label>Username Entrade</label>
+        <input type="text" id="entradeUsername" autocomplete="username" placeholder="V&iacute; d&#7909;: 1000000001">
       </div>
       <div class="form-group">
-        <label>Entrade mode</label>
-        <select id="entradeEnvironment">
-          <option value="paper">Demo / Papertrade</option>
-          <option value="real">Real</option>
-        </select>
+        <label>Password Entrade</label>
+        <input type="password" id="entradePassword" autocomplete="current-password" placeholder="Nh&#7853;p password Entrade">
       </div>
-      <div class="form-group">
-        <label>Entrade mock mode</label>
-        <select id="entradeMock">
-          <option value="false">Off</option>
-          <option value="true">On</option>
-        </select>
+      <div class="inline-actions">
+        <button class="btn" type="button" onclick="linkEntradeAccount()">Li&ecirc;n k&#7871;t t&agrave;i kho&#7843;n</button>
       </div>
-      <div class="form-group">
-        <label>Default accounts for MT5 signals</label>
-        <input type="text" id="entradeDefaultAccounts" placeholder="ENTRADE_DEMO">
-      </div>
-      <div class="form-group">
-        <label>Account profiles</label>
-        <textarea id="entradeAccounts" rows="7" style="width:100%; resize:vertical;" placeholder="ENTRADE_DEMO|paper|username|password|investorId|investorAccountId|tradingToken"></textarea>
-      </div>
-      <div class="muted">One row per account: <code>ID|mode|username|password|investorId|investorAccountId|tradingToken</code>. Leave password/token blank to keep the saved value. SuperTrend sends only BUY/SELL/CLOSE; this list decides where orders go.</div>
+      <p id="entradeLinkResult" class="muted" style="margin-top:16px;"></p>
     </section>
 
     <section class="card">
@@ -413,6 +397,7 @@ const settingsHTML = layoutTop + `
     let availableSymbols = [];
     let selectedExchanges = new Set(["HOSE", "HNX", "UPCOM", "INDEX", "DERIVATIVE"]);
     let selectedSymbolsState = new Set(defaultSymbols);
+    let currentEntrade = {};
 
     function mergeSymbols(symbols) {
       const seen = new Set(availableSymbols);
@@ -542,36 +527,48 @@ const settingsHTML = layoutTop + `
       return (value || '').split(',').map((item) => item.trim().toUpperCase()).filter(Boolean);
     }
 
-    function formatEntradeAccounts(accounts) {
-      if (!accounts || !accounts.length) {
-        return 'ENTRADE_DEMO|paper|||||';
+    function renderEntradeStatus() {
+      const status = document.getElementById('entradeLinkStatus');
+      const username = document.getElementById('entradeUsername');
+      const enabled = currentEntrade && currentEntrade.enabled;
+      const accountNo = currentEntrade && currentEntrade.accountNo;
+      const investorId = currentEntrade && currentEntrade.investorId;
+      username.value = (currentEntrade && currentEntrade.username) || '';
+      if (enabled && investorId) {
+        status.innerHTML = '<span class="status-indicator status-ok"></span>Đ&atilde; li&ecirc;n k&#7871;t Entrade: investorId <code>' + investorId + '</code>' + (accountNo ? ', master account <code>' + accountNo + '</code>' : '') + '.';
+      } else {
+        status.innerHTML = '<span class="status-indicator status-warn"></span>Ch&#432;a li&ecirc;n k&#7871;t t&agrave;i kho&#7843;n Entrade.';
       }
-      return accounts.filter((account) => account.enabled !== false).map((account) => [
-        account.id || '',
-        account.environment || 'paper',
-        account.username || '',
-        '',
-        account.investorId || '',
-        account.accountNo || '',
-        ''
-      ].join('|')).join('\n');
     }
 
-    function parseEntradeAccounts() {
-      const rows = (document.getElementById('entradeAccounts').value || '').split(/\r?\n/);
-      return rows.map((row) => {
-        const cols = row.split('|');
-        return {
-          id: (cols[0] || '').trim().toUpperCase(),
-          environment: (cols[1] || 'paper').trim().toLowerCase(),
-          username: (cols[2] || '').trim(),
-          password: (cols[3] || '').trim(),
-          investorId: (cols[4] || '').trim(),
-          accountNo: (cols[5] || '').trim(),
-          tradingToken: (cols[6] || '').trim(),
-          enabled: true
-        };
-      }).filter((account) => account.id);
+    async function linkEntradeAccount() {
+      const result = document.getElementById('entradeLinkResult');
+      const username = document.getElementById('entradeUsername').value.trim();
+      const password = document.getElementById('entradePassword').value.trim();
+      if (!username || !password) {
+        result.textContent = 'Hãy nhập username và password Entrade.';
+        return;
+      }
+      result.textContent = 'Đang liên kết Entrade...';
+      try {
+        const res = await fetch('/api/entrade/link', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password, environment: 'real' })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+          result.textContent = data.error || 'Không thể liên kết Entrade.';
+          return;
+        }
+        const account = data.account || {};
+        const packages = account.loanPackages || [];
+        result.textContent = 'Đã liên kết thành công. Trạng thái: ' + (account.status || 'UNKNOWN') + '. Gói vay: ' + packages.length + '.';
+        document.getElementById('entradePassword').value = '';
+        await loadSettings();
+      } catch (e) {
+        result.textContent = 'Không thể liên kết Entrade.';
+      }
     }
 
     async function loadSettings() {
@@ -580,11 +577,8 @@ const settingsHTML = layoutTop + `
       document.getElementById('apiKey').value = data.dnse.apiKey || '';
       document.getElementById('accountNo').value = data.dnse.accountNo || '';
       document.getElementById('mockMode').value = data.dnse.mock ? 'true' : 'false';
-      document.getElementById('entradeEnabled').value = data.entrade && data.entrade.enabled ? 'true' : 'false';
-      document.getElementById('entradeMock').value = data.entrade && data.entrade.mock ? 'true' : 'false';
-      document.getElementById('entradeEnvironment').value = (data.entrade && data.entrade.environment) || 'paper';
-      document.getElementById('entradeDefaultAccounts').value = ((data.entrade && data.entrade.defaultAccountNos) || ['ENTRADE_DEMO']).join(',');
-      document.getElementById('entradeAccounts').value = formatEntradeAccounts((data.entrade && data.entrade.accounts) || []);
+      currentEntrade = data.entrade || {};
+      renderEntradeStatus();
 
       const selectedSymbols = (data.marketData && data.marketData.symbols && data.marketData.symbols.length)
         ? data.marketData.symbols
@@ -611,11 +605,11 @@ const settingsHTML = layoutTop + `
         mock: document.getElementById('mockMode').value === 'true',
         symbols: selectedSymbols,
         primarySymbol: document.getElementById('primarySymbol').value,
-        entradeEnabled: document.getElementById('entradeEnabled').value === 'true',
-        entradeMock: document.getElementById('entradeMock').value === 'true',
-        entradeEnvironment: document.getElementById('entradeEnvironment').value,
-        entradeDefaultAccountNos: splitAccounts(document.getElementById('entradeDefaultAccounts').value),
-        entradeAccounts: parseEntradeAccounts()
+        entradeEnabled: currentEntrade.enabled === true,
+        entradeMock: currentEntrade.mock === true,
+        entradeEnvironment: currentEntrade.environment || 'real',
+        entradeDefaultAccountNos: currentEntrade.defaultAccountNos || [],
+        entradeAccounts: currentEntrade.accounts || []
       };
 
       const res = await fetch('/api/settings', {

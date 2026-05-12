@@ -155,7 +155,8 @@ internal static class Program
     private static void CreateDesktopLaunchers(string installDir)
     {
         var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-        WriteCmdLauncher(Path.Combine(desktop, "DNSE MT5 Connector.bat"), installDir, Path.Combine(installDir, "start_trial.bat"));
+        WriteCmdLauncher(Path.Combine(desktop, "DNSE MT5 Connector.bat"), installDir, Path.Combine(installDir, "launch_dnse_mt5.bat"));
+        WriteCmdLauncher(Path.Combine(desktop, "DNSE Bridge Only.bat"), installDir, Path.Combine(installDir, "start_trial.bat"));
         WriteCmdLauncher(Path.Combine(desktop, "DNSE MT5 Setup.bat"), installDir, Path.Combine(installDir, "open_setup.bat"));
         WriteCmdLauncher(Path.Combine(desktop, "DNSE MT5 Stop.bat"), installDir, Path.Combine(installDir, "stop_trial.bat"));
         WriteCmdLauncher(Path.Combine(desktop, "DNSE MT5 Folder.bat"), installDir, "explorer.exe \"" + installDir + "\"");
