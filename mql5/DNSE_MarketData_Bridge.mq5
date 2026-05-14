@@ -219,7 +219,7 @@ void CreateManualTradeButton(string name, string text, int x, int y, int w, int 
 {
    if(ObjectFind(0, name) < 0)
       ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0);
-   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
    ObjectSetInteger(0, name, OBJPROP_XSIZE, w);
@@ -238,7 +238,7 @@ void CreateManualTradeLabel(string name, string text, int x, int y, color fg)
 {
    if(ObjectFind(0, name) < 0)
       ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
    ObjectSetInteger(0, name, OBJPROP_COLOR, fg);
@@ -253,10 +253,10 @@ void DrawManualTradePanel()
 {
    if(!InpEnableManualTradePanel)
       return;
-   CreateManualTradeButton(g_manual_panel_prefix + "BUY", "BUY", 14, 28, 72, 28, clrGreen, clrWhite);
-   CreateManualTradeButton(g_manual_panel_prefix + "SELL", "SELL", 92, 28, 72, 28, clrRed, clrWhite);
-   string label = StringFormat("%s qty=%d acct=%s", InpManualOrderType, InpManualQuantity, InpManualAccountNos);
-   CreateManualTradeLabel(g_manual_panel_prefix + "INFO", label, 14, 60, clrSilver);
+   CreateManualTradeButton(g_manual_panel_prefix + "BUY", "BUY", 172, 28, 72, 28, clrGreen, clrWhite);
+   CreateManualTradeButton(g_manual_panel_prefix + "SELL", "SELL", 94, 28, 72, 28, clrRed, clrWhite);
+   string label = StringFormat("%s x%d", InpManualOrderType, InpManualQuantity);
+   CreateManualTradeLabel(g_manual_panel_prefix + "INFO", label, 94, 60, clrSilver);
    ChartRedraw(0);
 }
 
