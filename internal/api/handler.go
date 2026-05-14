@@ -29,6 +29,10 @@ type MarketDataStatusProvider interface {
 	Status() marketdata.BridgeStatusSnapshot
 }
 
+type MarketDataPriceProvider interface {
+	LatestTick(symbol string) (marketdata.Tick, bool)
+}
+
 type TelemetrySink interface {
 	Track(ctx context.Context, name string, params map[string]any)
 }
@@ -75,6 +79,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/health", h.health)
 	mux.HandleFunc("/status", h.status)
 	mux.HandleFunc("/mode", h.mode)
+	mux.HandleFunc("/market/latest", h.marketLatest)
 	mux.HandleFunc("/signal", h.signal)
 	mux.HandleFunc("/signals", h.pendingSignals)
 	mux.HandleFunc("/confirm", h.confirm)
@@ -92,6 +97,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/history/today-all", h.historyTodayAll)
 	mux.HandleFunc("/otp/latest", h.getLatestOTP)
 	mux.HandleFunc("/accounts/orderable", h.orderableAccounts)
+	mux.HandleFunc("/api/dnse/orderable-accounts", h.dnseOrderableAccounts)
 	mux.HandleFunc("/positions", h.positionsHandler)
 	mux.HandleFunc("/position/", h.positionBySymbol)
 	mux.HandleFunc("/kill-switch", h.killSwitch)
@@ -358,6 +364,46 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) marketLatest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	provider, ok := h.market.(MarketDataPriceProvider)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "market data price lookup is not configured")
+		return
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("symbol")))
+	if symbol == "" {
+		for _, profile := range h.profiles {
+			if strings.TrimSpace(profile.Symbol) != "" {
+				symbol = strings.ToUpper(strings.TrimSpace(profile.Symbol))
+				break
+			}
+		}
+	}
+	if symbol == "" {
+		writeError(w, http.StatusBadRequest, "symbol is required")
+		return
+	}
+	tick, ok := provider.LatestTick(symbol)
+	if !ok || tick.Last <= 0 {
+		writeJSON(w, http.StatusNotFound, errorResponse{Success: false, Error: "latest realtime price is not available for " + symbol})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"symbol":  tick.Symbol,
+		"price":   tick.Last,
+		"bid":     tick.Bid,
+		"ask":     tick.Ask,
+		"volume":  tick.Volume,
+		"time":    time.UnixMilli(tick.TimestampMS).UTC().Format(time.RFC3339),
+		"tick":    tick,
+	})
+}
+
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -404,6 +450,36 @@ func (h *Handler) orderableAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": accounts})
+}
+
+func (h *Handler) dnseOrderableAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.dnse == nil {
+		writeError(w, http.StatusServiceUnavailable, "dnse client is not configured")
+		return
+	}
+	accounts, err := h.dnse.GetAccounts(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	out := make([]map[string]any, 0, len(accounts))
+	for _, account := range accounts {
+		status := strings.ToUpper(strings.TrimSpace(account.DerivativeAccountStatus))
+		orderable := status == "" || status == "ACTIVE" || strings.Contains(status, "ACTIVE")
+		if !orderable {
+			continue
+		}
+		out = append(out, map[string]any{
+			"accountNo":               account.AccountNo,
+			"derivativeAccountStatus": account.DerivativeAccountStatus,
+			"orderable":               true,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": out, "total": len(out)})
 }
 
 func (h *Handler) selfTest(w http.ResponseWriter, r *http.Request) {
@@ -1505,55 +1581,78 @@ func (h *Handler) entradeLinkAPI(w http.ResponseWriter, r *http.Request) {
 	linkCfg.Password = req.Password
 
 	client := entrade.NewClient(linkCfg, h.logger)
-	result, err := client.LinkAccount(r.Context(), req.Username, req.Password, req.Environment)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+	environments := []string{"real", "paper"}
+	if req.Environment == "paper" {
+		environments = []string{"paper", "real"}
+	}
+	results := make([]entrade.LinkAccountResult, 0, len(environments))
+	var firstErr error
+	for _, env := range environments {
+		result, err := client.LinkAccount(r.Context(), req.Username, req.Password, env)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%s: %w", env, err)
+			}
+			continue
+		}
+		results = append(results, result)
+	}
+	if len(results) == 0 {
+		writeError(w, http.StatusBadGateway, firstErr.Error())
 		return
 	}
-
-	accountID := strings.TrimSpace(result.InvestorAccountID)
-	if accountID == "" {
-		accountID = strings.TrimSpace(result.InvestorID)
-	}
+	result := results[0]
 	cfg.Entrade.Enabled = true
 	cfg.Entrade.Mock = false
-	cfg.Entrade.Environment = result.Environment
+	cfg.Entrade.Environment = "real"
 	cfg.Entrade.Username = req.Username
 	cfg.Entrade.Password = req.Password
 	cfg.Entrade.InvestorID = result.InvestorID
-	cfg.Entrade.AccountNo = accountID
-	profileID := entradeProfileID(result, req.Username)
-	loanPackageID := 0
-	if len(result.LoanPackages) > 0 {
-		loanPackageID = result.LoanPackages[0].ID
+	for _, result := range results {
+		accountID := strings.TrimSpace(result.InvestorAccountID)
+		if accountID == "" {
+			accountID = strings.TrimSpace(result.InvestorID)
+		}
+		if result.Environment == "real" {
+			cfg.Entrade.AccountNo = accountID
+		}
+		profileID := entradeProfileID(result, req.Username)
+		loanPackageID := 0
+		if len(result.LoanPackages) > 0 {
+			loanPackageID = result.LoanPackages[0].ID
+		}
+		linkedAccount := config.EntradeAccountConfig{
+			ID:            profileID,
+			Environment:   result.Environment,
+			Username:      req.Username,
+			Password:      req.Password,
+			InvestorID:    result.InvestorID,
+			AccountNo:     accountID,
+			LoanPackageID: loanPackageID,
+			Enabled:       true,
+		}
+		cfg.Entrade.Accounts = upsertEntradeAccount(cfg.Entrade.Accounts, linkedAccount)
+		if result.Environment == "real" {
+			cfg.Entrade.DefaultAccountNos = addDefaultEntradeAccount(cfg.Entrade.DefaultAccountNos, profileID)
+		}
 	}
-	linkedAccount := config.EntradeAccountConfig{
-		ID:            profileID,
-		Environment:   result.Environment,
-		Username:      req.Username,
-		Password:      req.Password,
-		InvestorID:    result.InvestorID,
-		AccountNo:     accountID,
-		LoanPackageID: loanPackageID,
-		Enabled:       true,
-	}
-	cfg.Entrade.Accounts = upsertEntradeAccount(cfg.Entrade.Accounts, linkedAccount)
-	cfg.Entrade.DefaultAccountNos = addDefaultEntradeAccount(cfg.Entrade.DefaultAccountNos, profileID)
 	if err := cfg.Save("config/config.yaml"); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save config")
 		return
 	}
 	if h.telemetry != nil {
 		h.telemetry.Track(r.Context(), "entrade_linked", map[string]any{
-			"environment": result.Environment,
-			"status":      result.Status,
-			"packages":    len(result.LoanPackages),
+			"environment":   result.Environment,
+			"status":        result.Status,
+			"packages":      totalEntradePackages(results),
+			"profile_count": len(results),
 		})
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"success": true,
-		"account": result,
+		"success":  true,
+		"account":  result,
+		"accounts": results,
 	})
 }
 
@@ -1569,7 +1668,18 @@ func entradeProfileID(result entrade.LinkAccountResult, username string) string 
 	if key == "" {
 		return entrade.AccountReal
 	}
-	return "ENTRADE_" + key
+	if result.Environment == "paper" {
+		return "ENTRADE_DEMO_" + key
+	}
+	return "ENTRADE_REAL_" + key
+}
+
+func totalEntradePackages(results []entrade.LinkAccountResult) int {
+	total := 0
+	for _, result := range results {
+		total += len(result.LoanPackages)
+	}
+	return total
 }
 
 func upsertEntradeAccount(accounts []config.EntradeAccountConfig, linked config.EntradeAccountConfig) []config.EntradeAccountConfig {
@@ -1581,7 +1691,7 @@ func upsertEntradeAccount(accounts []config.EntradeAccountConfig, linked config.
 		if account.ID == "" {
 			continue
 		}
-		if account.ID == linked.ID {
+		if sameEntradeAccount(account, linked) {
 			out = append(out, linked)
 			replaced = true
 			continue
@@ -1592,6 +1702,37 @@ func upsertEntradeAccount(accounts []config.EntradeAccountConfig, linked config.
 		out = append(out, linked)
 	}
 	return out
+}
+
+func sameEntradeAccount(a, b config.EntradeAccountConfig) bool {
+	if !sameEntradeEnvironment(a.Environment, b.Environment) {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(a.ID), strings.TrimSpace(b.ID)) {
+		return true
+	}
+	if a.AccountNo != "" && b.AccountNo != "" && strings.EqualFold(strings.TrimSpace(a.AccountNo), strings.TrimSpace(b.AccountNo)) {
+		return true
+	}
+	if a.InvestorID != "" && b.InvestorID != "" && strings.EqualFold(strings.TrimSpace(a.InvestorID), strings.TrimSpace(b.InvestorID)) {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(a.Environment), strings.TrimSpace(b.Environment)) &&
+		strings.EqualFold(strings.TrimSpace(a.Username), strings.TrimSpace(b.Username))
+}
+
+func sameEntradeEnvironment(a, b string) bool {
+	a = normalizeEntradeEnvironment(a)
+	b = normalizeEntradeEnvironment(b)
+	return a == "" || b == "" || a == b
+}
+
+func normalizeEntradeEnvironment(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "prod" {
+		return "real"
+	}
+	return value
 }
 
 func addDefaultEntradeAccount(values []string, accountID string) []string {

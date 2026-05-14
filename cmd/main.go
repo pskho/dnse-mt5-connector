@@ -195,18 +195,30 @@ func main() {
 			ordered := make([]marketdata.SymbolProfile, 0, len(profiles))
 			for _, profile := range profiles {
 				if strings.EqualFold(profile.Symbol, primary) {
-					continue
-				}
-				ordered = append(ordered, profile)
-			}
-			for _, profile := range profiles {
-				if strings.EqualFold(profile.Symbol, primary) {
 					ordered = append(ordered, profile)
 					break
 				}
 			}
+			for _, profile := range profiles {
+				if strings.EqualFold(profile.Symbol, primary) {
+					continue
+				}
+				ordered = append(ordered, profile)
+			}
 
 			for _, profile := range ordered {
+				if _, err := historyService.SyncWithOptions(appCtx, marketdata.SyncOptions{
+					TodayOnly:  true,
+					Symbol:     profile.Symbol,
+					MarketType: profile.MarketType,
+					Resolution: profile.Resolution,
+				}); err != nil {
+					appLog.Error("history_startup_today_repair_failed", map[string]any{
+						"symbol": profile.Symbol,
+						"error":  err.Error(),
+					})
+				}
+
 				if !historyService.NeedsBootstrap(appCtx, profile.Symbol, profile.MarketType, profile.Resolution) {
 					appLog.Info("history_bootstrap_skipped", map[string]any{
 						"reason":     "cache_present",
@@ -233,19 +245,6 @@ func main() {
 					Resolution:   profile.Resolution,
 				}); err != nil {
 					appLog.Error("history_bootstrap_backfill_failed", map[string]any{
-						"symbol": profile.Symbol,
-						"error":  err.Error(),
-					})
-					continue
-				}
-
-				if _, err := historyService.SyncWithOptions(appCtx, marketdata.SyncOptions{
-					TodayOnly:  true,
-					Symbol:     profile.Symbol,
-					MarketType: profile.MarketType,
-					Resolution: profile.Resolution,
-				}); err != nil {
-					appLog.Error("history_bootstrap_today_failed", map[string]any{
 						"symbol": profile.Symbol,
 						"error":  err.Error(),
 					})

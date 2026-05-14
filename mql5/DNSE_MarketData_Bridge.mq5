@@ -37,8 +37,17 @@ input int    InpHistoryTimeoutMs = 30000;
 input int    InpAutoRecentHistoryDays = 0;   // 0=manual only, 1=today, 7=last week
 input int    InpAutoRecentSyncDelaySec = 15; // wait for realtime before any history backfill
 input bool   InpEnableSignalBridge = false;
+input bool   InpEnableManualTradePanel = true;
+input string InpManualBridgeURL = "http://127.0.0.1:8080";
+input string InpManualAccountNos = "ENTRADE_DEMO"; // comma-separated account/profile ids
+input int    InpManualQuantity = 1;
+input string InpManualOrderType = "MTL"; // MTL or LO
+input double InpManualLimitPrice = 0.0;   // for LO; 0 uses latest realtime price
+input string InpManualMarketType = "DERIVATIVE";
+input string InpManualOrderCategory = "NORMAL";
 
 string   g_instance_lock_name = "DNSE_MT5_BRIDGE_MASTER_LOCK";
+string   g_manual_panel_prefix = "DNSE_MANUAL_TRADE_";
 long     g_last_timestamp_ms = 0;
 double   g_last_bid          = 0.0;
 double   g_last_ask          = 0.0;
@@ -204,6 +213,162 @@ void CheckForSignal()
       g_last_signal_time = candle_time;
       SendSignal(side);
    }
+}
+
+void CreateManualTradeButton(string name, string text, int x, int y, int w, int h, color bg, color fg)
+{
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, w);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, h);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bg);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, fg);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, clrWhite);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 10);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial Bold");
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+void CreateManualTradeLabel(string name, string text, int x, int y, color fg)
+{
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, fg);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+void DrawManualTradePanel()
+{
+   if(!InpEnableManualTradePanel)
+      return;
+   CreateManualTradeButton(g_manual_panel_prefix + "BUY", "BUY", 14, 28, 72, 28, clrGreen, clrWhite);
+   CreateManualTradeButton(g_manual_panel_prefix + "SELL", "SELL", 92, 28, 72, 28, clrRed, clrWhite);
+   string label = StringFormat("%s qty=%d acct=%s", InpManualOrderType, InpManualQuantity, InpManualAccountNos);
+   CreateManualTradeLabel(g_manual_panel_prefix + "INFO", label, 14, 60, clrSilver);
+   ChartRedraw(0);
+}
+
+void DeleteManualTradePanel()
+{
+   int total = ObjectsTotal(0, 0, -1);
+   for(int i = total - 1; i >= 0; i--)
+   {
+      string name = ObjectName(0, i, 0, -1);
+      if(StringFind(name, g_manual_panel_prefix) == 0)
+         ObjectDelete(0, name);
+   }
+}
+
+string JSONEscape(string text)
+{
+   StringReplace(text, "\\", "\\\\");
+   StringReplace(text, "\"", "\\\"");
+   return text;
+}
+
+string BuildManualAccountsJSON()
+{
+   string raw = InpManualAccountNos;
+   StringTrimLeft(raw);
+   StringTrimRight(raw);
+   if(raw == "")
+      raw = "ENTRADE_DEMO";
+
+   string parts[];
+   int count = StringSplit(raw, ',', parts);
+   if(count <= 1)
+      return "\"accountNo\":\"" + JSONEscape(raw) + "\"";
+
+   string out = "\"accountNos\":[";
+   int added = 0;
+   for(int i = 0; i < count; i++)
+   {
+      string value = parts[i];
+      StringTrimLeft(value);
+      StringTrimRight(value);
+      if(value == "")
+         continue;
+      if(added > 0)
+         out += ",";
+      out += "\"" + JSONEscape(value) + "\"";
+      added++;
+   }
+   out += "]";
+   if(added == 0)
+      return "\"accountNo\":\"ENTRADE_DEMO\"";
+   return out;
+}
+
+bool SendManualOrder(string side)
+{
+   if(!InpEnableManualTradePanel)
+      return false;
+   side = NormalizeSymbolName(side);
+   if(side != "BUY" && side != "SELL")
+      return false;
+
+   string orderType = InpManualOrderType;
+   StringTrimLeft(orderType);
+   StringTrimRight(orderType);
+   StringToUpper(orderType);
+   if(orderType == "")
+      orderType = "MTL";
+
+   double price = InpManualLimitPrice;
+   if(orderType == "LO" && price <= 0.0)
+      price = g_last_last;
+
+   string clientOrderId = StringFormat("mt5-manual-%s-%I64d", side, GetTickCount64());
+   string payload = "{";
+   payload += "\"clientOrderId\":\"" + JSONEscape(clientOrderId) + "\"";
+   payload += "," + BuildManualAccountsJSON();
+   payload += ",\"symbol\":\"" + JSONEscape(InpSourceSymbol) + "\"";
+   payload += ",\"side\":\"" + side + "\"";
+   payload += ",\"quantity\":" + IntegerToString((int)MathMax(1, InpManualQuantity));
+   payload += ",\"price\":" + DoubleToString(MathMax(0.0, price), LookupDigits(InpSourceSymbol));
+   payload += ",\"orderType\":\"" + JSONEscape(orderType) + "\"";
+   payload += ",\"marketType\":\"" + JSONEscape(InpManualMarketType) + "\"";
+   payload += ",\"orderCategory\":\"" + JSONEscape(InpManualOrderCategory) + "\"";
+   payload += "}";
+
+   string baseURL = InpManualBridgeURL;
+   StringTrimRight(baseURL);
+   while(StringLen(baseURL) > 0 && StringSubstr(baseURL, StringLen(baseURL) - 1, 1) == "/")
+      baseURL = StringSubstr(baseURL, 0, StringLen(baseURL) - 1);
+   string url = baseURL + "/order";
+   char data[];
+   ArrayResize(data, 0);
+   int copied = StringToCharArray(payload, data, 0, WHOLE_ARRAY, CP_UTF8);
+   if(copied > 0 && ArraySize(data) > 0)
+      ArrayResize(data, copied - 1);
+
+   char result[];
+   string result_headers;
+   string headers = "Content-Type: application/json\r\n";
+   ResetLastError();
+   int res = WebRequest("POST", url, headers, 3000, data, result, result_headers);
+   string response = SafeCharArrayToString(result);
+   if(res == 200)
+   {
+      PrintFormat("DNSE manual order %s submitted. clientOrderId=%s, response=%s", side, clientOrderId, response);
+      return true;
+   }
+   PrintFormat("DNSE manual order %s failed. HTTP=%d, error=%d, body=%s", side, res, GetLastError(), response);
+   if(res == -1)
+      Print("DNSE bridge: add http://127.0.0.1:8080 to MT5 WebRequest allowed URLs.");
+   return false;
 }
 
 bool EnsureCustomSymbol()
@@ -654,6 +819,14 @@ int ImportHistoricalRatesForSymbol(string sourceSymbol, string customSymbol, lon
          rates[i].real_volume = 0;
       }
 
+      if(count > 0)
+      {
+         datetime deleteFrom = rates[0].time;
+         datetime deleteTo = rates[count - 1].time;
+         if(deleteTo >= deleteFrom)
+            CustomRatesDelete(customSymbol, deleteFrom, deleteTo);
+      }
+
       int updated = CustomRatesUpdate(customSymbol, rates, count);
       if(updated < 0)
       {
@@ -709,6 +882,96 @@ bool TryConnectSymbol(string sourceSymbol, bool logPrimary)
    return ok;
 }
 
+bool IsDerivativeRealtimeSymbol(string symbol)
+{
+   symbol = NormalizeSymbolName(symbol);
+   return StringFind(symbol, "VN30F") == 0 ||
+          StringFind(symbol, "V100F") == 0 ||
+          StringFind(symbol, "VNF") == 0 ||
+          StringFind(symbol, "F1M") >= 0 ||
+          StringFind(symbol, "F2M") >= 0 ||
+          StringFind(symbol, "F1Q") >= 0 ||
+          StringFind(symbol, "F2Q") >= 0;
+}
+
+bool IsHOSEIndexRealtimeSymbol(string symbol)
+{
+   symbol = NormalizeSymbolName(symbol);
+   return symbol == "VNINDEX" ||
+          symbol == "VN30" ||
+          symbol == "VN100" ||
+          symbol == "VNXALLSHARE" ||
+          symbol == "VNDIVIDEND" ||
+          symbol == "VN50GROWTH" ||
+          symbol == "VNMITECH";
+}
+
+bool IsHNXUPCOMRealtimeSymbol(string symbol)
+{
+   symbol = NormalizeSymbolName(symbol);
+   return symbol == "HNX" || symbol == "HNX30" || symbol == "UPCOM";
+}
+
+bool NormalizeKRXRealtimeTimestamp(string sourceSymbol, long &timestamp_ms)
+{
+   if(timestamp_ms <= 0)
+      return false;
+
+   int morningOpen = 8 * 60 + 45;
+   int openingAuctionEnd = 0;
+   int morningClose = 11 * 60 + 30;
+   int afternoonOpen = 13 * 60;
+   int closingAuction = 0;
+   int afternoonClose = 15 * 60;
+
+   if(IsDerivativeRealtimeSymbol(sourceSymbol))
+   {
+      morningOpen = 8 * 60 + 45;
+      openingAuctionEnd = 9 * 60;
+      closingAuction = 14 * 60 + 30;
+      afternoonClose = 14 * 60 + 45;
+   }
+   else if(IsHOSEIndexRealtimeSymbol(sourceSymbol))
+   {
+      morningOpen = 9 * 60;
+      openingAuctionEnd = 9 * 60 + 15;
+      closingAuction = 14 * 60 + 30;
+      afternoonClose = 14 * 60 + 45;
+   }
+   else if(IsHNXUPCOMRealtimeSymbol(sourceSymbol))
+   {
+      morningOpen = 9 * 60;
+      afternoonClose = 15 * 60;
+   }
+
+   datetime vnTime = (datetime)(timestamp_ms / 1000 + 7 * 3600);
+   MqlDateTime dt;
+   TimeToStruct(vnTime, dt);
+   if(dt.day_of_week == 0 || dt.day_of_week == 6)
+      return false;
+
+   int minute = dt.hour * 60 + dt.min;
+   if(minute < morningOpen || minute > afternoonClose)
+      return false;
+   if(minute > morningClose && minute < afternoonOpen)
+      return false;
+
+   int bucketMinute = minute;
+   if(openingAuctionEnd > 0 && minute >= morningOpen && minute < openingAuctionEnd)
+      bucketMinute = morningOpen;
+   if(closingAuction > 0 && minute >= closingAuction && minute <= afternoonClose)
+      bucketMinute = closingAuction;
+
+   if(bucketMinute != minute)
+   {
+      dt.hour = bucketMinute / 60;
+      dt.min = bucketMinute % 60;
+      dt.sec = 0;
+      timestamp_ms = (long)(StructToTime(dt) - 7 * 3600) * 1000;
+   }
+   return true;
+}
+
 void ProcessTrackedSymbol(int idx)
 {
    string sourceSymbol = g_symbols[idx];
@@ -722,6 +985,8 @@ void ProcessTrackedSymbol(int idx)
    if(!GetLatestTick(sourceSymbol, bid, ask, last, volume, timestamp_ms))
       return;
    if(timestamp_ms <= 0)
+      return;
+   if(!NormalizeKRXRealtimeTimestamp(sourceSymbol, timestamp_ms))
       return;
 
    if(timestamp_ms == g_last_timestamp_by_symbol[idx] &&
@@ -831,8 +1096,9 @@ int OnInit()
    g_recent_history_done = (InpAutoRecentHistoryDays <= 0);
    g_recent_history_not_before = TimeCurrent() + InpAutoRecentSyncDelaySec;
    g_recent_history_retry_after = 0;
+   DrawManualTradePanel();
    EventSetMillisecondTimer(MathMax(50, InpTimerMs));
-   PrintFormat("DNSE bridge v1.14: EA started, source=%s, custom symbol=%s, trackedSymbols=%s, autoRecentHistoryDays=%d, historyTimeoutMs=%d", InpSourceSymbol, InpCustomSymbol, GetConfiguredSymbolsSummary(), InpAutoRecentHistoryDays, InpHistoryTimeoutMs);
+   PrintFormat("DNSE bridge v1.14: EA started, source=%s, custom symbol=%s, trackedSymbols=%s, autoRecentHistoryDays=%d, historyTimeoutMs=%d, manualTradePanel=%s, manualAccounts=%s", InpSourceSymbol, InpCustomSymbol, GetConfiguredSymbolsSummary(), InpAutoRecentHistoryDays, InpHistoryTimeoutMs, InpEnableManualTradePanel ? "ON" : "OFF", InpManualAccountNos);
    if(InpAutoRecentHistoryDays <= 0)
       Print("DNSE bridge v1.14: auto history backfill is disabled; realtime is priority, older history is manual.");
    return INIT_SUCCEEDED;
@@ -841,6 +1107,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   DeleteManualTradePanel();
    for(int i = 0; i < ArraySize(g_symbols); i++)
       DisconnectBridge(g_symbols[i]);
    GlobalVariableDel(g_instance_lock_name);
@@ -875,4 +1142,25 @@ void OnTimer()
 
    MaybeBackfillRecentHistory();
    UpdateRealtimeStatus(true, g_last_timestamp_ms, g_last_last);
+}
+
+void OnChartEvent(const int id,
+                  const long &lparam,
+                  const double &dparam,
+                  const string &sparam)
+{
+   if(id != CHARTEVENT_OBJECT_CLICK)
+      return;
+   if(sparam == g_manual_panel_prefix + "BUY")
+   {
+      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+      SendManualOrder("BUY");
+      return;
+   }
+   if(sparam == g_manual_panel_prefix + "SELL")
+   {
+      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+      SendManualOrder("SELL");
+      return;
+   }
 }

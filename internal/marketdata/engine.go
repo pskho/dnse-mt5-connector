@@ -102,6 +102,13 @@ func (e *Engine) Status() BridgeStatusSnapshot {
 	return e.status.Snapshot()
 }
 
+func (e *Engine) LatestTick(symbol string) (Tick, bool) {
+	if e == nil || e.store == nil {
+		return Tick{}, false
+	}
+	return e.store.Latest(symbol)
+}
+
 func (e *Engine) Start(ctx context.Context) {
 	if !e.cfg.Enabled {
 		e.logger.Info("marketdata_disabled", nil)

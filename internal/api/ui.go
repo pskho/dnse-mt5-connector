@@ -252,9 +252,14 @@ const indexHTML = layoutTop + `
           <label>Giá</label>
           <input id="ppsePrice" type="number" value="0">
         </div>
+        <div class="form-group full">
+          <label>Giá realtime</label>
+          <div id="latestPriceText" class="inline-note">Chưa có giá realtime.</div>
+        </div>
       </div>
       <div class="actions">
         <button class="btn" onclick="getLoanPackages()">Lấy danh sách gói vay</button>
+        <button class="btn secondary" onclick="refreshLatestPrice()">Lấy giá realtime</button>
         <button class="btn secondary" onclick="getPpse()">Tính PPSE</button>
       </div>
     </section>
@@ -325,6 +330,7 @@ const indexHTML = layoutTop + `
         </div>
       </div>
       <div class="actions">
+        <button class="btn secondary" onclick="refreshLatestPrice()">Lấy giá realtime</button>
         <button class="btn" style="background:var(--success)" onclick="placeOrder()">Gửi lệnh</button>
       </div>
     </section>
@@ -339,6 +345,8 @@ const indexHTML = layoutTop + `
       </div>
       <div class="actions">
         <button class="btn" onclick="getPendingSignals()">Tải tín hiệu chờ</button>
+        <button class="btn" style="background:var(--success)" onclick="testBotSignal('BUY')">Test bot mua Demo</button>
+        <button class="btn danger" onclick="testBotSignal('SELL')">Test bot bán Demo</button>
         <button class="btn" style="background:var(--success)" onclick="confirmSignal()">Xác nhận tín hiệu</button>
         <button class="btn danger" onclick="rejectSignal()">Từ chối tín hiệu</button>
       </div>
@@ -420,6 +428,44 @@ const indexHTML = layoutTop + `
 
     async function run(fn) {
       try { await fn(); } catch (e) { console.error(e); }
+    }
+
+    async function loadLatestPrice(symbol, quiet = false) {
+      symbol = (symbol || $('symbol').value || $('pkgSymbol').value || '').trim();
+      if (!symbol) throw new Error('Vui lòng nhập mã');
+      const res = await fetch('/market/latest?symbol=' + encodeURIComponent(symbol));
+      const text = await res.text();
+      let body;
+      try { body = text ? JSON.parse(text) : {}; } catch { body = text; }
+      if (!res.ok) {
+        if (!quiet) {
+          printConsole(body, true);
+          showToast('Chưa có giá realtime cho ' + symbol, 'error');
+        }
+        throw body;
+      }
+      const price = Number(body.price || (body.tick && body.tick.last) || 0);
+      if (price > 0) {
+        $('price').value = price;
+        $('ppsePrice').value = price;
+        $('latestPriceText').textContent = symbol.toUpperCase() + ': ' + price + ' lúc ' + (body.time || '');
+      }
+      if (!quiet) {
+        printConsole(body, false);
+        showToast('Đã lấy giá realtime');
+      }
+      return price;
+    }
+
+    function refreshLatestPrice(symbol) {
+      run(() => loadLatestPrice(symbol, false));
+    }
+
+    async function ensureOrderPrice() {
+      const orderType = $('orderType').value;
+      const currentPrice = Number($('price').value);
+      if (currentPrice > 0 || orderType !== 'LO') return currentPrice;
+      try { return await loadLatestPrice($('symbol').value, true); } catch { return currentPrice; }
     }
 
     function ping() { run(() => request('/ping')); }
@@ -512,7 +558,10 @@ const indexHTML = layoutTop + `
     }
 
     function getPpse() {
-      run(() => {
+      run(async () => {
+        if (Number($('ppsePrice').value) <= 0) {
+          try { await loadLatestPrice($('pkgSymbol').value || $('symbol').value, true); } catch {}
+        }
         const params = new URLSearchParams({
           accountNo: $('accountNo').value,
           symbol: $('pkgSymbol').value,
@@ -534,7 +583,13 @@ const indexHTML = layoutTop + `
     function getOrder() {
       const id = $('queryOrderId').value;
       if (!id) return showToast('Vui lòng nhập mã lệnh', 'error');
-      run(() => request('/order/' + id));
+      let path = '/order/' + encodeURIComponent(id);
+      if (id.startsWith('client:')) {
+        path = '/order/client/' + encodeURIComponent(id.slice(7));
+      } else if (id.startsWith('signal-')) {
+        path = '/order/client/' + encodeURIComponent(id);
+      }
+      run(() => request(path));
     }
 
     function cancelOrder() {
@@ -548,7 +603,8 @@ const indexHTML = layoutTop + `
     }
 
     function placeOrder() {
-      run(() => {
+      run(async () => {
+        await ensureOrderPrice();
         const loanPackage = $('loanPackageId').value.trim();
         const body = {
           clientOrderId: $('clientOrderId').value,
@@ -567,6 +623,38 @@ const indexHTML = layoutTop + `
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
         });
+      });
+    }
+
+    function testBotSignal(side) {
+      run(async () => {
+        await request('/mode', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: 'auto' })
+        });
+        if (Number($('price').value) <= 0) {
+          try { await loadLatestPrice($('symbol').value, true); } catch {}
+        }
+        const body = {
+          accountNo: $('accountNo').value || 'ENTRADE_DEMO',
+          symbol: $('symbol').value || 'VN30F1M',
+          side: side,
+          quantity: Number($('quantity').value) || 1,
+          price: Number($('price').value) || 0,
+          orderType: $('orderType').value || 'MTL',
+          marketType: $('marketType').value || 'DERIVATIVE',
+          orderCategory: $('orderCategory').value || 'NORMAL'
+        };
+        const data = await request('/signal', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (data.signalId) {
+          $('signalId').value = data.signalId;
+          $('queryOrderId').value = 'client:signal-' + data.signalId;
+        }
       });
     }
 

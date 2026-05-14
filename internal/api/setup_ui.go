@@ -365,6 +365,10 @@ const settingsHTML = layoutTop + `
           <option value="entrade">Entrade</option>
         </select>
       </div>
+      <div style="margin-top:22px;">
+        <h3 style="font-size:16px;">Tài khoản DNSE có thể đặt lệnh</h3>
+        <div id="dnseAccountsList" class="account-list"></div>
+      </div>
       <p class="muted">Nếu chọn Entrade, bot sẽ đặt lệnh vào nhóm tài khoản Entrade bên cạnh. Nếu chọn DNSE, bot dùng số tài khoản DNSE ở trên.</p>
     </section>
 
@@ -576,6 +580,36 @@ const settingsHTML = layoutTop + `
       return new Set(((currentEntrade && currentEntrade.defaultAccountNos) || []).map((value) => String(value || '').trim().toUpperCase()).filter(Boolean));
     }
 
+    async function loadDNSEAccounts() {
+      const box = document.getElementById('dnseAccountsList');
+      if (!box) return;
+      box.innerHTML = '<div class="muted">Đang tải tài khoản DNSE...</div>';
+      try {
+        const res = await fetch('/api/dnse/orderable-accounts');
+        const data = await res.json();
+        if (!res.ok) {
+          box.innerHTML = '<div class="muted">Chưa tải được danh sách tài khoản DNSE.</div>';
+          return;
+        }
+        const accounts = data.accounts || [];
+        if (!accounts.length) {
+          box.innerHTML = '<div class="muted">Chưa có tài khoản DNSE khả dụng.</div>';
+          return;
+        }
+        box.innerHTML = accounts.map((account) => {
+          const accountNo = account.accountNo || account.AccountNo || '';
+          const status = account.derivativeAccountStatus || account.DerivativeAccountStatus || 'UNKNOWN';
+          const configured = accountNo && accountNo === document.getElementById('accountNo').value.trim();
+          return '<div class="account-row">' +
+            '<div style="font-weight:700">' + escapeHtml(accountNo || '-') + (configured ? ' <span class="muted">(đang chọn)</span>' : '') + '</div>' +
+            '<div class="account-meta">Trạng thái phái sinh: <code>' + escapeHtml(status) + '</code></div>' +
+          '</div>';
+        }).join('');
+      } catch (e) {
+        box.innerHTML = '<div class="muted">Chưa tải được danh sách tài khoản DNSE.</div>';
+      }
+    }
+
     function renderEntradeStatus() {
       const status = document.getElementById('entradeLinkStatus');
       const username = document.getElementById('entradeUsername');
@@ -685,6 +719,7 @@ const settingsHTML = layoutTop + `
         const account = data.account || {};
         const packages = account.loanPackages || [];
         result.textContent = 'Đã liên kết thành công. Trạng thái: ' + (account.status || 'UNKNOWN') + '. Gói vay: ' + packages.length + '.';
+        result.textContent = 'Đã liên kết thành công Real/Demo. Tổng profile Entrade: ' + ((data.accounts || []).length || 1) + '. Loan package ID Real: ' + ((packages[0] || {}).id || 'tự lấy') + '.';
         document.getElementById('entradePassword').value = '';
         await loadSettings();
       } catch (e) {
@@ -702,6 +737,7 @@ const settingsHTML = layoutTop + `
       document.getElementById('tradingProvider').value = currentEntrade.enabled ? 'entrade' : 'dnse';
       renderEntradeStatus();
       renderEntradeAccounts();
+      loadDNSEAccounts();
 
       const selectedSymbols = (data.marketData && data.marketData.symbols && data.marketData.symbols.length)
         ? data.marketData.symbols
@@ -747,6 +783,87 @@ const settingsHTML = layoutTop + `
         const data = await res.json();
         saveRes.textContent = data.error || 'Không thể lưu cấu hình.';
       }
+    }
+
+    function buildSettingsPayload() {
+      const selectedSymbols = getSelectedSymbols();
+      if (!selectedSymbols.length) return null;
+      return {
+        apiKey: document.getElementById('apiKey').value,
+        apiSecret: document.getElementById('apiSecret').value,
+        accountNo: document.getElementById('accountNo').value,
+        mock: document.getElementById('mockMode').value === 'true',
+        symbols: selectedSymbols,
+        primarySymbol: document.getElementById('primarySymbol').value,
+        entradeEnabled: document.getElementById('tradingProvider').value === 'entrade' && entradeAccounts().length > 0,
+        entradeMock: currentEntrade.mock === true,
+        entradeEnvironment: currentEntrade.environment || 'real',
+        entradeDefaultAccountNos: currentEntrade.defaultAccountNos || [],
+        entradeAccounts: currentEntrade.accounts || []
+      };
+    }
+
+    async function persistSettings(message) {
+      const saveRes = document.getElementById('save-res');
+      const body = buildSettingsPayload();
+      if (!body) {
+        if (saveRes) saveRes.textContent = 'Hãy chọn ít nhất một mã để theo dõi.';
+        return false;
+      }
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (res.ok) {
+        if (saveRes) saveRes.textContent = message || 'Đã lưu thành công. Hãy khởi động lại bridge để áp dụng toàn bộ cấu hình.';
+        return true;
+      }
+      const data = await res.json();
+      if (saveRes) saveRes.textContent = data.error || 'Không thể lưu cấu hình.';
+      return false;
+    }
+
+    async function saveSettings() {
+      await persistSettings();
+    }
+
+    async function editEntradeAccount(index) {
+      const account = entradeAccounts()[index];
+      if (!account) return;
+      const accountNo = window.prompt('Master account / investorAccountId', account.accountNo || '');
+      if (accountNo === null) return;
+      const loanPackageId = window.prompt('Loan package ID / bankMarginPortfolioId. Để trống nếu muốn tự lấy gói đầu tiên.', account.loanPackageId || '');
+      if (loanPackageId === null) return;
+      account.accountNo = accountNo.trim();
+      account.loanPackageId = Number(loanPackageId || 0);
+      renderEntradeAccounts();
+      await persistSettings('Đã lưu thay đổi tài khoản Entrade.');
+    }
+
+    async function deleteEntradeAccount(index) {
+      const account = entradeAccounts()[index];
+      if (!account) return;
+      if (!window.confirm('Xóa tài khoản ' + account.id + ' khỏi danh sách liên kết?')) return;
+      currentEntrade.accounts.splice(index, 1);
+      const removedID = String(account.id || '').toUpperCase();
+      currentEntrade.defaultAccountNos = ((currentEntrade.defaultAccountNos || []).filter((id) => String(id || '').toUpperCase() !== removedID));
+      if (!currentEntrade.accounts.length) currentEntrade.enabled = false;
+      renderEntradeStatus();
+      renderEntradeAccounts();
+      await persistSettings('Đã xóa tài khoản Entrade khỏi cấu hình.');
+    }
+
+    async function toggleEntradeDefault(index, checked) {
+      const account = entradeAccounts()[index];
+      if (!account) return;
+      const id = String(account.id || '').toUpperCase();
+      const defaults = entradeDefaultSet();
+      if (checked) defaults.add(id);
+      else defaults.delete(id);
+      currentEntrade.defaultAccountNos = Array.from(defaults);
+      renderEntradeAccounts();
+      await persistSettings('Đã cập nhật nhóm đặt lệnh Entrade.');
     }
 
     loadProfiles().then(loadSettings);

@@ -743,6 +743,14 @@ func normalizeEntradeAccounts(cfg EntradeConfig) []EntradeAccountConfig {
 		if account.TradingToken == "" {
 			account.TradingToken = cfg.TradingToken
 		}
+		for idx, existing := range accounts {
+			if sameEntradeProfile(existing, account) {
+				if preferEntradeProfile(account, existing) {
+					accounts[idx] = account
+				}
+				return
+			}
+		}
 		accounts = append(accounts, account)
 	}
 	for _, account := range cfg.Accounts {
@@ -754,6 +762,49 @@ func normalizeEntradeAccounts(cfg EntradeConfig) []EntradeAccountConfig {
 		add(EntradeAccountConfig{ID: "ENTRADE_DEMO", Environment: "paper", Enabled: true})
 	}
 	return accounts
+}
+
+func sameEntradeProfile(a, b EntradeAccountConfig) bool {
+	if !sameEntradeEnvironment(a.Environment, b.Environment) {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(a.ID), strings.TrimSpace(b.ID)) {
+		return true
+	}
+	if a.AccountNo != "" && b.AccountNo != "" && strings.EqualFold(strings.TrimSpace(a.AccountNo), strings.TrimSpace(b.AccountNo)) {
+		return true
+	}
+	if a.InvestorID != "" && b.InvestorID != "" && strings.EqualFold(strings.TrimSpace(a.InvestorID), strings.TrimSpace(b.InvestorID)) {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(a.Environment), strings.TrimSpace(b.Environment)) &&
+		strings.EqualFold(strings.TrimSpace(a.Username), strings.TrimSpace(b.Username))
+}
+
+func sameEntradeEnvironment(a, b string) bool {
+	a = normalizeEntradeEnvironment(a)
+	b = normalizeEntradeEnvironment(b)
+	return a == "" || b == "" || a == b
+}
+
+func normalizeEntradeEnvironment(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "prod" {
+		return "real"
+	}
+	return value
+}
+
+func preferEntradeProfile(candidate, existing EntradeAccountConfig) bool {
+	candidateVirtual := candidate.ID == "ENTRADE_REAL" || candidate.ID == "ENTRADE_DEMO"
+	existingVirtual := existing.ID == "ENTRADE_REAL" || existing.ID == "ENTRADE_DEMO"
+	if existingVirtual != candidateVirtual {
+		return !candidateVirtual
+	}
+	if candidate.LoanPackageID > 0 && existing.LoanPackageID == 0 {
+		return true
+	}
+	return len(candidate.ID) > len(existing.ID)
 }
 
 func parseEntradeAccountProfiles(value string) []EntradeAccountConfig {

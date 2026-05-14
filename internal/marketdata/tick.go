@@ -60,7 +60,9 @@ func (s *Store) Update(tick Tick) {
 		s.mu.Unlock()
 		return
 	}
-	if !isVNTradingTimestampMS(tick.TimestampMS) {
+	if normalizedMS, ok := normalizeRealtimeTickTimestampForSymbolMS(tick.Symbol, tick.TimestampMS); ok {
+		tick.TimestampMS = normalizedMS
+	} else {
 		s.mu.Unlock()
 		return
 	}

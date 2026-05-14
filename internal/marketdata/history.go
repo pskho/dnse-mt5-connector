@@ -39,6 +39,10 @@ type HistoryCache interface {
 	GetHistoryCoverage(ctx context.Context, symbol, marketType string, resolution int) (minMS, maxMS int64, count int, err error)
 }
 
+type TickerMetadataLookup interface {
+	GetTickerMetadataBySymbol(ctx context.Context, symbol string) (storage.TickerMetadataRecord, error)
+}
+
 type SyncRequest struct {
 	FirstTime int64 `json:"firstTime"`
 	LastTime  int64 `json:"lastTime"`
@@ -74,6 +78,7 @@ type HistoryService struct {
 	logger    *logger.FileLogger
 	store     HistorySyncLogger
 	cache     HistoryCache
+	tickers   TickerMetadataLookup
 	mu        sync.RWMutex
 	snapshots map[string]historySnapshot
 	subs      map[chan HistoryKey]struct{}
@@ -99,12 +104,17 @@ func NewHistoryService(cfg config.HistoryConfig, client HistoryClient, store His
 	if c, ok := store.(HistoryCache); ok {
 		cache = c
 	}
+	var tickers TickerMetadataLookup
+	if t, ok := store.(TickerMetadataLookup); ok {
+		tickers = t
+	}
 	return &HistoryService{
 		cfg:       cfg,
 		client:    client,
 		store:     store,
 		logger:    logger,
 		cache:     cache,
+		tickers:   tickers,
 		snapshots: make(map[string]historySnapshot),
 		subs:      make(map[chan HistoryKey]struct{}),
 		reqGate:   &historyRequestGate{},
@@ -253,13 +263,15 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 
 	fromMS := from * 1000
 	toMS := to * 1000
+	sessionPolicy := s.sessionPolicy(ctx, symbol, marketType)
 	if s.cache != nil && !opt.ForceFull {
+		requiredFromMS, requiredToMS, hasRequiredCandles := requiredTradingCoverageRange(fromMS, toMS, resolution, sessionPolicy)
 		minMS, maxMS, count, err := s.cache.GetHistoryCoverage(ctx, symbol, marketType, resolution)
-		if err == nil && count > 0 && minMS <= fromMS && maxMS >= toMS {
+		if err == nil && count > 0 && (!hasRequiredCandles || (minMS <= requiredFromMS && maxMS >= requiredToMS)) {
 			cached, loadErr := s.cache.LoadHistoryCandles(ctx, symbol, marketType, resolution, fromMS, toMS)
-			if loadErr == nil && len(cached) > 0 {
+			if loadErr == nil && cacheRecordsCompleteForRange(cached, resolution, fromMS, toMS, sessionPolicy) {
 				stagedCandles := recordsToCandles(cached)
-				stagedCandles = fillDerivativeSessionGapsIfNeeded(symbol, marketType, stagedCandles)
+				stagedCandles = fillTradingSessionGapsForRangeIfNeeded(symbol, marketType, resolution, fromMS, toMS, stagedCandles, sessionPolicy)
 				s.replaceStagedCandles(HistoryKey{
 					Symbol:     symbol,
 					MarketType: marketType,
@@ -280,6 +292,15 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 					"fromMS": fromMS, "toMS": toMS, "candles": len(stagedCandles),
 				})
 				return SyncResult{Success: true, Message: message, CandlesSynced: len(stagedCandles)}, nil
+			} else if loadErr != nil {
+				s.logger.Error("history_cache_load_failed", map[string]any{
+					"symbol": symbol, "marketType": marketType, "resolution": resolution, "error": loadErr.Error(),
+				})
+			} else {
+				s.logger.Info("history_cache_gap_detected", map[string]any{
+					"symbol": symbol, "marketType": marketType, "resolution": resolution,
+					"fromMS": fromMS, "toMS": toMS, "cached": len(cached),
+				})
 			}
 		}
 	}
@@ -362,7 +383,7 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 	sort.Slice(stagedCandles, func(i, j int) bool {
 		return stagedCandles[i].Time < stagedCandles[j].Time
 	})
-	stagedCandles = fillDerivativeSessionGapsIfNeeded(symbol, marketType, stagedCandles)
+	stagedCandles = fillTradingSessionGapsForRangeIfNeeded(symbol, marketType, resolution, fromMS, toMS, stagedCandles, sessionPolicy)
 
 	if s.cache != nil && len(stagedCandles) > 0 {
 		if err := s.cache.UpsertHistoryCandles(ctx, candlesToRecords(symbol, marketType, resolution, stagedCandles)); err != nil {
@@ -633,9 +654,152 @@ var vnLocation = func() *time.Location {
 	return loc
 }()
 
-func fillDerivativeSessionGaps(candles []HistoryCandle) []HistoryCandle {
+type tradingSessionPolicy struct {
+	MorningOpen       int
+	OpeningAuctionEnd int
+	MorningClose      int
+	AfternoonOpen     int
+	ClosingAuction    int
+	AfternoonClose    int
+}
+
+func (s *HistoryService) sessionPolicy(ctx context.Context, symbol, marketType string) tradingSessionPolicy {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	marketType = strings.ToUpper(strings.TrimSpace(marketType))
+	if marketType == "DERIVATIVE" || isDerivativeSymbol(symbol) {
+		return derivativeKRXPolicy()
+	}
+	if isHOSEIndexSymbol(symbol) {
+		return hoseKRXPolicy()
+	}
+	if isHNXOrUPCOMSymbol(symbol) {
+		return hnxUPCOMKRXPolicy()
+	}
+	if marketType != "STOCK" || s == nil || s.tickers == nil || symbol == "" {
+		return defaultKRXPolicy()
+	}
+	record, err := s.tickers.GetTickerMetadataBySymbol(ctx, symbol)
+	if err != nil {
+		return defaultKRXPolicy()
+	}
+	exchange := strings.ToUpper(strings.TrimSpace(record.Exchange))
+	if exchange == "HOSE" || exchange == "HSX" {
+		return hoseKRXPolicy()
+	}
+	if exchange == "HNX" || exchange == "UPCOM" {
+		return hnxUPCOMKRXPolicy()
+	}
+	return defaultKRXPolicy()
+}
+
+func isHNXOrUPCOMSymbol(symbol string) bool {
+	switch strings.ToUpper(strings.TrimSpace(symbol)) {
+	case "HNX", "HNX30", "UPCOM":
+		return true
+	default:
+		return false
+	}
+}
+
+func realtimePolicyForSymbol(symbol string) tradingSessionPolicy {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if isDerivativeSymbol(symbol) {
+		return derivativeKRXPolicy()
+	}
+	if isHOSEIndexSymbol(symbol) {
+		return hoseKRXPolicy()
+	}
+	if isHNXOrUPCOMSymbol(symbol) {
+		return hnxUPCOMKRXPolicy()
+	}
+	return tradingSessionPolicy{
+		MorningOpen:    8*60 + 45,
+		MorningClose:   11*60 + 30,
+		AfternoonOpen:  13 * 60,
+		AfternoonClose: 15 * 60,
+	}
+}
+
+func isHOSEIndexSymbol(symbol string) bool {
+	switch strings.ToUpper(strings.TrimSpace(symbol)) {
+	case "VNINDEX", "VN30", "VN100", "VNXALLSHARE", "VNDIVIDEND", "VN50GROWTH", "VNMITECH":
+		return true
+	default:
+		return false
+	}
+}
+
+func derivativeKRXPolicy() tradingSessionPolicy {
+	return tradingSessionPolicy{
+		MorningOpen:       8*60 + 45,
+		OpeningAuctionEnd: 9 * 60,
+		MorningClose:      11*60 + 30,
+		AfternoonOpen:     13 * 60,
+		ClosingAuction:    14*60 + 30,
+		AfternoonClose:    14*60 + 45,
+	}
+}
+
+func hoseKRXPolicy() tradingSessionPolicy {
+	return tradingSessionPolicy{
+		MorningOpen:       9 * 60,
+		OpeningAuctionEnd: 9*60 + 15,
+		MorningClose:      11*60 + 30,
+		AfternoonOpen:     13 * 60,
+		ClosingAuction:    14*60 + 30,
+		AfternoonClose:    14*60 + 45,
+	}
+}
+
+func hnxUPCOMKRXPolicy() tradingSessionPolicy {
+	return tradingSessionPolicy{
+		MorningOpen:    9 * 60,
+		MorningClose:   11*60 + 30,
+		AfternoonOpen:  13 * 60,
+		AfternoonClose: 15 * 60,
+	}
+}
+
+func defaultKRXPolicy() tradingSessionPolicy {
+	return hoseKRXPolicy()
+}
+
+func normalizeTradingSessionPolicy(policy tradingSessionPolicy) tradingSessionPolicy {
+	if policy.MorningOpen <= 0 {
+		policy.MorningOpen = 9 * 60
+	}
+	if policy.MorningClose <= 0 {
+		policy.MorningClose = 11*60 + 30
+	}
+	if policy.AfternoonOpen <= 0 {
+		policy.AfternoonOpen = 13 * 60
+	}
+	if policy.AfternoonClose <= 0 {
+		policy.AfternoonClose = 14*60 + 45
+	}
+	if policy.OpeningAuctionEnd <= policy.MorningOpen {
+		policy.OpeningAuctionEnd = 0
+	}
+	if policy.ClosingAuction <= 0 || policy.ClosingAuction > policy.AfternoonClose {
+		policy.ClosingAuction = 0
+	}
+	return policy
+}
+
+func fillTradingSessionGaps(candles []HistoryCandle, resolution int) []HistoryCandle {
+	return fillTradingSessionGapsWithPolicy(candles, resolution, defaultKRXPolicy())
+}
+
+func fillTradingSessionGapsWithPolicy(candles []HistoryCandle, resolution int, policy tradingSessionPolicy) []HistoryCandle {
 	if len(candles) < 2 {
 		return candles
+	}
+	if resolution <= 0 {
+		resolution = 1
+	}
+	stepMS := int64(resolution) * 60_000
+	if stepMS <= 0 {
+		stepMS = 60_000
 	}
 
 	out := make([]HistoryCandle, 0, len(candles)+1024)
@@ -645,8 +809,8 @@ func fillDerivativeSessionGaps(candles []HistoryCandle) []HistoryCandle {
 		prev := out[len(out)-1]
 		curr := candles[i]
 
-		for ts := prev.Time + 60_000; ts < curr.Time; ts += 60_000 {
-			if !sameTradingSession(prev.Time, ts) || !sameTradingSession(ts, curr.Time) {
+		for ts := prev.Time + stepMS; ts < curr.Time; ts += stepMS {
+			if !sameTradingSessionWithPolicy(prev.Time, ts, policy) || !sameTradingSessionWithPolicy(ts, curr.Time, policy) {
 				break
 			}
 			price := prev.Close
@@ -671,11 +835,275 @@ func fillDerivativeSessionGaps(candles []HistoryCandle) []HistoryCandle {
 	return out
 }
 
-func fillDerivativeSessionGapsIfNeeded(symbol, marketType string, candles []HistoryCandle) []HistoryCandle {
-	if strings.EqualFold(strings.TrimSpace(marketType), "DERIVATIVE") || strings.HasPrefix(strings.ToUpper(strings.TrimSpace(symbol)), "VN30F") {
-		return fillDerivativeSessionGaps(candles)
+func fillDerivativeSessionGaps(candles []HistoryCandle) []HistoryCandle {
+	return fillTradingSessionGapsWithPolicy(candles, 1, derivativeKRXPolicy())
+}
+
+func fillTradingSessionGapsIfNeeded(symbol, marketType string, resolution int, candles []HistoryCandle) []HistoryCandle {
+	_ = marketType
+	if resolution == 1 && strings.TrimSpace(symbol) != "" {
+		return fillTradingSessionGaps(candles, resolution)
 	}
 	return candles
+}
+
+func fillTradingSessionGapsForRangeIfNeeded(symbol, marketType string, resolution int, fromMS, toMS int64, candles []HistoryCandle, policy tradingSessionPolicy) []HistoryCandle {
+	_ = marketType
+	if resolution == 1 && strings.TrimSpace(symbol) != "" {
+		return fillTradingSessionGapsForRange(candles, resolution, fromMS, toMS, policy)
+	}
+	return candles
+}
+
+func fillDerivativeSessionGapsIfNeeded(symbol, marketType string, candles []HistoryCandle) []HistoryCandle {
+	return fillTradingSessionGapsIfNeeded(symbol, marketType, 1, candles)
+}
+
+func fillTradingSessionGapsForRange(candles []HistoryCandle, resolution int, fromMS, toMS int64, policy tradingSessionPolicy) []HistoryCandle {
+	if len(candles) == 0 {
+		return candles
+	}
+	candles = normalizeKRXCandles(candles, policy)
+	if len(candles) == 0 {
+		return candles
+	}
+	if resolution <= 0 {
+		resolution = 1
+	}
+	stepMS := int64(resolution) * 60_000
+	if stepMS <= 0 {
+		stepMS = 60_000
+	}
+
+	actual := make(map[int64]HistoryCandle, len(candles))
+	days := make(map[string]struct{})
+	for _, candle := range candles {
+		actual[candle.Time] = candle
+		t := time.UnixMilli(candle.Time).In(vnLocation)
+		days[t.Format("2006-01-02")] = struct{}{}
+	}
+
+	out := make([]HistoryCandle, 0, len(candles)+1024)
+	seen := make(map[int64]struct{}, len(candles)+1024)
+	for _, candle := range candles {
+		if !isVNTradingTimestampMSWithPolicy(candle.Time, policy) {
+			out = append(out, candle)
+			seen[candle.Time] = struct{}{}
+		}
+	}
+
+	rangeStart := alignUpToStepMS(fromMS, stepMS)
+	rangeEnd := lastCompletedCandleStartMS(toMS, stepMS)
+	if rangeEnd < rangeStart {
+		return candles
+	}
+
+	var lastCandle HistoryCandle
+	hasLast := false
+	for ts := rangeStart; ts <= rangeEnd; ts += stepMS {
+		if !isVNTradingTimestampMSWithPolicy(ts, policy) {
+			continue
+		}
+		dayKey := time.UnixMilli(ts).In(vnLocation).Format("2006-01-02")
+		if _, ok := days[dayKey]; !ok {
+			continue
+		}
+		if candle, ok := actual[ts]; ok {
+			if _, exists := seen[ts]; !exists {
+				out = append(out, candle)
+				seen[ts] = struct{}{}
+			}
+			lastCandle = candle
+			hasLast = true
+			continue
+		}
+		if !hasLast || !sameTradingDay(lastCandle.Time, ts) {
+			first, ok := firstActualOnDayAtOrAfter(actual, dayKey, ts)
+			if !ok {
+				continue
+			}
+			lastCandle = first
+			hasLast = true
+		}
+		price := lastCandle.Close
+		if price <= 0 {
+			price = lastCandle.Open
+		}
+		if price <= 0 {
+			continue
+		}
+		if _, exists := seen[ts]; exists {
+			continue
+		}
+		out = append(out, HistoryCandle{
+			IsHistory:  1,
+			Time:       ts,
+			Open:       price,
+			High:       price,
+			Low:        price,
+			Close:      price,
+			TickVolume: 0,
+		})
+		seen[ts] = struct{}{}
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Time < out[j].Time
+	})
+	return out
+}
+
+func normalizeKRXCandles(candles []HistoryCandle, policy tradingSessionPolicy) []HistoryCandle {
+	if len(candles) == 0 {
+		return candles
+	}
+	sorted := make([]HistoryCandle, len(candles))
+	copy(sorted, candles)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Time < sorted[j].Time
+	})
+
+	byTime := make(map[int64]HistoryCandle, len(sorted))
+	order := make([]int64, 0, len(sorted))
+	for _, candle := range sorted {
+		bucketMS, ok := krxCandleStartMS(candle.Time, policy)
+		if !ok {
+			continue
+		}
+		existing, exists := byTime[bucketMS]
+		if !exists {
+			candle.Time = bucketMS
+			candle.IsHistory = 1
+			byTime[bucketMS] = candle
+			order = append(order, bucketMS)
+			continue
+		}
+		if candle.High > existing.High || existing.High <= 0 {
+			existing.High = candle.High
+		}
+		if candle.Low < existing.Low || existing.Low <= 0 {
+			existing.Low = candle.Low
+		}
+		if candle.Close > 0 {
+			existing.Close = candle.Close
+		}
+		existing.TickVolume += candle.TickVolume
+		byTime[bucketMS] = existing
+	}
+
+	out := make([]HistoryCandle, 0, len(order))
+	for _, ts := range order {
+		out = append(out, byTime[ts])
+	}
+	return out
+}
+
+func sameTradingDay(aMS, bMS int64) bool {
+	a := time.UnixMilli(aMS).In(vnLocation)
+	b := time.UnixMilli(bMS).In(vnLocation)
+	return a.Year() == b.Year() && a.Month() == b.Month() && a.Day() == b.Day()
+}
+
+func firstActualOnDayAtOrAfter(actual map[int64]HistoryCandle, dayKey string, fromMS int64) (HistoryCandle, bool) {
+	var out HistoryCandle
+	found := false
+	for ts, candle := range actual {
+		if ts < fromMS {
+			continue
+		}
+		if time.UnixMilli(ts).In(vnLocation).Format("2006-01-02") != dayKey {
+			continue
+		}
+		if !found || ts < out.Time {
+			out = candle
+			found = true
+		}
+	}
+	return out, found
+}
+
+func cacheRecordsCompleteForRange(records []storage.HistoryCandleRecord, resolution int, fromMS, toMS int64, policy tradingSessionPolicy) bool {
+	if resolution <= 0 {
+		resolution = 1
+	}
+	stepMS := int64(resolution) * 60_000
+	if stepMS <= 0 {
+		stepMS = 60_000
+	}
+	checkFrom, checkTo, hasExpected := requiredTradingCoverageRangeWithStep(fromMS, toMS, stepMS, policy)
+	if !hasExpected {
+		return true
+	}
+	if len(records) == 0 {
+		return false
+	}
+
+	seen := make(map[int64]struct{}, len(records))
+	for _, record := range records {
+		seen[record.TimeMS] = struct{}{}
+	}
+	for ts := checkFrom; ts <= checkTo; ts += stepMS {
+		if !isVNTradingTimestampMSWithPolicy(ts, policy) {
+			continue
+		}
+		if _, ok := seen[ts]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func requiredTradingCoverageRange(fromMS, toMS int64, resolution int, policy tradingSessionPolicy) (int64, int64, bool) {
+	if resolution <= 0 {
+		resolution = 1
+	}
+	stepMS := int64(resolution) * 60_000
+	if stepMS <= 0 {
+		stepMS = 60_000
+	}
+	return requiredTradingCoverageRangeWithStep(fromMS, toMS, stepMS, policy)
+}
+
+func requiredTradingCoverageRangeWithStep(fromMS, toMS, stepMS int64, policy tradingSessionPolicy) (int64, int64, bool) {
+	checkFrom := alignUpToStepMS(fromMS, stepMS)
+	checkTo := lastCompletedCandleStartMS(toMS, stepMS)
+	if checkTo < checkFrom {
+		return 0, 0, false
+	}
+	first := int64(0)
+	last := int64(0)
+	for ts := checkFrom; ts <= checkTo; ts += stepMS {
+		if !isVNTradingTimestampMSWithPolicy(ts, policy) {
+			continue
+		}
+		if first == 0 {
+			first = ts
+		}
+		last = ts
+	}
+	return first, last, first != 0
+}
+
+func alignUpToStepMS(value, stepMS int64) int64 {
+	if stepMS <= 0 {
+		return value
+	}
+	remainder := value % stepMS
+	if remainder == 0 {
+		return value
+	}
+	return value + stepMS - remainder
+}
+
+func lastCompletedCandleStartMS(toMS, stepMS int64) int64 {
+	if stepMS <= 0 {
+		return toMS
+	}
+	aligned := toMS - (toMS % stepMS)
+	if aligned == toMS {
+		return aligned
+	}
+	return aligned - stepMS
 }
 
 func candlesToRecords(symbol, marketType string, resolution int, candles []HistoryCandle) []storage.HistoryCandleRecord {
@@ -715,6 +1143,10 @@ func recordsToCandles(records []storage.HistoryCandleRecord) []HistoryCandle {
 }
 
 func sameTradingSession(aMS, bMS int64) bool {
+	return sameTradingSessionWithPolicy(aMS, bMS, tradingSessionPolicy{})
+}
+
+func sameTradingSessionWithPolicy(aMS, bMS int64, policy tradingSessionPolicy) bool {
 	a := time.UnixMilli(aMS).In(vnLocation)
 	b := time.UnixMilli(bMS).In(vnLocation)
 
@@ -724,7 +1156,7 @@ func sameTradingSession(aMS, bMS int64) bool {
 	if !isWeekday(a) || !isWeekday(b) {
 		return false
 	}
-	return sessionID(a) != 0 && sessionID(a) == sessionID(b)
+	return sessionIDWithPolicy(a, policy) != 0 && sessionIDWithPolicy(a, policy) == sessionIDWithPolicy(b, policy)
 }
 
 func isWeekday(t time.Time) bool {
@@ -732,23 +1164,93 @@ func isWeekday(t time.Time) bool {
 }
 
 func sessionID(t time.Time) int {
+	return sessionIDWithPolicy(t, tradingSessionPolicy{})
+}
+
+func sessionIDWithPolicy(t time.Time, policy tradingSessionPolicy) int {
+	policy = normalizeTradingSessionPolicy(policy)
 	minuteOfDay := t.Hour()*60 + t.Minute()
 	switch {
-	case minuteOfDay >= 8*60+45 && minuteOfDay <= 11*60+30:
+	case minuteOfDay >= policy.MorningOpen && minuteOfDay <= policy.MorningClose:
 		return 1
-	case minuteOfDay >= 13*60 && minuteOfDay <= 14*60+45:
+	case minuteOfDay >= policy.AfternoonOpen && minuteOfDay <= policy.AfternoonClose:
 		return 2
 	default:
 		return 0
 	}
 }
 
+func isKRXCandleMinute(t time.Time, policy tradingSessionPolicy) bool {
+	start, ok := krxCandleStart(t, policy)
+	return ok && start.Year() == t.Year() && start.Month() == t.Month() && start.Day() == t.Day() &&
+		start.Hour() == t.Hour() && start.Minute() == t.Minute()
+}
+
+func krxCandleStartMS(timestampMS int64, policy tradingSessionPolicy) (int64, bool) {
+	if timestampMS <= 0 {
+		return 0, false
+	}
+	t := time.UnixMilli(timestampMS).In(vnLocation)
+	start, ok := krxCandleStart(t, policy)
+	if !ok {
+		return 0, false
+	}
+	return start.UnixMilli(), true
+}
+
+func krxCandleStart(t time.Time, policy tradingSessionPolicy) (time.Time, bool) {
+	if !isWeekday(t) {
+		return time.Time{}, false
+	}
+	policy = normalizeTradingSessionPolicy(policy)
+	minuteOfDay := t.Hour()*60 + t.Minute()
+	if minuteOfDay < policy.MorningOpen || minuteOfDay > policy.AfternoonClose {
+		return time.Time{}, false
+	}
+	if minuteOfDay > policy.MorningClose && minuteOfDay < policy.AfternoonOpen {
+		return time.Time{}, false
+	}
+	if policy.OpeningAuctionEnd > 0 && minuteOfDay >= policy.MorningOpen && minuteOfDay < policy.OpeningAuctionEnd {
+		return time.Date(t.Year(), t.Month(), t.Day(), policy.MorningOpen/60, policy.MorningOpen%60, 0, 0, vnLocation), true
+	}
+	if policy.ClosingAuction > 0 && minuteOfDay >= policy.ClosingAuction && minuteOfDay <= policy.AfternoonClose {
+		return time.Date(t.Year(), t.Month(), t.Day(), policy.ClosingAuction/60, policy.ClosingAuction%60, 0, 0, vnLocation), true
+	}
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, vnLocation), true
+}
+
 func isVNTradingTimestampMS(timestampMS int64) bool {
+	return isVNTradingTimestampMSWithPolicy(timestampMS, tradingSessionPolicy{
+		MorningOpen:    8*60 + 45,
+		MorningClose:   11*60 + 30,
+		AfternoonOpen:  13 * 60,
+		AfternoonClose: 15 * 60,
+	})
+}
+
+func isVNTradingTimestampMSWithPolicy(timestampMS int64, policy tradingSessionPolicy) bool {
 	if timestampMS <= 0 {
 		return false
 	}
 	t := time.UnixMilli(timestampMS).In(vnLocation)
-	return isWeekday(t) && sessionID(t) != 0
+	if !isWeekday(t) {
+		return false
+	}
+	return isKRXCandleMinute(t, policy)
+}
+
+func normalizeRealtimeTickTimestampForSymbolMS(symbol string, timestampMS int64) (int64, bool) {
+	policy := realtimePolicyForSymbol(symbol)
+	startMS, ok := krxCandleStartMS(timestampMS, policy)
+	if !ok {
+		return 0, false
+	}
+	t := time.UnixMilli(timestampMS).In(vnLocation)
+	start := time.UnixMilli(startMS).In(vnLocation)
+	if t.Hour() == start.Hour() && t.Minute() == start.Minute() {
+		return timestampMS, true
+	}
+	return startMS, true
 }
 
 func endOfPreviousDayUnix() int64 {
