@@ -3,19 +3,27 @@
 //| Sends BUY/SELL signals to the local DNSE/Entrade bridge.         |
 //+------------------------------------------------------------------+
 #property strict
-#property version "1.01"
+#property version "1.05"
 
 input string          InpBridgeURL          = "http://127.0.0.1:8080";
-input string          InpSourceSymbol       = "VN30F1M";
-input string          InpCustomSymbol       = "VN30F1M_DNSE";
+input string          InpSourceSymbol       = ""; // empty/AUTO = chart symbol without _DNSE
+input string          InpCustomSymbol       = ""; // empty/AUTO = current chart symbol
 input ENUM_TIMEFRAMES InpTimeframe          = PERIOD_M1;
 input int             InpATRPeriod         = 10;
 input double          InpMultiplier        = 3.0;
-input int             InpQuantity          = 1;
+input int             InpQuantity          = 1; // 0 = use server execution group default qty
 input string          InpOrderType         = "MTL"; // MTL, LO, MAK, MOK, ATO, ATC
 input double          InpLimitPrice        = 0.0;   // used only when InpOrderType=LO
+input string          InpAccountNos        = ""; // empty = server default account/group
+input string          InpMarketType        = "DERIVATIVE";
+input string          InpOrderCategory     = "NORMAL";
 input bool            InpCloseBeforeReverse = true;
 input bool            InpEnableTrading      = false;
+input bool            InpConfigureBridgeMode = true;
+input string          InpBridgeSignalMode    = "auto"; // manual, semi-auto, auto
+input bool            InpSendTestSignalOnInit = false;
+input string          InpTestSide             = "BUY";
+input int             InpRequestTimeoutMs     = 15000;
 input int             InpTimerSeconds       = 1;
 input int             InpBarsToCalculate    = 300;
 input bool            InpShowChartObjects   = true;
@@ -31,28 +39,78 @@ int      g_atr_handle = INVALID_HANDLE;
 datetime g_last_closed_bar_time = 0;
 int      g_last_direction = 0;
 
+string Trimmed(string value)
+{
+   StringTrimLeft(value);
+   StringTrimRight(value);
+   return value;
+}
+
+string EffectiveCustomSymbol()
+{
+   string symbol = Trimmed(InpCustomSymbol);
+   string upper = symbol;
+   StringToUpper(upper);
+   if(symbol == "" || upper == "AUTO")
+      symbol = Symbol();
+   return symbol;
+}
+
+string EffectiveSourceSymbol()
+{
+   string symbol = Trimmed(InpSourceSymbol);
+   string upper = symbol;
+   StringToUpper(upper);
+   if(symbol == "" || upper == "AUTO")
+   {
+      symbol = EffectiveCustomSymbol();
+      if(StringLen(symbol) > 5 && StringSubstr(symbol, StringLen(symbol) - 5, 5) == "_DNSE")
+         symbol = StringSubstr(symbol, 0, StringLen(symbol) - 5);
+   }
+   StringToUpper(symbol);
+   return symbol;
+}
+
 int OnInit()
 {
-   if(!SymbolSelect(InpCustomSymbol, true))
+   string customSymbol = EffectiveCustomSymbol();
+   if(!SymbolSelect(customSymbol, true))
    {
-      PrintFormat("SuperTrend bot: cannot select custom symbol %s, error=%d", InpCustomSymbol, GetLastError());
+      PrintFormat("SuperTrend bot: cannot select custom symbol %s, error=%d", customSymbol, GetLastError());
       return INIT_FAILED;
    }
 
-   g_atr_handle = iATR(InpCustomSymbol, InpTimeframe, InpATRPeriod);
+   g_atr_handle = iATR(customSymbol, InpTimeframe, InpATRPeriod);
    if(g_atr_handle == INVALID_HANDLE)
    {
       PrintFormat("SuperTrend bot: cannot create ATR handle, error=%d", GetLastError());
       return INIT_FAILED;
    }
 
+   if(InpEnableTrading && InpConfigureBridgeMode)
+      ConfigureBridgeMode();
+
    EventSetTimer((int)MathMax(1, InpTimerSeconds));
-   PrintFormat("SuperTrend bot v1.00 started: symbol=%s, timeframe=%s, atr=%d, multiplier=%.2f, trading=%s",
-               InpCustomSymbol,
+   PrintFormat("SuperTrend bot v1.05 started: symbol=%s, orderSymbol=%s, timeframe=%s, atr=%d, multiplier=%.2f, trading=%s, bridgeMode=%s, accounts=%s, requestTimeoutMs=%d",
+               customSymbol,
+               EffectiveSourceSymbol(),
                EnumToString(InpTimeframe),
                InpATRPeriod,
                InpMultiplier,
-               InpEnableTrading ? "ON" : "OFF");
+               InpEnableTrading ? "ON" : "OFF",
+               InpBridgeSignalMode,
+               InpAccountNos,
+               InpRequestTimeoutMs);
+
+   if(InpEnableTrading && InpSendTestSignalOnInit)
+   {
+      string testSide = InpTestSide;
+      StringToUpper(testSide);
+      if(testSide != "SELL")
+         testSide = "BUY";
+      PrintFormat("SuperTrend bot: sending startup test %s signal.", testSide);
+      SendOrderSignal(testSide);
+   }
    return INIT_SUCCEEDED;
 }
 
@@ -76,7 +134,8 @@ void CheckSuperTrendSignal()
    int barsNeeded = (int)MathMax(InpBarsToCalculate, InpATRPeriod + 50);
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
-   int copied = CopyRates(InpCustomSymbol, InpTimeframe, 0, barsNeeded, rates);
+   string customSymbol = EffectiveCustomSymbol();
+   int copied = CopyRates(customSymbol, InpTimeframe, 0, barsNeeded, rates);
    if(copied < InpATRPeriod + 5)
       return;
 
@@ -272,7 +331,7 @@ void DrawTrendSegment(string prefix, datetime time1, double price1, datetime tim
 
 void DrawSignalMarker(string prefix, string side, datetime signalTime, double anchorPrice, double tradePrice, color markerColor, bool isBuy)
 {
-   double point = SymbolInfoDouble(InpCustomSymbol, SYMBOL_POINT);
+   double point = SymbolInfoDouble(EffectiveCustomSymbol(), SYMBOL_POINT);
    if(point <= 0.0)
       point = 0.1;
    double markerOffset = point * 12.0;
@@ -293,7 +352,7 @@ void DrawSignalMarker(string prefix, string side, datetime signalTime, double an
       ObjectSetInteger(0, arrowName, OBJPROP_HIDDEN, true);
    }
 
-   int digits = (int)SymbolInfoInteger(InpCustomSymbol, SYMBOL_DIGITS);
+   int digits = (int)SymbolInfoInteger(EffectiveCustomSymbol(), SYMBOL_DIGITS);
    if(digits <= 0)
       digits = 1;
    string label = side + " " + DoubleToString(tradePrice, digits);
@@ -328,22 +387,32 @@ void DeleteObjectsByPrefix(string prefix)
 
 string ChartObjectPrefix()
 {
-   return "DNSE_ST_" + InpCustomSymbol + "_" + EnumToString(InpTimeframe) + "_";
+   return "DNSE_ST_" + EffectiveCustomSymbol() + "_" + EnumToString(InpTimeframe) + "_";
 }
 
 void SendOrderSignal(string side)
 {
    string action = side;
-   string payload = "{";
-   payload += "\"action\":\"" + action + "\"";
-   payload += ",\"symbol\":\"" + InpSourceSymbol + "\"";
-   payload += ",\"side\":\"" + side + "\"";
-   payload += ",\"quantity\":" + IntegerToString(InpQuantity);
    string orderType = InpOrderType;
    StringToUpper(orderType);
+   string marketType = InpMarketType;
+   StringToUpper(marketType);
+   string orderCategory = InpOrderCategory;
+   StringToUpper(orderCategory);
+
+   string payload = "{";
+   payload += "\"action\":\"" + action + "\"";
+   payload += ",\"source\":\"supertrend\"";
+   payload += ",\"symbol\":\"" + EffectiveSourceSymbol() + "\"";
+   payload += ",\"side\":\"" + side + "\"";
+   if(InpQuantity > 0)
+      payload += ",\"quantity\":" + IntegerToString(InpQuantity);
    payload += ",\"orderType\":\"" + orderType + "\"";
    if(orderType == "LO" && InpLimitPrice > 0.0)
       payload += ",\"price\":" + DoubleToString(InpLimitPrice, 1);
+   payload += ",\"marketType\":\"" + marketType + "\"";
+   payload += ",\"orderCategory\":\"" + orderCategory + "\"";
+   payload += AccountSelectionJSON();
    payload += "}";
 
    SendJSON("/signal", payload, "order " + side);
@@ -351,13 +420,65 @@ void SendOrderSignal(string side)
 
 void SendCloseDealSignal()
 {
+   string orderType = InpOrderType;
+   StringToUpper(orderType);
    string payload = "{";
    payload += "\"action\":\"CLOSE_DEAL\"";
-   payload += ",\"symbol\":\"" + InpSourceSymbol + "\"";
-   payload += ",\"orderType\":\"" + InpOrderType + "\"";
+   payload += ",\"source\":\"supertrend\"";
+   payload += ",\"symbol\":\"" + EffectiveSourceSymbol() + "\"";
+   payload += ",\"orderType\":\"" + orderType + "\"";
+   payload += AccountSelectionJSON();
    payload += "}";
 
    SendJSON("/signal", payload, "close deal");
+}
+
+void ConfigureBridgeMode()
+{
+   string mode = InpBridgeSignalMode;
+   StringToLower(mode);
+   if(mode != "manual" && mode != "semi-auto" && mode != "semi_auto" && mode != "auto")
+      mode = "auto";
+   string payload = "{\"mode\":\"" + mode + "\"}";
+   SendJSON("/mode", payload, "bridge mode " + mode);
+}
+
+string AccountSelectionJSON()
+{
+   string raw = InpAccountNos;
+   StringTrimLeft(raw);
+   StringTrimRight(raw);
+   if(raw == "")
+      return "";
+
+   string parts[];
+   int count = StringSplit(raw, ',', parts);
+   string accounts = "";
+   int added = 0;
+   for(int i = 0; i < count; i++)
+   {
+      string account = parts[i];
+      StringTrimLeft(account);
+      StringTrimRight(account);
+      if(account == "")
+         continue;
+      if(added > 0)
+         accounts += ",";
+      accounts += "\"" + JsonEscape(account) + "\"";
+      added++;
+   }
+   if(added <= 0)
+      return "";
+   if(added == 1)
+      return ",\"accountNo\":" + accounts;
+   return ",\"accountNos\":[" + accounts + "]";
+}
+
+string JsonEscape(string value)
+{
+   StringReplace(value, "\\", "\\\\");
+   StringReplace(value, "\"", "\\\"");
+   return value;
 }
 
 bool SendJSON(string path, string payload, string label)
@@ -370,7 +491,9 @@ bool SendJSON(string path, string payload, string label)
    string resultHeaders;
    string headers = "Content-Type: application/json\r\n";
    ResetLastError();
-   int res = WebRequest("POST", url, headers, 3000, data, result, resultHeaders);
+   int timeoutMs = (int)MathMax(3000, InpRequestTimeoutMs);
+   int res = WebRequest("POST", url, headers, timeoutMs, data, result, resultHeaders);
+   int err = GetLastError();
    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
 
    if(res == 200)
@@ -379,8 +502,10 @@ bool SendJSON(string path, string payload, string label)
       return true;
    }
 
-   PrintFormat("SuperTrend bot: failed to send %s signal. HTTP=%d, error=%d, body=%s",
-               label, res, GetLastError(), response);
+   PrintFormat("SuperTrend bot: failed to send %s signal. HTTP=%d, error=%d, timeoutMs=%d, body=%s",
+               label, res, err, timeoutMs, response);
+   if(response == "" && (res == 1003 || err == 5203))
+      PrintFormat("SuperTrend bot: MT5 WebRequest transport failed or timed out. Check bridge URL %s and increase InpRequestTimeoutMs if auto order routing is slow.", InpBridgeURL);
    if(res == -1)
       Print("SuperTrend bot: add http://127.0.0.1:8080 to MT5 WebRequest allowed URLs.");
    return false;

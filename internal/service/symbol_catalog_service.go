@@ -413,7 +413,19 @@ func (s *SymbolCatalogService) GetMT5Layouts(ctx context.Context, symbols []stri
 	}
 
 	seen := make(map[string]struct{}, len(symbols))
-	layouts := make([]MT5SymbolLayout, 0, len(symbols))
+	layoutSeen := make(map[string]struct{}, len(symbols)*2)
+	layouts := make([]MT5SymbolLayout, 0, len(symbols)*2)
+	appendLayout := func(record storage.TickerMetadataRecord) {
+		layoutSymbol := strings.ToUpper(strings.TrimSpace(record.Symbol))
+		if layoutSymbol == "" {
+			return
+		}
+		if _, ok := layoutSeen[layoutSymbol]; ok {
+			return
+		}
+		layoutSeen[layoutSymbol] = struct{}{}
+		layouts = append(layouts, buildMT5Layout(record))
+	}
 	for _, symbol := range symbols {
 		symbol = strings.ToUpper(strings.TrimSpace(symbol))
 		if symbol == "" {
@@ -427,8 +439,10 @@ func (s *SymbolCatalogService) GetMT5Layouts(ctx context.Context, symbols []stri
 		record, ok := bySymbol[symbol]
 		if !ok {
 			if feedRecord, feedOK := byFeed[symbol]; feedOK {
+				displayRecord := feedRecord
 				record = feedRecord
 				record.Symbol = symbol
+				appendLayout(displayRecord)
 				ok = true
 			}
 		}
@@ -442,7 +456,12 @@ func (s *SymbolCatalogService) GetMT5Layouts(ctx context.Context, symbols []stri
 				Description: symbol,
 			}
 		}
-		layouts = append(layouts, buildMT5Layout(record))
+		appendLayout(record)
+		if feedSymbol := strings.ToUpper(strings.TrimSpace(record.FeedSymbol)); feedSymbol != "" && !strings.EqualFold(feedSymbol, record.Symbol) {
+			feedRecord := record
+			feedRecord.Symbol = feedSymbol
+			appendLayout(feedRecord)
+		}
 	}
 
 	sort.Slice(layouts, func(i, j int) bool {
@@ -466,7 +485,7 @@ func buildMT5Layout(record storage.TickerMetadataRecord) MT5SymbolLayout {
 		meta["name"],
 		record.Symbol,
 	)
-	sector := firstNonEmpty(meta["sectorIndex"], meta["sector"], meta["industry"], "Khác")
+	sector := firstNonEmpty(meta["sectorIndex"], meta["sector"], meta["industry"], "Khac")
 	groupPath := buildMT5GroupPath(record.Symbol, exchange, assetType, meta, sector)
 	description := buildMT5Description(record.Symbol, name, exchange, sector, meta)
 
@@ -507,38 +526,33 @@ func buildMT5GroupPath(symbol, exchange, assetType string, meta map[string]strin
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
 	switch classifyLayoutTypeWithFallback(symbol, assetType) {
 	case "INDEX":
-		return "DNSE\\Chỉ số\\" + sanitizeMT5Group(firstNonEmpty(meta["exchange"], exchange, "Tổng hợp"))
+		return "DNSE\\Chi so\\" + sanitizeMT5Group(firstNonEmpty(meta["exchange"], exchange, "Tong hop"))
 	case "DERIVATIVE":
-		family := "Khác"
-		switch {
-		case strings.HasPrefix(symbol, "VN30F"):
+		family := "Khac"
+		if strings.HasPrefix(symbol, "VN30F") {
 			family = "VN30"
-		case strings.HasPrefix(symbol, "V100F"):
+		} else if strings.HasPrefix(symbol, "V100F") {
 			family = "VN100"
 		}
-		return "DNSE\\Phái sinh\\" + sanitizeMT5Group(family)
+		return "DNSE\\Phai sinh\\" + sanitizeMT5Group(family)
 	default:
-		exchangeGroup := sanitizeMT5Group(firstNonEmpty(exchange, "Khác"))
+		exchangeGroup := sanitizeMT5Group(firstNonEmpty(exchange, "Khac"))
 		sectorGroup := sanitizeMT5Group(sector)
-		return "DNSE\\Cổ phiếu\\" + exchangeGroup + "\\" + sectorGroup
+		return "DNSE\\Co phieu\\" + exchangeGroup + "\\" + sectorGroup
 	}
 }
 
 func buildMT5Description(symbol, name, exchange, sector string, meta map[string]string) string {
-	parts := []string{symbol}
-	if strings.TrimSpace(name) != "" && !strings.EqualFold(strings.TrimSpace(name), symbol) {
-		parts = append(parts, name)
+	assetType := classifyLayoutTypeWithFallback(symbol, meta["type"])
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	partsASCII := []string{symbol}
+	if asciiExchange := sanitizeMT5ASCII(exchange); asciiExchange != "" {
+		partsASCII = append(partsASCII, asciiExchange)
 	}
-	if exchange != "" {
-		parts = append(parts, exchange)
+	if assetType != "" {
+		partsASCII = append(partsASCII, assetType)
 	}
-	if sector != "" && !strings.EqualFold(sector, "Khác") {
-		parts = append(parts, sector)
-	}
-	if short := strings.TrimSpace(meta["shortName"]); short != "" && !strings.EqualFold(short, name) {
-		parts = append(parts, short)
-	}
-	return strings.Join(parts, " | ")
+	return strings.Join(partsASCII, " | ")
 }
 
 func parseTickerRawJSON(raw string) map[string]string {
@@ -597,16 +611,34 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func sanitizeMT5ASCII(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(value))
+	for _, r := range value {
+		if r >= 32 && r <= 126 {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte(' ')
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
+}
+
 func sanitizeMT5Group(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return "Khác"
+		return "Khac"
 	}
 	replacer := strings.NewReplacer("\\", "-", "/", "-", ":", "-", "*", "-", "?", "", "\"", "", "<", "", ">", "", "|", "-", "\t", " ")
 	value = replacer.Replace(value)
+	value = sanitizeMT5ASCII(value)
 	value = strings.Join(strings.Fields(value), " ")
 	if value == "" {
-		return "Khác"
+		return "Khac"
 	}
 	return value
 }

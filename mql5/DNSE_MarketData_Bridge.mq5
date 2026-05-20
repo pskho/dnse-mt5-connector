@@ -3,7 +3,7 @@
 //| Updates custom symbol VN30F1M_DNSE from DNSEBridge.dll           |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.14"
+#property version   "1.17"
 
 struct MqlRateLite {
    long     time;
@@ -39,8 +39,9 @@ input int    InpAutoRecentSyncDelaySec = 15; // wait for realtime before any his
 input bool   InpEnableSignalBridge = false;
 input bool   InpEnableManualTradePanel = true;
 input string InpManualBridgeURL = "http://127.0.0.1:8080";
-input string InpManualAccountNos = "ENTRADE_DEMO"; // comma-separated account/profile ids
-input int    InpManualQuantity = 1;
+input string InpManualAccountNos = ""; // empty = server default account/group
+input int    InpManualOrderTimeoutMs = 15000;
+input int    InpManualQuantity = 1; // 0 = use server execution group default qty
 input string InpManualOrderType = "MTL"; // MTL or LO
 input double InpManualLimitPrice = 0.0;   // for LO; 0 uses latest realtime price
 input string InpManualMarketType = "DERIVATIVE";
@@ -136,7 +137,7 @@ void PollPendingSignals()
 void SendSignal(string side)
 {
    string url = "http://127.0.0.1:8080/signal";
-   string payload = StringFormat("{\"action\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"quantity\":1,\"source\":\"MT5\"}", side, InpSourceSymbol, side);
+   string payload = StringFormat("{\"action\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"source\":\"mt5_manual\"}", side, ChartTradingSymbol(), side);
    
    char data[];
    StringToCharArray(payload, data, 0, StringLen(payload), CP_UTF8);
@@ -170,7 +171,7 @@ void SendSignal(string side)
 void SendCloseDealSignal()
 {
    string url = "http://127.0.0.1:8080/signal";
-   string payload = StringFormat("{\"action\":\"CLOSE_DEAL\",\"symbol\":\"%s\",\"orderType\":\"MTL\",\"source\":\"MT5\"}", InpSourceSymbol);
+   string payload = StringFormat("{\"action\":\"CLOSE_DEAL\",\"symbol\":\"%s\",\"orderType\":\"MTL\",\"source\":\"mt5_manual\"}", ChartTradingSymbol());
    
    char data[];
    StringToCharArray(payload, data, 0, StringLen(payload), CP_UTF8);
@@ -255,7 +256,7 @@ void DrawManualTradePanel()
       return;
    CreateManualTradeButton(g_manual_panel_prefix + "BUY", "BUY", 172, 28, 72, 28, clrGreen, clrWhite);
    CreateManualTradeButton(g_manual_panel_prefix + "SELL", "SELL", 94, 28, 72, 28, clrRed, clrWhite);
-   string label = StringFormat("%s x%d", InpManualOrderType, InpManualQuantity);
+   string label = InpManualQuantity > 0 ? StringFormat("%s x%d", InpManualOrderType, InpManualQuantity) : InpManualOrderType + " server qty";
    CreateManualTradeLabel(g_manual_panel_prefix + "INFO", label, 94, 60, clrSilver);
    ChartRedraw(0);
 }
@@ -278,13 +279,43 @@ string JSONEscape(string text)
    return text;
 }
 
+string ChartTradingSymbol()
+{
+   string symbol = Symbol();
+   symbol = NormalizeSymbolName(symbol);
+   if(StringLen(symbol) > 5 && StringSubstr(symbol, StringLen(symbol) - 5, 5) == "_DNSE")
+      symbol = StringSubstr(symbol, 0, StringLen(symbol) - 5);
+   if(symbol == "")
+      symbol = InpSourceSymbol;
+   return NormalizeSymbolName(symbol);
+}
+
+double LatestManualOrderPrice(string symbol, string side)
+{
+   int idx = FindTrackedSymbolIndex(symbol);
+   if(idx >= 0)
+   {
+      if(side == "BUY" && g_last_ask_by_symbol[idx] > 0.0)
+         return g_last_ask_by_symbol[idx];
+      if(side == "SELL" && g_last_bid_by_symbol[idx] > 0.0)
+         return g_last_bid_by_symbol[idx];
+      if(g_last_last_by_symbol[idx] > 0.0)
+         return g_last_last_by_symbol[idx];
+   }
+   if(side == "BUY" && g_last_ask > 0.0)
+      return g_last_ask;
+   if(side == "SELL" && g_last_bid > 0.0)
+      return g_last_bid;
+   return g_last_last;
+}
+
 string BuildManualAccountsJSON()
 {
    string raw = InpManualAccountNos;
    StringTrimLeft(raw);
    StringTrimRight(raw);
    if(raw == "")
-      raw = "ENTRADE_DEMO";
+      return "";
 
    string parts[];
    int count = StringSplit(raw, ',', parts);
@@ -307,7 +338,7 @@ string BuildManualAccountsJSON()
    }
    out += "]";
    if(added == 0)
-      return "\"accountNo\":\"ENTRADE_DEMO\"";
+      return "";
    return out;
 }
 
@@ -326,18 +357,28 @@ bool SendManualOrder(string side)
    if(orderType == "")
       orderType = "MTL";
 
+   string orderSymbol = ChartTradingSymbol();
    double price = InpManualLimitPrice;
-   if(orderType == "LO" && price <= 0.0)
-      price = g_last_last;
+   if(price <= 0.0)
+      price = LatestManualOrderPrice(orderSymbol, side);
+   if(price <= 0.0)
+   {
+      PrintFormat("DNSE manual order %s skipped: realtime price is not available yet. Wait for the first tick or set InpManualLimitPrice.", side);
+      return false;
+   }
 
    string clientOrderId = StringFormat("mt5-manual-%s-%I64d", side, GetTickCount64());
    string payload = "{";
    payload += "\"clientOrderId\":\"" + JSONEscape(clientOrderId) + "\"";
-   payload += "," + BuildManualAccountsJSON();
-   payload += ",\"symbol\":\"" + JSONEscape(InpSourceSymbol) + "\"";
+   string accountJSON = BuildManualAccountsJSON();
+   if(accountJSON != "")
+      payload += "," + accountJSON;
+   payload += ",\"source\":\"mt5_manual\"";
+   payload += ",\"symbol\":\"" + JSONEscape(orderSymbol) + "\"";
    payload += ",\"side\":\"" + side + "\"";
-   payload += ",\"quantity\":" + IntegerToString((int)MathMax(1, InpManualQuantity));
-   payload += ",\"price\":" + DoubleToString(MathMax(0.0, price), LookupDigits(InpSourceSymbol));
+   if(InpManualQuantity > 0)
+      payload += ",\"quantity\":" + IntegerToString(InpManualQuantity);
+   payload += ",\"price\":" + DoubleToString(MathMax(0.0, price), LookupDigits(orderSymbol));
    payload += ",\"orderType\":\"" + JSONEscape(orderType) + "\"";
    payload += ",\"marketType\":\"" + JSONEscape(InpManualMarketType) + "\"";
    payload += ",\"orderCategory\":\"" + JSONEscape(InpManualOrderCategory) + "\"";
@@ -358,14 +399,21 @@ bool SendManualOrder(string side)
    string result_headers;
    string headers = "Content-Type: application/json\r\n";
    ResetLastError();
-   int res = WebRequest("POST", url, headers, 3000, data, result, result_headers);
+   int timeoutMs = (int)MathMax(3000, InpManualOrderTimeoutMs);
+   int res = WebRequest("POST", url, headers, timeoutMs, data, result, result_headers);
+   int err = GetLastError();
    string response = SafeCharArrayToString(result);
    if(res == 200)
    {
       PrintFormat("DNSE manual order %s submitted. clientOrderId=%s, response=%s", side, clientOrderId, response);
       return true;
    }
-   PrintFormat("DNSE manual order %s failed. HTTP=%d, error=%d, body=%s", side, res, GetLastError(), response);
+   PrintFormat("DNSE manual order %s failed. HTTP=%d, error=%d, timeoutMs=%d, clientOrderId=%s, body=%s", side, res, err, timeoutMs, clientOrderId, response);
+   if(response == "" && (res == 1003 || err == 5203))
+   {
+      PrintFormat("DNSE bridge: MT5 WebRequest transport failed or timed out. Check that bridge is running at %s, URL is allowed in MT5 WebRequest, and retry with a larger InpManualOrderTimeoutMs if Entrade/DNSE login is slow.", baseURL);
+      PrintFormat("DNSE bridge: If the server accepted the request after MT5 timed out, query this order on dashboard with client:%s", clientOrderId);
+   }
    if(res == -1)
       Print("DNSE bridge: add http://127.0.0.1:8080 to MT5 WebRequest allowed URLs.");
    return false;
@@ -589,6 +637,15 @@ void EnsureConfiguredCustomSymbols()
    ArrayResize(g_last_reconnect_by_symbol, 0);
 
    AddTrackedSymbol(InpSourceSymbol);
+   for(int i = 0; i < ArraySize(g_layout_symbols); i++)
+   {
+      string layoutSymbol = NormalizeSymbolName(g_layout_symbols[i]);
+      if(layoutSymbol == "")
+         continue;
+      AddTrackedSymbol(layoutSymbol);
+      EnsureNamedCustomSymbol(layoutSymbol);
+   }
+
    string url = "http://127.0.0.1:8080/symbols/profiles";
    char data[];
    char result[];
@@ -1098,7 +1155,7 @@ int OnInit()
    g_recent_history_retry_after = 0;
    DrawManualTradePanel();
    EventSetMillisecondTimer(MathMax(50, InpTimerMs));
-   PrintFormat("DNSE bridge v1.14: EA started, source=%s, custom symbol=%s, trackedSymbols=%s, autoRecentHistoryDays=%d, historyTimeoutMs=%d, manualTradePanel=%s, manualAccounts=%s", InpSourceSymbol, InpCustomSymbol, GetConfiguredSymbolsSummary(), InpAutoRecentHistoryDays, InpHistoryTimeoutMs, InpEnableManualTradePanel ? "ON" : "OFF", InpManualAccountNos);
+   PrintFormat("DNSE bridge v1.17: EA started, source=%s, custom symbol=%s, trackedSymbols=%s, autoRecentHistoryDays=%d, historyTimeoutMs=%d, manualTradePanel=%s, manualAccounts=%s, manualOrderTimeoutMs=%d", InpSourceSymbol, InpCustomSymbol, GetConfiguredSymbolsSummary(), InpAutoRecentHistoryDays, InpHistoryTimeoutMs, InpEnableManualTradePanel ? "ON" : "OFF", InpManualAccountNos, InpManualOrderTimeoutMs);
    if(InpAutoRecentHistoryDays <= 0)
       Print("DNSE bridge v1.14: auto history backfill is disabled; realtime is priority, older history is manual.");
    return INIT_SUCCEEDED;

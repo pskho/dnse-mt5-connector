@@ -34,6 +34,7 @@ type Config struct {
 	Risk         RiskConfig       `json:"risk"`
 	DNSE         DNSEConfig       `json:"dnse"`
 	Entrade      EntradeConfig    `json:"entrade"`
+	Trading      TradingConfig    `json:"trading"`
 	MarketData   MarketDataConfig `json:"marketData"`
 	History      HistoryConfig    `json:"history"`
 	GmailOTP     GmailOTPConfig   `json:"gmailOTP"`
@@ -112,6 +113,34 @@ type EntradeAccountConfig struct {
 	Enabled       bool   `json:"enabled"`
 }
 
+type TradingConfig struct {
+	Groups []ExecutionGroupConfig `json:"groups"`
+	Routes TradingRoutesConfig    `json:"routes"`
+}
+
+type ExecutionGroupConfig struct {
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	Enabled         bool     `json:"enabled"`
+	AccountNos      []string `json:"accountNos"`
+	DefaultQuantity int      `json:"defaultQuantity,omitempty"`
+	MaxQuantity     int      `json:"maxQuantity,omitempty"`
+	OrderType       string   `json:"orderType,omitempty"`
+	MarketType      string   `json:"marketType,omitempty"`
+	OrderCategory   string   `json:"orderCategory,omitempty"`
+	AllowBuy        bool     `json:"allowBuy"`
+	AllowSell       bool     `json:"allowSell"`
+	Symbols         []string `json:"symbols,omitempty"`
+}
+
+type TradingRoutesConfig struct {
+	Dashboard  string `json:"dashboard"`
+	MT5Manual  string `json:"mt5Manual"`
+	SuperTrend string `json:"superTrend"`
+	SignalAPI  string `json:"signalApi"`
+	OrderAPI   string `json:"orderApi"`
+}
+
 type MarketDataConfig struct {
 	Enabled          bool     `json:"enabled"`
 	Symbol           string   `json:"symbol"`
@@ -145,6 +174,7 @@ func Load(path string) (Config, error) {
 			PaperBaseURL:      "https://services.entrade.com.vn/papertrade-entrade-api",
 			DefaultAccountNos: []string{"ENTRADE_DEMO"},
 		},
+		Trading: defaultTradingConfig("", []string{"ENTRADE_DEMO"}),
 		MarketData: MarketDataConfig{
 			Enabled:          true,
 			Symbol:           "VN30F1M",
@@ -253,6 +283,7 @@ func normalize(cfg *Config) {
 		cfg.Entrade.DefaultAccountNos = normalizeAccountNos([]string{cfg.Entrade.AccountNo})
 	}
 	cfg.Entrade.Accounts = normalizeEntradeAccounts(cfg.Entrade)
+	cfg.Trading = normalizeTradingConfig(cfg.Trading, cfg.DNSE.AccountNo, cfg.Entrade.DefaultAccountNos)
 	if cfg.Risk.MaxQuantity <= 0 {
 		cfg.Risk.MaxQuantity = 10
 	}
@@ -419,6 +450,21 @@ func parseSimpleYAML(data []byte, cfg *Config) error {
 					return fmt.Errorf("invalid entrade.mock: %w", err)
 				}
 				cfg.Entrade.Mock = enabled
+			}
+		case "trading":
+			switch key {
+			case "groups":
+				cfg.Trading.Groups = parseExecutionGroups(value)
+			case "route_dashboard":
+				cfg.Trading.Routes.Dashboard = value
+			case "route_mt5_manual":
+				cfg.Trading.Routes.MT5Manual = value
+			case "route_supertrend":
+				cfg.Trading.Routes.SuperTrend = value
+			case "route_signal_api":
+				cfg.Trading.Routes.SignalAPI = value
+			case "route_order_api":
+				cfg.Trading.Routes.OrderAPI = value
 			}
 		case "risk":
 			n, err := strconv.Atoi(value)
@@ -616,6 +662,14 @@ entrade:
   trading_token: "%s"
   mock: %v
 
+trading:
+  groups: "%s"
+  route_dashboard: "%s"
+  route_mt5_manual: "%s"
+  route_supertrend: "%s"
+  route_signal_api: "%s"
+  route_order_api: "%s"
+
 market_data:
   enabled: %v
   symbol: "%s"
@@ -658,6 +712,7 @@ telemetry:
 		c.Entrade.Username, c.Entrade.Password, c.Entrade.InvestorID, c.Entrade.AccountNo,
 		strings.Join(quoteChannels(c.Entrade.DefaultAccountNos), ", "), formatEntradeAccountProfiles(c.Entrade.Accounts),
 		c.Entrade.TradingToken, c.Entrade.Mock,
+		formatExecutionGroups(c.Trading.Groups), c.Trading.Routes.Dashboard, c.Trading.Routes.MT5Manual, c.Trading.Routes.SuperTrend, c.Trading.Routes.SignalAPI, c.Trading.Routes.OrderAPI,
 		c.MarketData.Enabled, c.MarketData.Symbol, strings.Join(quoteChannels(c.MarketData.Symbols), ", "), c.MarketData.BridgeAddress, c.MarketData.WebSocketURL, strings.Join(quoteChannels(c.MarketData.Channels), ", "), c.MarketData.Mock, c.MarketData.ReconnectSeconds,
 		c.History.Enabled, c.History.Symbol, c.History.MarketType, c.History.Resolution, c.History.InitialLookbackDays, c.History.IncrementalSync, c.History.FullRebuild, c.History.MaxBatchDays,
 		c.GmailOTP.Enabled, c.GmailOTP.CredentialsFile, c.GmailOTP.TokenFile, c.GmailOTP.PollIntervalSeconds, c.GmailOTP.EmailDomainFilter,
@@ -673,6 +728,249 @@ func quoteChannels(channels []string) []string {
 		quoted[i] = fmt.Sprintf(`"%s"`, ch)
 	}
 	return quoted
+}
+
+func defaultTradingConfig(dnseAccount string, entradeDefaults []string) TradingConfig {
+	groups := []ExecutionGroupConfig{}
+	if strings.TrimSpace(dnseAccount) != "" {
+		groups = append(groups, ExecutionGroupConfig{
+			ID: "dnse-main", Name: "DNSE chính", Enabled: true, AccountNos: []string{strings.TrimSpace(dnseAccount)},
+			DefaultQuantity: 1, MaxQuantity: 1, OrderType: "MTL", MarketType: "DERIVATIVE", OrderCategory: "NORMAL", AllowBuy: true, AllowSell: true,
+		})
+	}
+	entradeAccounts := normalizeAccountNos(entradeDefaults)
+	if len(entradeAccounts) > 0 {
+		groups = append(groups, ExecutionGroupConfig{
+			ID: "entrade-default", Name: "Entrade mặc định", Enabled: true, AccountNos: entradeAccounts,
+			DefaultQuantity: 1, MaxQuantity: 1, OrderType: "MTL", MarketType: "DERIVATIVE", OrderCategory: "NORMAL", AllowBuy: true, AllowSell: true,
+			Symbols: []string{"VN30F1M"},
+		})
+	}
+	defaultRoute := "dnse-main"
+	if defaultRoute == "dnse-main" && strings.TrimSpace(dnseAccount) == "" && len(entradeAccounts) > 0 {
+		defaultRoute = "entrade-default"
+	}
+	return TradingConfig{
+		Groups: groups,
+		Routes: TradingRoutesConfig{
+			Dashboard:  defaultRoute,
+			MT5Manual:  defaultRoute,
+			SuperTrend: "entrade-default",
+			SignalAPI:  defaultRoute,
+			OrderAPI:   defaultRoute,
+		},
+	}
+}
+
+func normalizeTradingConfig(in TradingConfig, dnseAccount string, entradeDefaults []string) TradingConfig {
+	if len(in.Groups) == 0 {
+		in = defaultTradingConfig(dnseAccount, entradeDefaults)
+	}
+	seen := map[string]struct{}{}
+	out := make([]ExecutionGroupConfig, 0, len(in.Groups)+2)
+	for _, group := range in.Groups {
+		group.ID = normalizeRouteID(group.ID)
+		group.Name = strings.TrimSpace(group.Name)
+		if group.ID == "" {
+			continue
+		}
+		if group.Name == "" {
+			group.Name = group.ID
+		}
+		if _, ok := seen[group.ID]; ok {
+			continue
+		}
+		seen[group.ID] = struct{}{}
+		group.AccountNos = normalizeAccountNos(group.AccountNos)
+		group.Symbols = normalizeSymbols(group.Symbols)
+		group.OrderType = strings.ToUpper(strings.TrimSpace(group.OrderType))
+		group.MarketType = strings.ToUpper(strings.TrimSpace(group.MarketType))
+		group.OrderCategory = strings.ToUpper(strings.TrimSpace(group.OrderCategory))
+		if group.OrderType == "" {
+			group.OrderType = "MTL"
+		}
+		if group.MarketType == "" {
+			group.MarketType = "DERIVATIVE"
+		}
+		if group.OrderCategory == "" {
+			group.OrderCategory = "NORMAL"
+		}
+		if !group.AllowBuy && !group.AllowSell {
+			group.AllowBuy = true
+			group.AllowSell = true
+		}
+		if group.MaxQuantity < 0 {
+			group.MaxQuantity = 0
+		}
+		if group.DefaultQuantity < 0 {
+			group.DefaultQuantity = 0
+		}
+		if group.DefaultQuantity == 0 && group.MaxQuantity == 1 {
+			group.DefaultQuantity = 1
+		}
+		out = append(out, group)
+	}
+	in.Groups = out
+	if len(in.Groups) == 0 {
+		in = defaultTradingConfig(dnseAccount, entradeDefaults)
+	}
+	ensureRoute := func(value string) string {
+		value = normalizeRouteID(value)
+		if value != "" {
+			if _, ok := seen[value]; ok {
+				return value
+			}
+		}
+		if len(in.Groups) > 0 {
+			return in.Groups[0].ID
+		}
+		return ""
+	}
+	in.Routes.Dashboard = ensureRoute(in.Routes.Dashboard)
+	in.Routes.MT5Manual = ensureRoute(in.Routes.MT5Manual)
+	in.Routes.SuperTrend = ensureRoute(in.Routes.SuperTrend)
+	in.Routes.SignalAPI = ensureRoute(in.Routes.SignalAPI)
+	in.Routes.OrderAPI = ensureRoute(in.Routes.OrderAPI)
+	return in
+}
+
+func normalizeRouteID(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, "_", "-")
+	value = strings.ReplaceAll(value, " ", "-")
+	return value
+}
+
+func parseExecutionGroups(value string) []ExecutionGroupConfig {
+	rows := splitEscaped(value, ';')
+	out := make([]ExecutionGroupConfig, 0, len(rows))
+	for _, row := range rows {
+		cols := splitEscaped(row, '|')
+		if len(cols) < 3 {
+			continue
+		}
+		group := ExecutionGroupConfig{
+			ID:      cols[0],
+			Name:    cols[1],
+			Enabled: parseBoolDefault(cols[2], true),
+		}
+		if len(cols) > 3 {
+			group.AccountNos = splitPlus(cols[3])
+		}
+		if len(cols) > 4 {
+			group.MaxQuantity, _ = strconv.Atoi(strings.TrimSpace(cols[4]))
+		}
+		if len(cols) > 5 {
+			group.OrderType = cols[5]
+		}
+		if len(cols) > 6 {
+			group.MarketType = cols[6]
+		}
+		if len(cols) > 7 {
+			group.OrderCategory = cols[7]
+		}
+		if len(cols) > 8 {
+			group.AllowBuy = parseBoolDefault(cols[8], true)
+		}
+		if len(cols) > 9 {
+			group.AllowSell = parseBoolDefault(cols[9], true)
+		}
+		if len(cols) > 10 {
+			group.Symbols = splitPlus(cols[10])
+		}
+		if len(cols) > 11 {
+			group.DefaultQuantity, _ = strconv.Atoi(strings.TrimSpace(cols[11]))
+		}
+		out = append(out, group)
+	}
+	return out
+}
+
+func formatExecutionGroups(groups []ExecutionGroupConfig) string {
+	rows := make([]string, 0, len(groups))
+	for _, group := range groups {
+		cols := []string{
+			escapeTradingField(group.ID),
+			escapeTradingField(group.Name),
+			strconv.FormatBool(group.Enabled),
+			escapeTradingField(strings.Join(group.AccountNos, "+")),
+			strconv.Itoa(group.MaxQuantity),
+			escapeTradingField(group.OrderType),
+			escapeTradingField(group.MarketType),
+			escapeTradingField(group.OrderCategory),
+			strconv.FormatBool(group.AllowBuy),
+			strconv.FormatBool(group.AllowSell),
+			escapeTradingField(strings.Join(group.Symbols, "+")),
+			strconv.Itoa(group.DefaultQuantity),
+		}
+		rows = append(rows, strings.Join(cols, "|"))
+	}
+	return strings.Join(rows, ";")
+}
+
+func splitPlus(value string) []string {
+	parts := strings.Split(value, "+")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(unescapeTradingField(part))
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func parseBoolDefault(value string, fallback bool) bool {
+	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func escapeTradingField(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `|`, `\p`)
+	value = strings.ReplaceAll(value, `;`, `\s`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	return value
+}
+
+func unescapeTradingField(value string) string {
+	value = strings.ReplaceAll(value, `\"`, `"`)
+	value = strings.ReplaceAll(value, `\s`, `;`)
+	value = strings.ReplaceAll(value, `\p`, `|`)
+	value = strings.ReplaceAll(value, `\\`, `\`)
+	return value
+}
+
+func splitEscaped(value string, sep rune) []string {
+	out := []string{}
+	var b strings.Builder
+	escaped := false
+	for _, r := range value {
+		if escaped {
+			b.WriteRune('\\')
+			b.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if r == sep {
+			out = append(out, unescapeTradingField(b.String()))
+			b.Reset()
+			continue
+		}
+		b.WriteRune(r)
+	}
+	if escaped {
+		b.WriteRune('\\')
+	}
+	out = append(out, unescapeTradingField(b.String()))
+	return out
 }
 
 func normalizeSymbols(symbols []string) []string {

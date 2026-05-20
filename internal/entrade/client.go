@@ -322,14 +322,20 @@ func (c *Client) PlaceOrder(ctx context.Context, req dnsemodel.PlaceOrderRequest
 		return dnsemodel.PlaceOrderResponse{}, errors.New("entrade bankMarginPortfolioId is required")
 	}
 
+	orderType := strings.ToUpper(strings.TrimSpace(defaultString(req.OrderType, "LO")))
 	payload := map[string]any{
 		"bankMarginPortfolioId": portfolioID,
 		"investorId":            parseInt(investorID),
 		"symbol":                symbol,
-		"price":                 req.Price,
-		"orderType":             defaultString(req.OrderType, "LO"),
+		"orderType":             orderType,
 		"side":                  req.Side,
 		"quantity":              req.Quantity,
+	}
+	if orderType == "LO" {
+		if req.Price <= 0 {
+			return dnsemodel.PlaceOrderResponse{}, errors.New("entrade LO order requires price")
+		}
+		payload["price"] = req.Price
 	}
 	var raw map[string]any
 	if err := c.doForAccount(ctx, req.AccountNo, http.MethodPost, "/derivative/orders", payload, &raw); err != nil {

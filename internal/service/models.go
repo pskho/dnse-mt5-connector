@@ -4,6 +4,8 @@ type OrderRequest struct {
 	ClientOrderID string   `json:"clientOrderId"`
 	AccountNo     string   `json:"accountNo"`
 	AccountNos    []string `json:"accountNos,omitempty"`
+	Source        string   `json:"source,omitempty"`
+	RouteGroupID  string   `json:"routeGroupId,omitempty"`
 	Symbol        string   `json:"symbol"`
 	Side          string   `json:"side"`
 	Quantity      int      `json:"quantity"`
@@ -15,10 +17,12 @@ type OrderRequest struct {
 }
 
 type CloseDealRequest struct {
-	AccountNo  string   `json:"accountNo,omitempty"`
-	AccountNos []string `json:"accountNos,omitempty"`
-	Symbol     string   `json:"symbol"`
-	OrderType  string   `json:"orderType,omitempty"`
+	AccountNo    string   `json:"accountNo,omitempty"`
+	AccountNos   []string `json:"accountNos,omitempty"`
+	Source       string   `json:"source,omitempty"`
+	RouteGroupID string   `json:"routeGroupId,omitempty"`
+	Symbol       string   `json:"symbol"`
+	OrderType    string   `json:"orderType,omitempty"`
 }
 
 type OrderResponse struct {

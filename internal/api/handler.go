@@ -173,8 +173,12 @@ func (h *Handler) order(w http.ResponseWriter, r *http.Request) {
 	if h.signals != nil {
 		h.signals.MarkMT5Activity()
 	}
+	if strings.TrimSpace(req.Source) == "" {
+		req.Source = service.SourceOrderAPI
+	}
+	h.fillOrderRealtimePrice(&req)
 
-	if len(req.AccountNos) > 0 {
+	if len(req.AccountNos) > 0 || strings.TrimSpace(req.AccountNo) == "" {
 		responses, err := h.orders.PlaceOrders(r.Context(), req)
 		status := http.StatusOK
 		if err != nil {
@@ -226,6 +230,7 @@ func (h *Handler) signal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
+	h.fillSignalRealtimePrice(&req)
 	resp, err := h.signals.Receive(r.Context(), req)
 	if err != nil {
 		h.track(r.Context(), "signal_rejected", signalParams(req, map[string]any{
@@ -402,6 +407,70 @@ func (h *Handler) marketLatest(w http.ResponseWriter, r *http.Request) {
 		"time":    time.UnixMilli(tick.TimestampMS).UTC().Format(time.RFC3339),
 		"tick":    tick,
 	})
+}
+
+func (h *Handler) fillOrderRealtimePrice(req *service.OrderRequest) {
+	if req == nil || req.Price > 0 {
+		return
+	}
+	price, ok := h.latestOrderPrice(req.Symbol, req.Side)
+	if !ok {
+		return
+	}
+	req.Price = price
+	if h.logger != nil {
+		h.logger.Info("order_price_filled_from_realtime", map[string]any{"symbol": req.Symbol, "side": req.Side, "price": price, "source": req.Source})
+	}
+}
+
+func (h *Handler) fillSignalRealtimePrice(req *service.SignalRequest) {
+	if req == nil || req.Price > 0 {
+		return
+	}
+	price, ok := h.latestOrderPrice(req.Symbol, req.Side)
+	if !ok {
+		return
+	}
+	req.Price = price
+	if h.logger != nil {
+		h.logger.Info("signal_price_filled_from_realtime", map[string]any{"symbol": req.Symbol, "side": req.Side, "price": price, "source": req.Source})
+	}
+}
+
+func (h *Handler) latestOrderPrice(symbol, side string) (float64, bool) {
+	provider, ok := h.market.(MarketDataPriceProvider)
+	if !ok || provider == nil {
+		return 0, false
+	}
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		return 0, false
+	}
+	tick, ok := provider.LatestTick(symbol)
+	if !ok {
+		return 0, false
+	}
+	side = strings.ToUpper(strings.TrimSpace(side))
+	switch side {
+	case "BUY":
+		if tick.Ask > 0 {
+			return tick.Ask, true
+		}
+	case "SELL":
+		if tick.Bid > 0 {
+			return tick.Bid, true
+		}
+	}
+	if tick.Last > 0 {
+		return tick.Last, true
+	}
+	if tick.Ask > 0 {
+		return tick.Ask, true
+	}
+	if tick.Bid > 0 {
+		return tick.Bid, true
+	}
+	return 0, false
 }
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
@@ -1469,6 +1538,8 @@ func (h *Handler) settingsAPI(w http.ResponseWriter, r *http.Request) {
 			EntradeEnvironment       string                        `json:"entradeEnvironment"`
 			EntradeDefaultAccountNos []string                      `json:"entradeDefaultAccountNos"`
 			EntradeAccounts          []config.EntradeAccountConfig `json:"entradeAccounts"`
+			TradingGroups            []config.ExecutionGroupConfig `json:"tradingGroups"`
+			TradingRoutes            config.TradingRoutesConfig    `json:"tradingRoutes"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid json")
@@ -1502,6 +1573,10 @@ func (h *Handler) settingsAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.EntradeAccounts != nil {
 			cfg.Entrade.Accounts = mergeEntradeAccountsForSave(req.EntradeAccounts, cfg.Entrade.Accounts)
+		}
+		if req.TradingGroups != nil {
+			cfg.Trading.Groups = req.TradingGroups
+			cfg.Trading.Routes = req.TradingRoutes
 		}
 		if len(req.Symbols) > 0 {
 			cfg.MarketData.Symbols = h.canonicalizeSymbols(r.Context(), req.Symbols)

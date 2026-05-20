@@ -207,27 +207,48 @@ const indexHTML = layoutTop + `
     </section>
 
     <section class="card dashboard-section">
-      <h2>Dữ liệu thị trường và lịch sử</h2>
+      <h2>Nạp dữ liệu cho MT5</h2>
       <div class="grid">
         <div class="form-group">
-          <label>Thời điểm bắt đầu (ms)</label>
-          <input id="firstTime" type="number" value="0">
+          <label>Phạm vi nạp</label>
+          <select id="mt5HistoryScope">
+            <option value="single">Một mã</option>
+            <option value="all">Tất cả mã đã chọn</option>
+          </select>
         </div>
         <div class="form-group">
-          <label>Thời điểm kết thúc (ms)</label>
-          <input id="lastTime" type="number" value="0">
+          <label>Mã</label>
+          <input id="mt5HistorySymbol" value="VN30F1M">
+        </div>
+        <div class="form-group">
+          <label>Loại thị trường</label>
+          <select id="mt5HistoryMarketType">
+            <option value="DERIVATIVE">DERIVATIVE</option>
+            <option value="STOCK">STOCK</option>
+            <option value="INDEX">INDEX</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Khung dữ liệu</label>
+          <select id="mt5HistoryResolution">
+            <option value="1">M1</option>
+            <option value="5">M5</option>
+            <option value="15">M15</option>
+            <option value="30">M30</option>
+            <option value="60">H1</option>
+          </select>
         </div>
         <div class="form-group">
           <label>Số ngày lấy lùi</label>
-          <input id="lookbackDays" type="number" value="365" min="1">
+          <input id="mt5LookbackDays" type="number" value="365" min="1">
         </div>
       </div>
       <div class="actions">
-        <button class="btn" onclick="syncHistory()">Đồng bộ lịch sử</button>
-        <button class="btn secondary" onclick="fullSyncHistory()">Nạp lại toàn bộ lịch sử</button>
-        <button class="btn secondary" onclick="backfillHistory()">Nạp lịch sử đến hết hôm qua</button>
+        <button class="btn" onclick="primeMT5History('single')">Nạp mã này cho MT5</button>
+        <button class="btn secondary" onclick="primeMT5History('all')">Nạp tất cả mã đã chọn</button>
+        <button class="btn secondary" onclick="syncHistory()">Chỉ nạp phần hôm nay</button>
       </div>
-      <div class="inline-note">Luồng "đến hết hôm qua" dùng để dựng nền dữ liệu một lần; realtime và dữ liệu hôm nay đi theo luồng riêng.</div>
+      <div class="inline-note">Luồng này dựng dữ liệu nền cho MT5, bao gồm lịch sử các ngày trước và dữ liệu trong ngày tới thời điểm hiện tại. Khi MT5 đang mở, bridge sẽ nhận snapshot mới và import lại vào custom symbol.</div>
     </section>
 
     <section class="card dashboard-section">
@@ -517,31 +538,52 @@ const indexHTML = layoutTop + `
       }));
     }
 
-    function syncHistory() {
-      run(() => request('/history/today-all', {
+    function mt5HistoryPayload() {
+      return {
+        symbol: ($('mt5HistorySymbol').value || 'VN30F1M').trim().toUpperCase(),
+        marketType: $('mt5HistoryMarketType').value || 'DERIVATIVE',
+        resolution: Number($('mt5HistoryResolution').value) || 1,
+        lookbackDays: Number($('mt5LookbackDays').value) || 365
+      };
+    }
+
+    function primeMT5History(scope) {
+      const payload = mt5HistoryPayload();
+      const selectedScope = scope || $('mt5HistoryScope').value;
+      const path = selectedScope === 'all' ? '/history/full-all' : '/history/full';
+      const body = selectedScope === 'all' ? { lookbackDays: payload.lookbackDays } : payload;
+      run(() => request(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
+        body: JSON.stringify(body)
+      }));
+    }
+
+    function syncHistory() {
+      const payload = mt5HistoryPayload();
+      const selectedScope = $('mt5HistoryScope').value;
+      const path = selectedScope === 'all' ? '/history/today-all' : '/history/today';
+      const body = selectedScope === 'all' ? {} : payload;
+      run(() => request(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
       }));
     }
 
     function fullSyncHistory() {
-      run(() => request('/history/full-all', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          lookbackDays: Number($('lookbackDays').value) || 365
-        })
-      }));
+      primeMT5History($('mt5HistoryScope').value);
     }
 
     function backfillHistory() {
-      run(() => request('/history/backfill-all', {
+      const payload = mt5HistoryPayload();
+      const selectedScope = $('mt5HistoryScope').value;
+      const path = selectedScope === 'all' ? '/history/backfill-all' : '/history/backfill';
+      const body = selectedScope === 'all' ? { lookbackDays: payload.lookbackDays } : payload;
+      run(() => request(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          lookbackDays: Number($('lookbackDays').value) || 365
-        })
+        body: JSON.stringify(body)
       }));
     }
 
@@ -608,7 +650,7 @@ const indexHTML = layoutTop + `
         const loanPackage = $('loanPackageId').value.trim();
         const body = {
           clientOrderId: $('clientOrderId').value,
-          accountNo: $('accountNo').value,
+          source: 'dashboard',
           symbol: $('symbol').value,
           side: $('side').value,
           quantity: Number($('quantity').value),
@@ -637,8 +679,8 @@ const indexHTML = layoutTop + `
           try { await loadLatestPrice($('symbol').value, true); } catch {}
         }
         const body = {
-          accountNo: $('accountNo').value || 'ENTRADE_DEMO',
           symbol: $('symbol').value || 'VN30F1M',
+          source: 'dashboard',
           side: side,
           quantity: Number($('quantity').value) || 1,
           price: Number($('price').value) || 0,

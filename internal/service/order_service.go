@@ -55,6 +55,8 @@ type OrderService struct {
 	maxOpenPosition   int
 	systemEnabled     bool
 	idempotency       map[string]idempotencyEntry
+	routes            *TradingRouteManager
+	priceResolver     func(symbol, side string) (float64, bool)
 	mu                sync.Mutex
 }
 
@@ -63,7 +65,7 @@ type idempotencyEntry struct {
 	processing bool
 }
 
-func NewOrderService(store Store, dnseClient DNSEClient, riskEngine RiskEngine, appLog *logger.FileLogger, defaultAccountNo string, positions *PositionService, maxOpenPosition int) *OrderService {
+func NewOrderService(store Store, dnseClient DNSEClient, riskEngine RiskEngine, appLog *logger.FileLogger, defaultAccountNo string, positions *PositionService, maxOpenPosition int, routes *TradingRouteManager) *OrderService {
 	if maxOpenPosition <= 0 {
 		maxOpenPosition = 10
 	}
@@ -86,7 +88,14 @@ func NewOrderService(store Store, dnseClient DNSEClient, riskEngine RiskEngine, 
 		maxOpenPosition:   maxOpenPosition,
 		systemEnabled:     true,
 		idempotency:       make(map[string]idempotencyEntry),
+		routes:            routes,
 	}
+}
+
+func (s *OrderService) SetPriceResolver(resolve func(symbol, side string) (float64, bool)) {
+	s.mu.Lock()
+	s.priceResolver = resolve
+	s.mu.Unlock()
 }
 
 func (s *OrderService) PlaceOrder(ctx context.Context, req OrderRequest) (OrderResponse, error) {
@@ -104,6 +113,8 @@ func (s *OrderService) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 		return OrderResponse{}, err
 	}
 	s.log(ctx, "info", "validation_passed", map[string]any{"symbol": normalized.Symbol, "side": normalized.Side})
+
+	s.fillPriceFromRealtime(ctx, &normalized)
 
 	idempotencyKey := orderIdempotencyKey(normalized)
 	if !s.reserveOrder(idempotencyKey, 3*time.Second) {
@@ -192,12 +203,28 @@ func (s *OrderService) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 }
 
 func (s *OrderService) PlaceOrders(ctx context.Context, req OrderRequest) ([]OrderResponse, error) {
+	if req.Source == "" {
+		req.Source = SourceOrderAPI
+	}
+	if s.routes != nil {
+		s.routes.ApplyDefaults(&req)
+	}
 	accounts := normalizeAccountList(req.AccountNos)
 	if len(accounts) == 0 && strings.TrimSpace(req.AccountNo) != "" {
 		accounts = []string{strings.TrimSpace(req.AccountNo)}
 	}
+	accounts = s.resolveAccountAliases(accounts)
+	if len(accounts) == 0 && s.routes != nil {
+		_, routedAccounts, routeErr := s.routes.GroupAccounts(req.Source, req.RouteGroupID, req.Side, req.Symbol, req.Quantity)
+		if routeErr != nil {
+			return nil, routeErr
+		}
+		accounts = routedAccounts
+		accounts = s.resolveAccountAliases(accounts)
+	}
 	if len(accounts) == 0 {
 		accounts = append(accounts, s.defaultAccountNos...)
+		accounts = s.resolveAccountAliases(accounts)
 	}
 	if len(accounts) == 0 {
 		resp, err := s.PlaceOrder(ctx, req)
@@ -257,8 +284,22 @@ func (s *OrderService) CloseDeals(ctx context.Context, req CloseDealRequest) ([]
 	if len(accounts) == 0 && strings.TrimSpace(req.AccountNo) != "" {
 		accounts = []string{strings.TrimSpace(req.AccountNo)}
 	}
+	accounts = s.resolveAccountAliases(accounts)
+	if len(accounts) == 0 && s.routes != nil {
+		source := req.Source
+		if source == "" {
+			source = SourceSignalAPI
+		}
+		_, routedAccounts, routeErr := s.routes.GroupAccounts(source, req.RouteGroupID, "SELL", symbol, 1)
+		if routeErr != nil {
+			return nil, routeErr
+		}
+		accounts = routedAccounts
+		accounts = s.resolveAccountAliases(accounts)
+	}
 	if len(accounts) == 0 {
 		accounts = append(accounts, s.defaultAccountNos...)
+		accounts = s.resolveAccountAliases(accounts)
 	}
 	if len(accounts) == 0 {
 		return nil, errors.New("accountNo or accountNos is required for close deal")
@@ -442,11 +483,16 @@ func (s *OrderService) IsEnabled() bool {
 func (s *OrderService) validateOrder(req OrderRequest) (OrderRequest, string, error) {
 	req.ClientOrderID = strings.TrimSpace(req.ClientOrderID)
 	req.AccountNo = strings.TrimSpace(req.AccountNo)
+	req.Source = normalizeSource(req.Source)
+	req.RouteGroupID = normalizeGroupID(req.RouteGroupID)
 	req.Symbol = strings.ToUpper(strings.TrimSpace(req.Symbol))
 	req.Side = strings.ToUpper(strings.TrimSpace(req.Side))
 	req.OrderType = strings.ToUpper(strings.TrimSpace(req.OrderType))
 	req.MarketType = strings.ToUpper(strings.TrimSpace(req.MarketType))
 	req.OrderCategory = strings.ToUpper(strings.TrimSpace(req.OrderCategory))
+	if s.routes != nil {
+		s.routes.ApplyDefaults(&req)
+	}
 	if req.OrderType == "" {
 		req.OrderType = "LO"
 	}
@@ -457,6 +503,10 @@ func (s *OrderService) validateOrder(req OrderRequest) (OrderRequest, string, er
 	if req.ClientOrderID == "" {
 		req.ClientOrderID = fmt.Sprintf("mt5-%d", time.Now().UnixNano())
 	}
+	if req.AccountNo == "" {
+		req.AccountNo = s.defaultAccountNo
+	}
+	req.AccountNo = s.resolveAccountAlias(req.AccountNo)
 	if req.AccountNo == "" {
 		req.AccountNo = s.defaultAccountNo
 	}
@@ -516,6 +566,76 @@ func (s *OrderService) ensureLoanPackage(ctx context.Context, req *OrderRequest)
 		"type":          selected.Type,
 	})
 	return nil
+}
+
+func (s *OrderService) resolveAccountAliases(accounts []string) []string {
+	out := make([]string, 0, len(accounts))
+	seen := make(map[string]struct{}, len(accounts))
+	add := func(account string) {
+		if account == "" {
+			return
+		}
+		key := strings.ToUpper(account)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, account)
+	}
+	for _, account := range accounts {
+		resolved := s.resolveAccountAlias(account)
+		if resolved == "" {
+			continue
+		}
+		add(resolved)
+	}
+	return out
+}
+
+func (s *OrderService) resolveAccountAlias(accountNo string) string {
+	accountNo = strings.TrimSpace(accountNo)
+	if accountNo == "" {
+		return ""
+	}
+	upper := strings.ToUpper(accountNo)
+	defaultUpper := strings.ToUpper(strings.TrimSpace(s.defaultAccountNo))
+	if isVirtualEntradeAccount(accountNo) && !strings.HasPrefix(defaultUpper, "ENTRADE_") {
+		s.log(context.Background(), "info", "order_account_alias_ignored", map[string]any{
+			"accountNo":        upper,
+			"defaultAccountNo": s.defaultAccountNo,
+			"reason":           "virtual entrade alias received while DNSE is the active trading provider",
+		})
+		return ""
+	}
+	return accountNo
+}
+
+func isVirtualEntradeAccount(accountNo string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(accountNo))
+	return upper == "ENTRADE_DEMO" || upper == "ENTRADE_REAL"
+}
+
+func (s *OrderService) fillPriceFromRealtime(ctx context.Context, req *OrderRequest) {
+	if req == nil || req.Price > 0 {
+		return
+	}
+	s.mu.Lock()
+	resolve := s.priceResolver
+	s.mu.Unlock()
+	if resolve == nil {
+		return
+	}
+	price, ok := resolve(req.Symbol, req.Side)
+	if !ok || price <= 0 {
+		return
+	}
+	req.Price = price
+	s.log(ctx, "info", "order_price_filled_from_realtime", map[string]any{
+		"symbol": req.Symbol,
+		"side":   req.Side,
+		"price":  price,
+		"source": req.Source,
+	})
 }
 
 func (s *OrderService) checkPositionLimit(ctx context.Context, req OrderRequest) error {

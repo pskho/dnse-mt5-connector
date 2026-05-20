@@ -377,7 +377,9 @@ func (s *SQLiteStore) LoadTickerMetadata(ctx context.Context) ([]TickerMetadataR
 func (s *SQLiteStore) GetTickerMetadataBySymbol(ctx context.Context, symbol string) (TickerMetadataRecord, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT symbol, feed_symbol, exchange, type, board_id, name, description, raw_json, updated_at
 		FROM ticker_metadata
-		WHERE symbol = ?`, symbol)
+		WHERE symbol = ? OR feed_symbol = ?
+		ORDER BY CASE WHEN symbol = ? THEN 0 ELSE 1 END
+		LIMIT 1`, symbol, symbol, symbol)
 	var record TickerMetadataRecord
 	var updatedAt string
 	err := row.Scan(&record.Symbol, &record.FeedSymbol, &record.Exchange, &record.Type, &record.BoardID, &record.Name, &record.Description, &record.RawJSON, &updatedAt)

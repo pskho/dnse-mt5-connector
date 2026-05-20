@@ -119,15 +119,20 @@ func main() {
 	positionClient := service.PositionClient(dnseClient)
 	defaultTradingAccountNo := cfg.DNSE.AccountNo
 	defaultPositionAccountNo := cfg.DNSE.AccountNo
+	routeManager := service.NewTradingRouteManager(cfg.Trading)
 	if cfg.Entrade.Enabled {
 		entradeClient := entrade.NewClient(cfg.Entrade, appLog)
-		tradingClient = entradeClient
-		positionClient = entradeClient
-		defaultTradingAccountNo = strings.Join(cfg.Entrade.DefaultAccountNos, ",")
+		routedClient := service.NewRoutedTradingClient(dnseClient, entradeClient)
+		tradingClient = routedClient
+		positionClient = routedClient
+		defaultTradingAccountNo = cfg.DNSE.AccountNo
+		if defaultTradingAccountNo == "" {
+			defaultTradingAccountNo = strings.Join(cfg.Entrade.DefaultAccountNos, ",")
+		}
 		if defaultTradingAccountNo == "" {
 			defaultTradingAccountNo = cfg.Entrade.AccountNo
 		}
-		defaultPositionAccountNo = ""
+		defaultPositionAccountNo = cfg.DNSE.AccountNo
 		if len(cfg.Entrade.DefaultAccountNos) > 0 {
 			defaultPositionAccountNo = cfg.Entrade.DefaultAccountNos[0]
 		}
@@ -143,7 +148,7 @@ func main() {
 		appLog.Info("trading_provider_selected", map[string]any{"provider": "dnse"})
 	}
 	positionService := service.NewPositionService(positionClient, appLog, defaultPositionAccountNo)
-	orderService := service.NewOrderService(store, tradingClient, riskEngine, appLog, defaultTradingAccountNo, positionService, cfg.Risk.MaxOpenPosition)
+	orderService := service.NewOrderService(store, tradingClient, riskEngine, appLog, defaultTradingAccountNo, positionService, cfg.Risk.MaxOpenPosition, routeManager)
 	signalService := service.NewSignalService(orderService, appLog)
 	symbolCatalogService := service.NewSymbolCatalogService(appLog, "", instrumentCatalogAdapter{client: dnseClient}, instrumentCatalogAdapter{client: dnseClient}, store)
 	historyService := marketdata.NewHistoryService(cfg.History, dnseClient, store, appLog)
@@ -157,6 +162,29 @@ func main() {
 	dnseClient.SetOTPFetcher(otpService)
 
 	marketDataEngine := marketdata.NewEngine(cfg.MarketData, cfg.DNSE.APIKey, cfg.DNSE.APISecret, dnseClient, symbolCatalogService, historyService, appLog)
+	orderService.SetPriceResolver(func(symbol, side string) (float64, bool) {
+		tick, ok := marketDataEngine.LatestTick(symbol)
+		if !ok {
+			return 0, false
+		}
+		side = strings.ToUpper(strings.TrimSpace(side))
+		if side == "BUY" && tick.Ask > 0 {
+			return tick.Ask, true
+		}
+		if side == "SELL" && tick.Bid > 0 {
+			return tick.Bid, true
+		}
+		if tick.Last > 0 {
+			return tick.Last, true
+		}
+		if tick.Ask > 0 {
+			return tick.Ask, true
+		}
+		if tick.Bid > 0 {
+			return tick.Bid, true
+		}
+		return 0, false
+	})
 	handler := api.NewHandler(orderService, positionService, signalService, symbolCatalogService, marketDataEngine.Profiles(), marketDataEngine, dnseClient, historyService, otpService, appLog, telemetryClient)
 	marketDataEngine.Start(appCtx)
 

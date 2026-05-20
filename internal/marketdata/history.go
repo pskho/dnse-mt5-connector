@@ -272,11 +272,13 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 			if loadErr == nil && cacheRecordsCompleteForRange(cached, resolution, fromMS, toMS, sessionPolicy) {
 				stagedCandles := recordsToCandles(cached)
 				stagedCandles = fillTradingSessionGapsForRangeIfNeeded(symbol, marketType, resolution, fromMS, toMS, stagedCandles, sessionPolicy)
-				s.replaceStagedCandles(HistoryKey{
+				key := HistoryKey{
 					Symbol:     symbol,
 					MarketType: marketType,
 					Resolution: resolution,
-				}, stagedCandles)
+				}
+				s.replaceStagedCandles(key, stagedCandles)
+				s.cloneTickerAliasSnapshots(ctx, key)
 				status := "completed_cached"
 				message := "History loaded from local cache"
 				if opt.BeforeToday {
@@ -397,11 +399,13 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 		}
 	}
 
-	s.replaceStagedCandles(HistoryKey{
+	key := HistoryKey{
 		Symbol:     symbol,
 		MarketType: marketType,
 		Resolution: resolution,
-	}, stagedCandles)
+	}
+	s.replaceStagedCandles(key, stagedCandles)
+	s.cloneTickerAliasSnapshots(ctx, key)
 
 	status := "completed_incremental"
 	message := "Sync completed"
@@ -436,6 +440,23 @@ func (s *HistoryService) replaceStagedCandles(key HistoryKey, stagedCandles []Hi
 		}
 	}
 	s.mu.Unlock()
+}
+
+func (s *HistoryService) cloneTickerAliasSnapshots(ctx context.Context, key HistoryKey) {
+	if s == nil || s.tickers == nil {
+		return
+	}
+	record, err := s.tickers.GetTickerMetadataBySymbol(ctx, key.Symbol)
+	if err != nil {
+		return
+	}
+	for _, alias := range []string{record.Symbol, record.FeedSymbol} {
+		alias = strings.ToUpper(strings.TrimSpace(alias))
+		if alias == "" || strings.EqualFold(alias, key.Symbol) {
+			continue
+		}
+		s.CloneSnapshot(key.Symbol, alias, key.MarketType, key.Resolution)
+	}
 }
 
 func (s *HistoryService) Candles() []HistoryCandle {

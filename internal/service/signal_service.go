@@ -22,6 +22,8 @@ type SignalRequest struct {
 	Action        string   `json:"action,omitempty"`
 	AccountNo     string   `json:"accountNo,omitempty"`
 	AccountNos    []string `json:"accountNos,omitempty"`
+	Source        string   `json:"source,omitempty"`
+	RouteGroupID  string   `json:"routeGroupId,omitempty"`
 	Symbol        string   `json:"symbol"`
 	Side          string   `json:"side"`
 	Quantity      int      `json:"quantity"`
@@ -38,6 +40,8 @@ type Signal struct {
 	Action        string    `json:"action"`
 	AccountNo     string    `json:"accountNo,omitempty"`
 	AccountNos    []string  `json:"accountNos,omitempty"`
+	Source        string    `json:"source,omitempty"`
+	RouteGroupID  string    `json:"routeGroupId,omitempty"`
 	Symbol        string    `json:"symbol"`
 	Side          string    `json:"side"`
 	Quantity      int       `json:"quantity"`
@@ -48,8 +52,15 @@ type Signal struct {
 }
 
 type SignalResponse struct {
-	SignalID  string    `json:"signalId"`
-	ExpiresAt time.Time `json:"expiresAt"`
+	SignalID      string    `json:"signalId"`
+	ExpiresAt     time.Time `json:"expiresAt"`
+	Mode          string    `json:"mode,omitempty"`
+	AutoSubmitted bool      `json:"autoSubmitted,omitempty"`
+	ClientOrderID string    `json:"clientOrderId,omitempty"`
+	OrderID       string    `json:"orderId,omitempty"`
+	Status        string    `json:"status,omitempty"`
+	Message       string    `json:"message,omitempty"`
+	CloseResults  any       `json:"closeResults,omitempty"`
 }
 
 type ConfirmRequest struct {
@@ -104,6 +115,8 @@ func (s *SignalService) Receive(ctx context.Context, req SignalRequest) (SignalR
 		Action:        normalized.Action,
 		AccountNo:     normalized.AccountNo,
 		AccountNos:    normalized.AccountNos,
+		Source:        normalized.Source,
+		RouteGroupID:  normalized.RouteGroupID,
 		Symbol:        normalized.Symbol,
 		Side:          normalized.Side,
 		Quantity:      normalized.Quantity,
@@ -133,25 +146,35 @@ func (s *SignalService) Receive(ctx context.Context, req SignalRequest) (SignalR
 	s.mu.Unlock()
 
 	s.log("info", "signal_received", map[string]any{"signal": signal, "mode": mode})
+	response := SignalResponse{SignalID: signal.ID, ExpiresAt: signal.ExpiresAt, Mode: mode}
 	if mode == ModeAuto {
 		if normalized.Action == "CLOSE_DEAL" {
 			resp, err := s.orders.CloseDeals(ctx, CloseDealRequest{
-				AccountNo:  signal.AccountNo,
-				AccountNos: signal.AccountNos,
-				Symbol:     signal.Symbol,
-				OrderType:  signal.OrderType,
+				AccountNo:    signal.AccountNo,
+				AccountNos:   signal.AccountNos,
+				Source:       signal.Source,
+				RouteGroupID: signal.RouteGroupID,
+				Symbol:       signal.Symbol,
+				OrderType:    signal.OrderType,
 			})
 			if err != nil {
 				s.log("error", "signal_auto_close_deal_failed", map[string]any{"signalId": signal.ID, "error": err.Error(), "signal": signal})
 				return SignalResponse{}, err
 			}
 			s.log("info", "signal_auto_close_deal_submitted", map[string]any{"signalId": signal.ID, "results": resp})
-			return SignalResponse{SignalID: signal.ID, ExpiresAt: signal.ExpiresAt}, nil
+			response.AutoSubmitted = true
+			response.Status = "CLOSE_DEAL_SUBMITTED"
+			response.Message = "close deal submitted"
+			response.CloseResults = resp
+			return response, nil
 		}
+		clientOrderID := "signal-" + signal.ID
 		orderReq := OrderRequest{
-			ClientOrderID: "signal-" + signal.ID,
+			ClientOrderID: clientOrderID,
 			AccountNo:     signal.AccountNo,
 			AccountNos:    signal.AccountNos,
+			Source:        signal.Source,
+			RouteGroupID:  signal.RouteGroupID,
 			Symbol:        signal.Symbol,
 			Side:          signal.Side,
 			Quantity:      signal.Quantity,
@@ -166,8 +189,13 @@ func (s *SignalService) Receive(ctx context.Context, req SignalRequest) (SignalR
 			return SignalResponse{}, err
 		}
 		s.log("info", "signal_auto_order_submitted", map[string]any{"signalId": signal.ID, "orderId": resp.OrderID, "status": resp.Status})
+		response.AutoSubmitted = true
+		response.ClientOrderID = clientOrderID
+		response.OrderID = resp.OrderID
+		response.Status = resp.Status
+		response.Message = resp.Message
 	}
-	return SignalResponse{SignalID: signal.ID, ExpiresAt: signal.ExpiresAt}, nil
+	return response, nil
 }
 
 func (s *SignalService) Confirm(ctx context.Context, signalID string) (OrderResponse, error) {
@@ -195,6 +223,8 @@ func (s *SignalService) Confirm(ctx context.Context, signalID string) (OrderResp
 		ClientOrderID: "signal-" + signal.ID,
 		AccountNo:     signal.AccountNo,
 		AccountNos:    signal.AccountNos,
+		Source:        signal.Source,
+		RouteGroupID:  signal.RouteGroupID,
 		Symbol:        signal.Symbol,
 		Side:          signal.Side,
 		Quantity:      signal.Quantity,
@@ -205,10 +235,12 @@ func (s *SignalService) Confirm(ctx context.Context, signalID string) (OrderResp
 	}
 	if signal.Action == "CLOSE_DEAL" {
 		results, err := s.orders.CloseDeals(ctx, CloseDealRequest{
-			AccountNo:  signal.AccountNo,
-			AccountNos: signal.AccountNos,
-			Symbol:     signal.Symbol,
-			OrderType:  signal.OrderType,
+			AccountNo:    signal.AccountNo,
+			AccountNos:   signal.AccountNos,
+			Source:       signal.Source,
+			RouteGroupID: signal.RouteGroupID,
+			Symbol:       signal.Symbol,
+			OrderType:    signal.OrderType,
 		})
 		if err != nil {
 			s.log("error", "signal_close_deal_failed", map[string]any{"signalId": signalID, "error": err.Error(), "signal": signal})
@@ -334,6 +366,11 @@ func normalizeSignal(req SignalRequest) (SignalRequest, error) {
 	req.Action = strings.ToUpper(strings.TrimSpace(req.Action))
 	req.AccountNo = strings.TrimSpace(req.AccountNo)
 	req.AccountNos = normalizeAccountList(req.AccountNos)
+	req.Source = normalizeSource(req.Source)
+	if req.Source == "" {
+		req.Source = SourceSignalAPI
+	}
+	req.RouteGroupID = normalizeGroupID(req.RouteGroupID)
 	req.Symbol = strings.ToUpper(strings.TrimSpace(req.Symbol))
 	req.Side = strings.ToUpper(strings.TrimSpace(req.Side))
 	req.OrderType = strings.ToUpper(strings.TrimSpace(req.OrderType))
