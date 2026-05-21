@@ -199,6 +199,7 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 	if symbol == "" {
 		symbol = strings.ToUpper(strings.TrimSpace(s.cfg.Symbol))
 	}
+	fetchSymbol := s.resolveHistoryFetchSymbol(ctx, symbol)
 	marketType := strings.ToUpper(strings.TrimSpace(opt.MarketType))
 	if marketType == "" {
 		marketType = strings.ToUpper(strings.TrimSpace(s.cfg.MarketType))
@@ -228,16 +229,16 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 			to = endOfYesterday
 			statusLabel = "history_sync_backfill_before_today"
 		}
-		s.logger.Info(statusLabel, map[string]any{"days": lookbackDays, "symbol": symbol, "marketType": marketType, "resolution": resolution, "to": to})
+		s.logger.Info(statusLabel, map[string]any{"days": lookbackDays, "symbol": symbol, "fetchSymbol": fetchSymbol, "marketType": marketType, "resolution": resolution, "to": to})
 	} else if opt.TodayOnly {
 		from = startOfToday
 		to = now
-		s.logger.Info("history_sync_today", map[string]any{"symbol": symbol, "marketType": marketType, "resolution": resolution, "from": from, "to": to})
+		s.logger.Info("history_sync_today", map[string]any{"symbol": symbol, "fetchSymbol": fetchSymbol, "marketType": marketType, "resolution": resolution, "from": from, "to": to})
 	} else if firstTime == 0 && lastTime == 0 {
 		// No data, full rebuild up to initial lookback
 		from = time.Now().Add(-time.Duration(lookbackDays) * 24 * time.Hour).Unix()
 		to = now
-		s.logger.Info("history_sync_initial", map[string]any{"days": lookbackDays, "symbol": symbol, "marketType": marketType, "resolution": resolution})
+		s.logger.Info("history_sync_initial", map[string]any{"days": lookbackDays, "symbol": symbol, "fetchSymbol": fetchSymbol, "marketType": marketType, "resolution": resolution})
 	} else {
 		if !s.cfg.IncrementalSync {
 			return SyncResult{Success: false, Message: "Incremental sync disabled"}, nil
@@ -251,7 +252,7 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 			s.store.LogHistorySync(ctx, firstTime, lastTime, "skipped_gap_too_large", 0)
 			return SyncResult{Success: false, Message: "Gap too large, skipped"}, nil
 		}
-		s.logger.Info("history_sync_incremental", map[string]any{"from": from, "to": to, "symbol": symbol, "marketType": marketType, "resolution": resolution})
+		s.logger.Info("history_sync_incremental", map[string]any{"from": from, "to": to, "symbol": symbol, "fetchSymbol": fetchSymbol, "marketType": marketType, "resolution": resolution})
 	}
 
 	if opt.BeforeToday && to > endOfYesterday {
@@ -309,9 +310,6 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 
 	totalCandles := 0
 	batchDays := s.cfg.MaxBatchDays
-	if opt.ForceFull && lookbackDays > batchDays {
-		batchDays = lookbackDays
-	}
 	if batchDays <= 0 {
 		batchDays = 30
 	}
@@ -331,7 +329,7 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 		batchAdded := 0
 		pageFrom := currentFrom
 		for page := 0; page < 100 && pageFrom <= currentTo; page++ {
-			raw, err := s.fetchOHLCWithRetry(ctx, symbol, marketType, resolution, pageFrom, currentTo)
+			raw, err := s.fetchOHLCWithRetry(ctx, fetchSymbol, marketType, resolution, pageFrom, currentTo)
 			if err != nil {
 				s.store.LogHistorySync(ctx, firstTime, lastTime, "failed", totalCandles)
 				return SyncResult{Success: false, Message: err.Error()}, err
@@ -457,6 +455,22 @@ func (s *HistoryService) cloneTickerAliasSnapshots(ctx context.Context, key Hist
 		}
 		s.CloneSnapshot(key.Symbol, alias, key.MarketType, key.Resolution)
 	}
+}
+
+func (s *HistoryService) resolveHistoryFetchSymbol(ctx context.Context, symbol string) string {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" || s == nil || s.tickers == nil {
+		return symbol
+	}
+	record, err := s.tickers.GetTickerMetadataBySymbol(ctx, symbol)
+	if err != nil {
+		return symbol
+	}
+	feed := strings.ToUpper(strings.TrimSpace(record.FeedSymbol))
+	if feed == "" {
+		return symbol
+	}
+	return feed
 }
 
 func (s *HistoryService) Candles() []HistoryCandle {

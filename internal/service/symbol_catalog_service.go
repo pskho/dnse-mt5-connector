@@ -305,6 +305,24 @@ func (s *SymbolCatalogService) GetTickerMetadata(ctx context.Context, forceRefre
 			RawJSON:     item.RawJSON,
 		})
 	}
+	if derivatives, err := s.GetDerivativeSymbols(ctx); err == nil {
+		for _, item := range derivatives {
+			display := strings.ToUpper(strings.TrimSpace(item.Type))
+			feed := strings.ToUpper(strings.TrimSpace(item.Symbol))
+			if display == "" || feed == "" {
+				continue
+			}
+			records = append(records, storage.TickerMetadataRecord{
+				Symbol:      display,
+				FeedSymbol:  feed,
+				Exchange:    "DERIVATIVE",
+				Type:        "DERIVATIVE",
+				BoardID:     "G1",
+				Name:        display,
+				Description: display,
+			})
+		}
+	}
 	records = mergeDefaultTickerMetadata(records)
 	if s.store != nil {
 		if err := s.store.UpsertTickerMetadata(ctx, records); err != nil {

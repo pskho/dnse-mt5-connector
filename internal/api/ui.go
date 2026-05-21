@@ -207,51 +207,6 @@ const indexHTML = layoutTop + `
     </section>
 
     <section class="card dashboard-section">
-      <h2>Nạp dữ liệu cho MT5</h2>
-      <div class="grid">
-        <div class="form-group">
-          <label>Phạm vi nạp</label>
-          <select id="mt5HistoryScope">
-            <option value="single">Một mã</option>
-            <option value="all">Tất cả mã đã chọn</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Mã</label>
-          <input id="mt5HistorySymbol" value="VN30F1M">
-        </div>
-        <div class="form-group">
-          <label>Loại thị trường</label>
-          <select id="mt5HistoryMarketType">
-            <option value="DERIVATIVE">DERIVATIVE</option>
-            <option value="STOCK">STOCK</option>
-            <option value="INDEX">INDEX</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Khung dữ liệu</label>
-          <select id="mt5HistoryResolution">
-            <option value="1">M1</option>
-            <option value="5">M5</option>
-            <option value="15">M15</option>
-            <option value="30">M30</option>
-            <option value="60">H1</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Số ngày lấy lùi</label>
-          <input id="mt5LookbackDays" type="number" value="365" min="1">
-        </div>
-      </div>
-      <div class="actions">
-        <button class="btn" onclick="primeMT5History('single')">Nạp mã này cho MT5</button>
-        <button class="btn secondary" onclick="primeMT5History('all')">Nạp tất cả mã đã chọn</button>
-        <button class="btn secondary" onclick="syncHistory()">Chỉ nạp phần hôm nay</button>
-      </div>
-      <div class="inline-note">Luồng này dựng dữ liệu nền cho MT5, bao gồm lịch sử các ngày trước và dữ liệu trong ngày tới thời điểm hiện tại. Khi MT5 đang mở, bridge sẽ nhận snapshot mới và import lại vào custom symbol.</div>
-    </section>
-
-    <section class="card dashboard-section">
       <h2>Sức mua (PPSE)</h2>
       <div class="grid">
         <div class="form-group">

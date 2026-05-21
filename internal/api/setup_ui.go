@@ -221,6 +221,7 @@ const layoutTop = `<!DOCTYPE html>
     <a href="/" id="nav-dash">Bảng điều khiển</a>
     <a href="/setup" id="nav-setup">Bắt đầu sử dụng</a>
     <a href="/status" id="nav-status">Trạng thái hệ thống</a>
+    <a href="/price-data" id="nav-price-data">Dữ liệu giá</a>
     <a href="/settings" id="nav-settings">Cấu hình</a>
     <a href="/logs" id="nav-logs">Nhật ký</a>
     <div style="margin-top:auto; padding:20px;">
@@ -237,6 +238,7 @@ const layoutBottom = `
     if(path === '/') document.getElementById('nav-dash').classList.add('active');
     else if(path.startsWith('/setup')) document.getElementById('nav-setup').classList.add('active');
     else if(path.startsWith('/status')) document.getElementById('nav-status').classList.add('active');
+    else if(path.startsWith('/price-data')) document.getElementById('nav-price-data').classList.add('active');
     else if(path.startsWith('/settings')) document.getElementById('nav-settings').classList.add('active');
     else if(path.startsWith('/logs')) document.getElementById('nav-logs').classList.add('active');
   </script>
@@ -601,12 +603,40 @@ const settingsHTML = layoutTop + `
       }[ch]));
     }
 
-    function entradeAccounts() {
-      return (currentEntrade && Array.isArray(currentEntrade.accounts)) ? currentEntrade.accounts : [];
-    }
-
     function entradeDefaultSet() {
       return new Set(((currentEntrade && currentEntrade.defaultAccountNos) || []).map((value) => String(value || '').trim().toUpperCase()).filter(Boolean));
+    }
+
+    function entradeAccounts() {
+      const accounts = (currentEntrade && Array.isArray(currentEntrade.accounts)) ? currentEntrade.accounts.slice() : [];
+      const hasDemo = accounts.some((account) => String(account.id || '').toUpperCase() === 'ENTRADE_DEMO');
+      if (!hasDemo && entradeDefaultSet().has('ENTRADE_DEMO')) {
+        accounts.unshift({ id: 'ENTRADE_DEMO', environment: 'paper', enabled: true });
+      }
+      return accounts.sort((a, b) => entradeSortKey(a).localeCompare(entradeSortKey(b)));
+    }
+
+    function entradeEnvironment(account) {
+      const id = String((account && account.id) || '').toUpperCase();
+      const env = String((account && account.environment) || '').toLowerCase();
+      if (id === 'ENTRADE_DEMO' || env === 'paper' || env === 'demo') return 'paper';
+      return 'real';
+    }
+
+    function entradeTypeLabel(account) {
+      return entradeEnvironment(account) === 'paper' ? 'Entrade Demo' : 'Entrade Real';
+    }
+
+    function entradeSortKey(account) {
+      const env = entradeEnvironment(account) === 'paper' ? '0' : '1';
+      return env + '-' + String((account && account.id) || '');
+    }
+
+    function entradeOrderLabel(account) {
+      const id = String((account && account.id) || '').toUpperCase();
+      if (entradeEnvironment(account) === 'paper') return 'Entrade Demo (' + id + ')';
+      const accountNo = String((account && account.accountNo) || '').trim();
+      return 'Entrade Real ' + (accountNo || id);
     }
 
     async function loadDNSEAccounts() {
@@ -675,11 +705,15 @@ const settingsHTML = layoutTop + `
         const id = String(account.id || '').toUpperCase();
         const inGroup = defaults.has(id);
         const loanID = Number(account.loanPackageId || 0);
+        const typeLabel = entradeTypeLabel(account);
+        const envCode = entradeEnvironment(account) === 'paper' ? 'DEMO' : 'REAL';
         return '<div class="account-row">' +
           '<div class="account-head">' +
             '<div>' +
               '<div style="font-weight:700">' + escapeHtml(id) + (account.enabled === false ? ' <span class="muted">(đang tắt)</span>' : '') + '</div>' +
               '<div class="account-meta">' +
+                'Loại tài khoản: <code>' + escapeHtml(typeLabel) + '</code><br>' +
+                'Môi trường: <code>' + escapeHtml(envCode) + '</code><br>' +
                 'Username: <code>' + escapeHtml(account.username) + '</code><br>' +
                 'InvestorId: <code>' + escapeHtml(account.investorId || '-') + '</code><br>' +
                 'Master account: <code>' + escapeHtml(account.accountNo || '-') + '</code><br>' +
@@ -724,7 +758,7 @@ const settingsHTML = layoutTop + `
       if (dnseAccount) out.push({ id: dnseAccount, label: 'DNSE ' + dnseAccount });
       entradeAccounts().forEach((account) => {
         const id = String(account.id || '').toUpperCase();
-        if (id) out.push({ id, label: id + ' / Entrade' });
+        if (id) out.push({ id, label: entradeOrderLabel(account) });
       });
       return out;
     }
@@ -741,6 +775,13 @@ const settingsHTML = layoutTop + `
       }
       const entradeDefaults = Array.from(entradeDefaultSet());
       if (entradeDefaults.length) {
+        if (entradeDefaults.some((account) => String(account || '').toUpperCase() === 'ENTRADE_DEMO')) {
+          groups.push({
+            id: 'entrade-demo', name: 'Entrade Demo', enabled: true, accountNos: ['ENTRADE_DEMO'],
+            defaultQuantity: 1, maxQuantity: 1, orderType: 'MTL', marketType: 'DERIVATIVE', orderCategory: 'NORMAL',
+            allowBuy: true, allowSell: true, symbols: ['VN30F1M']
+          });
+        }
         groups.push({
           id: 'entrade-default', name: 'Entrade mặc định', enabled: true, accountNos: entradeDefaults,
           defaultQuantity: 1, maxQuantity: 1, orderType: 'MTL', marketType: 'DERIVATIVE', orderCategory: 'NORMAL',

@@ -740,6 +740,13 @@ func defaultTradingConfig(dnseAccount string, entradeDefaults []string) TradingC
 	}
 	entradeAccounts := normalizeAccountNos(entradeDefaults)
 	if len(entradeAccounts) > 0 {
+		if hasEntradeDemo(entradeAccounts) {
+			groups = append(groups, ExecutionGroupConfig{
+				ID: "entrade-demo", Name: "Entrade Demo", Enabled: true, AccountNos: []string{"ENTRADE_DEMO"},
+				DefaultQuantity: 1, MaxQuantity: 1, OrderType: "MTL", MarketType: "DERIVATIVE", OrderCategory: "NORMAL", AllowBuy: true, AllowSell: true,
+				Symbols: []string{"VN30F1M"},
+			})
+		}
 		groups = append(groups, ExecutionGroupConfig{
 			ID: "entrade-default", Name: "Entrade mặc định", Enabled: true, AccountNos: entradeAccounts,
 			DefaultQuantity: 1, MaxQuantity: 1, OrderType: "MTL", MarketType: "DERIVATIVE", OrderCategory: "NORMAL", AllowBuy: true, AllowSell: true,
@@ -747,6 +754,9 @@ func defaultTradingConfig(dnseAccount string, entradeDefaults []string) TradingC
 		})
 	}
 	defaultRoute := "dnse-main"
+	if defaultRoute == "dnse-main" && strings.TrimSpace(dnseAccount) == "" && hasEntradeDemo(entradeAccounts) {
+		defaultRoute = "entrade-demo"
+	}
 	if defaultRoute == "dnse-main" && strings.TrimSpace(dnseAccount) == "" && len(entradeAccounts) > 0 {
 		defaultRoute = "entrade-default"
 	}
@@ -755,7 +765,7 @@ func defaultTradingConfig(dnseAccount string, entradeDefaults []string) TradingC
 		Routes: TradingRoutesConfig{
 			Dashboard:  defaultRoute,
 			MT5Manual:  defaultRoute,
-			SuperTrend: "entrade-default",
+			SuperTrend: defaultRoute,
 			SignalAPI:  defaultRoute,
 			OrderAPI:   defaultRoute,
 		},
@@ -810,6 +820,15 @@ func normalizeTradingConfig(in TradingConfig, dnseAccount string, entradeDefault
 		}
 		out = append(out, group)
 	}
+	if _, ok := seen["entrade-demo"]; !ok && hasEntradeDemo(entradeDefaults) {
+		group := ExecutionGroupConfig{
+			ID: "entrade-demo", Name: "Entrade Demo", Enabled: true, AccountNos: []string{"ENTRADE_DEMO"},
+			DefaultQuantity: 1, MaxQuantity: 1, OrderType: "MTL", MarketType: "DERIVATIVE", OrderCategory: "NORMAL", AllowBuy: true, AllowSell: true,
+			Symbols: []string{"VN30F1M"},
+		}
+		seen[group.ID] = struct{}{}
+		out = append([]ExecutionGroupConfig{group}, out...)
+	}
 	in.Groups = out
 	if len(in.Groups) == 0 {
 		in = defaultTradingConfig(dnseAccount, entradeDefaults)
@@ -831,7 +850,50 @@ func normalizeTradingConfig(in TradingConfig, dnseAccount string, entradeDefault
 	in.Routes.SuperTrend = ensureRoute(in.Routes.SuperTrend)
 	in.Routes.SignalAPI = ensureRoute(in.Routes.SignalAPI)
 	in.Routes.OrderAPI = ensureRoute(in.Routes.OrderAPI)
+	if hasGroup(in.Groups, "entrade-demo") && isMixedEntradeDemoRoute(in.Groups, in.Routes.MT5Manual) {
+		in.Routes.MT5Manual = "entrade-demo"
+	}
 	return in
+}
+
+func hasEntradeDemo(accounts []string) bool {
+	for _, account := range accounts {
+		if strings.EqualFold(strings.TrimSpace(account), "ENTRADE_DEMO") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasGroup(groups []ExecutionGroupConfig, id string) bool {
+	id = normalizeRouteID(id)
+	for _, group := range groups {
+		if normalizeRouteID(group.ID) == id {
+			return true
+		}
+	}
+	return false
+}
+
+func isMixedEntradeDemoRoute(groups []ExecutionGroupConfig, routeID string) bool {
+	routeID = normalizeRouteID(routeID)
+	for _, group := range groups {
+		if normalizeRouteID(group.ID) != routeID {
+			continue
+		}
+		hasDemo := false
+		hasOtherEntrade := false
+		for _, account := range group.AccountNos {
+			account = strings.ToUpper(strings.TrimSpace(account))
+			if account == "ENTRADE_DEMO" {
+				hasDemo = true
+			} else if strings.HasPrefix(account, "ENTRADE_") {
+				hasOtherEntrade = true
+			}
+		}
+		return hasDemo && hasOtherEntrade
+	}
+	return false
 }
 
 func normalizeRouteID(value string) string {
@@ -1035,7 +1097,7 @@ func normalizeEntradeAccounts(cfg EntradeConfig) []EntradeAccountConfig {
 		if account.InvestorID == "" {
 			account.InvestorID = cfg.InvestorID
 		}
-		if account.AccountNo == "" {
+		if account.AccountNo == "" && !isVirtualEntradeProfile(account.ID) {
 			account.AccountNo = cfg.AccountNo
 		}
 		if account.TradingToken == "" {
@@ -1056,10 +1118,15 @@ func normalizeEntradeAccounts(cfg EntradeConfig) []EntradeAccountConfig {
 			add(account)
 		}
 	}
-	if len(accounts) == 0 && strings.TrimSpace(cfg.Username) != "" {
+	if hasEntradeDemo(cfg.DefaultAccountNos) || (len(accounts) == 0 && strings.TrimSpace(cfg.Username) != "") {
 		add(EntradeAccountConfig{ID: "ENTRADE_DEMO", Environment: "paper", Enabled: true})
 	}
 	return accounts
+}
+
+func isVirtualEntradeProfile(id string) bool {
+	id = strings.ToUpper(strings.TrimSpace(id))
+	return id == "ENTRADE_DEMO" || id == "ENTRADE_REAL"
 }
 
 func sameEntradeProfile(a, b EntradeAccountConfig) bool {

@@ -117,6 +117,7 @@ func (h *Handler) Routes() http.Handler {
 	// UI Routes
 	mux.HandleFunc("/setup", h.setupUI)
 	mux.HandleFunc("/settings", h.settingsUI)
+	mux.HandleFunc("/price-data", h.priceDataUI)
 	mux.HandleFunc("/logs", h.logsUI)
 	mux.HandleFunc("/api/settings", h.settingsAPI)
 	mux.HandleFunc("/api/entrade/link", h.entradeLinkAPI)
@@ -191,11 +192,15 @@ func (h *Handler) order(w http.ResponseWriter, r *http.Request) {
 			"error_kind":    classifyError(err),
 			"source":        "direct",
 		}))
-		writeJSON(w, status, map[string]any{
+		payload := map[string]any{
 			"success": err == nil,
 			"orders":  responses,
 			"error":   errorString(err),
-		})
+		}
+		if hint := orderErrorHint(err, responses); hint != "" {
+			payload["hint"] = hint
+		}
+		writeJSON(w, status, payload)
 		return
 	}
 	resp, err := h.orders.PlaceOrder(r.Context(), req)
@@ -205,7 +210,11 @@ func (h *Handler) order(w http.ResponseWriter, r *http.Request) {
 			"error_kind": classifyError(err),
 			"source":     "direct",
 		}))
-		writeJSON(w, http.StatusBadRequest, errorResponse{Success: false, Error: err.Error()})
+		payload := map[string]any{"success": false, "error": err.Error()}
+		if hint := orderErrorHint(err, nil); hint != "" {
+			payload["hint"] = hint
+		}
+		writeJSON(w, http.StatusBadRequest, payload)
 		return
 	}
 	h.track(r.Context(), "order_result", orderParams(req, map[string]any{
@@ -1141,6 +1150,23 @@ func countSuccessfulOrders(responses []service.OrderResponse) int {
 	return count
 }
 
+func orderErrorHint(err error, responses []service.OrderResponse) string {
+	text := strings.ToLower(errorString(err))
+	for _, resp := range responses {
+		text += " " + strings.ToLower(resp.Message)
+	}
+	switch {
+	case strings.Contains(text, "account_purchase_power_not_enough") || strings.Contains(text, "purchase power is not enough"):
+		return "Tai khoan trong nhom dat lenh khong du suc mua. Hay chon nhom Entrade Demo, giam khoi luong, hoac bo tai khoan that khoi nhom dang gan cho luong nay."
+	case strings.Contains(text, "stock_price_undefined") || strings.Contains(text, "cannot determine stock price"):
+		return "He thong chua xac dinh duoc gia dat lenh. Hay dung MTL khong gui gia, hoac cap nhat gia realtime truoc khi gui lenh."
+	case strings.Contains(text, "account not found"):
+		return "Tai khoan chua dung voi moi truong dang ket noi. Hay lien ket lai tai khoan Entrade/DNSE hoac chon dung nhom Demo/That."
+	default:
+		return ""
+	}
+}
+
 func classifyError(err error) string {
 	if err == nil {
 		return ""
@@ -1149,6 +1175,8 @@ func classifyError(err error) string {
 	switch {
 	case strings.Contains(text, "duplicate"):
 		return "duplicate"
+	case strings.Contains(text, "account_purchase_power_not_enough") || strings.Contains(text, "purchase power is not enough"):
+		return "purchase_power"
 	case strings.Contains(text, "market") && strings.Contains(text, "closed"):
 		return "market_closed"
 	case strings.Contains(text, "loan") || strings.Contains(text, "margin"):
@@ -1183,10 +1211,12 @@ func (h *Handler) historySync(w http.ResponseWriter, r *http.Request) {
 	if svc, ok := h.history.(interface {
 		SyncWithOptions(ctx context.Context, opt marketdata.SyncOptions) (any, error)
 	}); ok {
+		symbol := strings.ToUpper(strings.TrimSpace(req.Symbol))
+		fetchSymbol := h.resolveHistoryFetchSymbol(r.Context(), symbol)
 		result, err := svc.SyncWithOptions(r.Context(), marketdata.SyncOptions{
 			FirstTime:  req.FirstTime,
 			LastTime:   req.LastTime,
-			Symbol:     req.Symbol,
+			Symbol:     fetchSymbol,
 			MarketType: req.MarketType,
 			Resolution: req.Resolution,
 		})
@@ -1195,8 +1225,9 @@ func (h *Handler) historySync(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		h.cloneHistorySnapshot(fetchSymbol, symbol, req.MarketType, req.Resolution)
 		h.track(r.Context(), "history_sync_result", map[string]any{"mode": "range", "success": true, "symbol": req.Symbol, "market_type": req.MarketType})
-		writeJSON(w, http.StatusOK, result)
+		writeJSON(w, http.StatusOK, h.singleHistoryResponse("range", symbol, fetchSymbol, req.MarketType, req.Resolution, result))
 		return
 	}
 	result, err := h.history.Sync(r.Context(), req.FirstTime, req.LastTime)
@@ -1227,10 +1258,12 @@ func (h *Handler) historyFull(w http.ResponseWriter, r *http.Request) {
 	if svc, ok := h.history.(interface {
 		SyncWithOptions(ctx context.Context, opt marketdata.SyncOptions) (any, error)
 	}); ok {
+		symbol := strings.ToUpper(strings.TrimSpace(req.Symbol))
+		fetchSymbol := h.resolveHistoryFetchSymbol(r.Context(), symbol)
 		result, err := svc.SyncWithOptions(r.Context(), marketdata.SyncOptions{
 			ForceFull:    true,
 			LookbackDays: req.LookbackDays,
-			Symbol:       req.Symbol,
+			Symbol:       fetchSymbol,
 			MarketType:   req.MarketType,
 			Resolution:   req.Resolution,
 		})
@@ -1239,8 +1272,9 @@ func (h *Handler) historyFull(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		h.cloneHistorySnapshot(fetchSymbol, symbol, req.MarketType, req.Resolution)
 		h.track(r.Context(), "history_sync_result", map[string]any{"mode": "full", "success": true, "lookback_days": req.LookbackDays, "symbol": req.Symbol, "market_type": req.MarketType})
-		writeJSON(w, http.StatusOK, result)
+		writeJSON(w, http.StatusOK, h.singleHistoryResponse("full", symbol, fetchSymbol, req.MarketType, req.Resolution, result))
 		return
 	}
 	result, err := h.history.FullSync(r.Context(), req.LookbackDays)
@@ -1271,11 +1305,13 @@ func (h *Handler) historyBackfill(w http.ResponseWriter, r *http.Request) {
 	if svc, ok := h.history.(interface {
 		SyncWithOptions(ctx context.Context, opt marketdata.SyncOptions) (any, error)
 	}); ok {
+		symbol := strings.ToUpper(strings.TrimSpace(req.Symbol))
+		fetchSymbol := h.resolveHistoryFetchSymbol(r.Context(), symbol)
 		result, err := svc.SyncWithOptions(r.Context(), marketdata.SyncOptions{
 			ForceFull:    true,
 			BeforeToday:  true,
 			LookbackDays: req.LookbackDays,
-			Symbol:       req.Symbol,
+			Symbol:       fetchSymbol,
 			MarketType:   req.MarketType,
 			Resolution:   req.Resolution,
 		})
@@ -1284,8 +1320,9 @@ func (h *Handler) historyBackfill(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		h.cloneHistorySnapshot(fetchSymbol, symbol, req.MarketType, req.Resolution)
 		h.track(r.Context(), "history_sync_result", map[string]any{"mode": "backfill", "success": true, "lookback_days": req.LookbackDays, "symbol": req.Symbol, "market_type": req.MarketType})
-		writeJSON(w, http.StatusOK, result)
+		writeJSON(w, http.StatusOK, h.singleHistoryResponse("backfill", symbol, fetchSymbol, req.MarketType, req.Resolution, result))
 		return
 	}
 	writeError(w, http.StatusServiceUnavailable, "history backfill is not supported")
@@ -1308,9 +1345,11 @@ func (h *Handler) historyToday(w http.ResponseWriter, r *http.Request) {
 	if svc, ok := h.history.(interface {
 		SyncWithOptions(ctx context.Context, opt marketdata.SyncOptions) (any, error)
 	}); ok {
+		symbol := strings.ToUpper(strings.TrimSpace(req.Symbol))
+		fetchSymbol := h.resolveHistoryFetchSymbol(r.Context(), symbol)
 		result, err := svc.SyncWithOptions(r.Context(), marketdata.SyncOptions{
 			TodayOnly:  true,
-			Symbol:     req.Symbol,
+			Symbol:     fetchSymbol,
 			MarketType: req.MarketType,
 			Resolution: req.Resolution,
 		})
@@ -1319,8 +1358,9 @@ func (h *Handler) historyToday(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		h.cloneHistorySnapshot(fetchSymbol, symbol, req.MarketType, req.Resolution)
 		h.track(r.Context(), "history_sync_result", map[string]any{"mode": "today", "success": true, "symbol": req.Symbol, "market_type": req.MarketType})
-		writeJSON(w, http.StatusOK, result)
+		writeJSON(w, http.StatusOK, h.singleHistoryResponse("today", symbol, fetchSymbol, req.MarketType, req.Resolution, result))
 		return
 	}
 	writeError(w, http.StatusServiceUnavailable, "today sync is not supported")
@@ -1345,7 +1385,8 @@ func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode st
 	}
 
 	var req struct {
-		LookbackDays int `json:"lookbackDays"`
+		LookbackDays int      `json:"lookbackDays"`
+		Symbols      []string `json:"symbols"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "invalid json body")
@@ -1376,7 +1417,16 @@ func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode st
 		lookbackDays = 365
 	}
 
-	results := make([]item, 0, len(h.profiles))
+	profiles := h.profiles
+	if len(req.Symbols) > 0 {
+		profiles = make([]marketdata.SymbolProfile, 0, len(req.Symbols))
+		for _, symbol := range h.canonicalizeSymbols(r.Context(), req.Symbols) {
+			if profile, ok := marketdata.InferSymbolProfile(symbol, nil); ok {
+				profiles = append(profiles, profile)
+			}
+		}
+	}
+	results := make([]item, 0, len(profiles))
 	successCount := 0
 	type syncJob struct {
 		fetchSymbol string
@@ -1385,8 +1435,12 @@ func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode st
 	}
 	jobsByCanonical := make(map[string]*syncJob)
 	order := make([]string, 0, len(h.profiles))
-	for _, profile := range h.profiles {
-		canonical := strings.ToUpper(strings.TrimSpace(profile.Symbol))
+	for _, profile := range profiles {
+		displaySymbol := strings.ToUpper(strings.TrimSpace(profile.Symbol))
+		canonical := h.resolveHistoryFetchSymbol(r.Context(), displaySymbol)
+		if canonical == "" {
+			canonical = displaySymbol
+		}
 		job := jobsByCanonical[canonical]
 		if job == nil {
 			job = &syncJob{
@@ -1404,6 +1458,7 @@ func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode st
 			jobsByCanonical[canonical] = job
 			order = append(order, canonical)
 		}
+		profile.Symbol = displaySymbol
 		job.members = append(job.members, profile)
 	}
 
@@ -1470,6 +1525,72 @@ func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode st
 	})
 }
 
+func (h *Handler) resolveHistoryFetchSymbol(ctx context.Context, symbol string) string {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" || h.symbols == nil {
+		return symbol
+	}
+	feed, ok, err := h.symbols.ResolveMarketFeedSymbol(ctx, symbol)
+	if err != nil || !ok {
+		return symbol
+	}
+	feed = strings.ToUpper(strings.TrimSpace(feed))
+	if feed == "" {
+		return symbol
+	}
+	return feed
+}
+
+func (h *Handler) cloneHistorySnapshot(sourceSymbol, targetSymbol, marketType string, resolution int) {
+	sourceSymbol = strings.ToUpper(strings.TrimSpace(sourceSymbol))
+	targetSymbol = strings.ToUpper(strings.TrimSpace(targetSymbol))
+	if sourceSymbol == "" || targetSymbol == "" || strings.EqualFold(sourceSymbol, targetSymbol) {
+		return
+	}
+	if resolution <= 0 {
+		resolution = 1
+	}
+	marketType = strings.ToUpper(strings.TrimSpace(marketType))
+	if marketType == "" {
+		if profile, ok := marketdata.InferSymbolProfile(targetSymbol, nil); ok {
+			marketType = profile.MarketType
+		}
+	}
+	type historySnapshotCloner interface {
+		CloneSnapshot(sourceSymbol, targetSymbol, marketType string, resolution int) bool
+	}
+	if cloner, ok := h.history.(historySnapshotCloner); ok {
+		cloner.CloneSnapshot(sourceSymbol, targetSymbol, marketType, resolution)
+	}
+}
+
+func (h *Handler) singleHistoryResponse(mode, symbol, fetchSymbol, marketType string, resolution int, result any) map[string]any {
+	if resolution <= 0 {
+		resolution = 1
+	}
+	resp := map[string]any{
+		"success":     true,
+		"mode":        mode,
+		"symbol":      strings.ToUpper(strings.TrimSpace(symbol)),
+		"fetchSymbol": strings.ToUpper(strings.TrimSpace(fetchSymbol)),
+		"marketType":  strings.ToUpper(strings.TrimSpace(marketType)),
+		"resolution":  resolution,
+		"result":      result,
+	}
+	if resp["symbol"] == "" {
+		resp["symbol"] = resp["fetchSymbol"]
+	}
+	if !strings.EqualFold(fmt.Sprint(resp["symbol"]), fmt.Sprint(resp["fetchSymbol"])) {
+		resp["clonedTo"] = resp["symbol"]
+	}
+	if payload, ok := result.(marketdata.SyncResult); ok {
+		resp["success"] = payload.Success
+		resp["message"] = payload.Message
+		resp["candlesSynced"] = payload.CandlesSynced
+	}
+	return resp
+}
+
 func (h *Handler) getLatestOTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1496,6 +1617,11 @@ func (h *Handler) setupUI(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) settingsUI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(settingsHTML))
+}
+
+func (h *Handler) priceDataUI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(priceDataHTML))
 }
 
 func (h *Handler) logsUI(w http.ResponseWriter, r *http.Request) {

@@ -664,11 +664,15 @@ func (c *DNSEClient) do(ctx context.Context, method, path string, payload any, o
 	if status < 200 || status >= 300 {
 		return fmt.Errorf("dnse api returned status %d: %s", status, string(body))
 	}
-	if out == nil || len(body) == 0 {
+	trimmedBody := bytes.TrimSpace(body)
+	if out == nil {
 		return nil
 	}
-	if err := json.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("decode dnse response: %w", err)
+	if len(trimmedBody) == 0 {
+		return fmt.Errorf("dnse api returned empty response for %s %s", method, path)
+	}
+	if err := json.Unmarshal(trimmedBody, out); err != nil {
+		return fmt.Errorf("decode dnse response for %s %s: %w; body=%s", method, path, err, shortenBody(trimmedBody, 240))
 	}
 	return nil
 }
@@ -727,6 +731,14 @@ func (c *DNSEClient) send(ctx context.Context, method, path string, payload any,
 	}
 	c.logger.Info("dnse_api_response", map[string]any{"path": path, "statusCode": resp.StatusCode, "body": string(respBody)})
 	return resp.StatusCode, respBody, nil
+}
+
+func shortenBody(body []byte, limit int) string {
+	text := strings.TrimSpace(string(body))
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "..."
 }
 
 func (c *DNSEClient) fetchTradingToken(ctx context.Context, passcode, otpType string) (string, time.Time, error) {

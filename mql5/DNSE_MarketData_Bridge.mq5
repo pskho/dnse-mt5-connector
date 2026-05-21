@@ -3,7 +3,7 @@
 //| Updates custom symbol VN30F1M_DNSE from DNSEBridge.dll           |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.17"
+#property version   "1.18"
 
 struct MqlRateLite {
    long     time;
@@ -34,8 +34,9 @@ input int    InpHistoryResolution = 1;
 input int    InpTimerMs       = 100;
 input int    InpReconnectSec  = 3;
 input int    InpHistoryTimeoutMs = 30000;
-input int    InpAutoRecentHistoryDays = 0;   // 0=manual only, 1=today, 7=last week
+input int    InpAutoRecentHistoryDays = 1;   // 0=manual only, 1=repair today on start, 7=last week
 input int    InpAutoRecentSyncDelaySec = 15; // wait for realtime before any history backfill
+input bool   InpAutoRecentHistoryAllSymbols = true;
 input bool   InpEnableSignalBridge = false;
 input bool   InpEnableManualTradePanel = true;
 input string InpManualBridgeURL = "http://127.0.0.1:8080";
@@ -686,8 +687,12 @@ int ParseCandlesSynced(string response)
 {
    int start = StringFind(response, "\"candlesSynced\":");
    if(start < 0)
+      start = StringFind(response, "\"successCount\":");
+   if(start < 0)
       return -1;
-   start += 16;
+   start = StringFind(response, ":", start) + 1;
+   if(start <= 0)
+      return -1;
    while(start < StringLen(response))
    {
       ushort ch = StringGetCharacter(response, start);
@@ -716,9 +721,18 @@ bool RequestHistory(bool forceFull, long firstTimeMs, long lastTimeMs, int lookb
    candlesSynced = -1;
    if(forceFull)
    {
-      url = "http://127.0.0.1:8080/history/full";
-      payload = StringFormat("{\"lookbackDays\":%d,\"symbol\":\"%s\",\"marketType\":\"%s\",\"resolution\":%d}", lookbackDays, InpSourceSymbol, InpHistoryMarketType, InpHistoryResolution);
-      PrintFormat("DNSE bridge: Triggering history backfill for %d day(s)...", lookbackDays);
+      if(InpAutoRecentHistoryAllSymbols)
+      {
+         url = "http://127.0.0.1:8080/history/full-all";
+         payload = StringFormat("{\"lookbackDays\":%d}", lookbackDays);
+         PrintFormat("DNSE bridge: Triggering history backfill for all tracked symbols, %d day(s)...", lookbackDays);
+      }
+      else
+      {
+         url = "http://127.0.0.1:8080/history/full";
+         payload = StringFormat("{\"lookbackDays\":%d,\"symbol\":\"%s\",\"marketType\":\"%s\",\"resolution\":%d}", lookbackDays, InpSourceSymbol, InpHistoryMarketType, InpHistoryResolution);
+         PrintFormat("DNSE bridge: Triggering history backfill for %d day(s)...", lookbackDays);
+      }
    }
    else
    {
@@ -758,7 +772,7 @@ bool RequestHistory(bool forceFull, long firstTimeMs, long lastTimeMs, int lookb
 
 void MaybeBackfillRecentHistory()
 {
-   if(!g_first_tick_seen || g_recent_history_done || InpAutoRecentHistoryDays <= 0)
+   if(g_recent_history_done || InpAutoRecentHistoryDays <= 0)
       return;
    if(TimeCurrent() < g_recent_history_not_before || TimeCurrent() < g_recent_history_retry_after)
       return;
@@ -766,10 +780,10 @@ void MaybeBackfillRecentHistory()
    int candlesSynced = -1;
    if(RequestHistory(true, 0, 0, InpAutoRecentHistoryDays, candlesSynced))
    {
-      if(candlesSynced > 0)
+      if(candlesSynced != 0)
       {
          RefreshBridgeHistory();
-         int imported = ImportHistoricalRates();
+         int imported = ImportReadyHistoryForAll();
          if(imported > 0)
          {
             g_recent_history_done = true;
@@ -811,16 +825,47 @@ void UpdateRealtimeStatus(bool connected, long timestamp_ms, double last)
 void RefreshBridgeHistory()
 {
    Print("DNSE bridge: Refreshing DLL bridge to import staged history.");
-   DisconnectBridge(InpSourceSymbol);
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+      DisconnectBridge(g_symbols[i]);
    Sleep(300);
    g_last_reconnect = 0;
-   TryConnect();
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+      TryConnectSymbol(g_symbols[i], g_symbols[i] == InpSourceSymbol);
 }
 
 int ImportHistoricalRates()
 {
    long latestImportedTimeMs = 0;
    return ImportHistoricalRatesForSymbol(InpSourceSymbol, InpCustomSymbol, latestImportedTimeMs);
+}
+
+int ImportReadyHistoryForSymbolIndex(int idx)
+{
+   if(idx < 0 || idx >= ArraySize(g_symbols))
+      return 0;
+   string sourceSymbol = g_symbols[idx];
+   string customSymbol = g_custom_symbols[idx];
+   if(!IsHistoryReady(sourceSymbol) || GetHistoricalRatesCount(sourceSymbol) <= 0)
+      return 0;
+
+   long latestImportedTimeMs = 0;
+   int imported = ImportHistoricalRatesForSymbol(sourceSymbol, customSymbol, latestImportedTimeMs);
+   if(imported > 0)
+   {
+      g_history_imported_by_symbol[idx] = true;
+      if(latestImportedTimeMs > g_last_timestamp_by_symbol[idx])
+         g_last_timestamp_by_symbol[idx] = latestImportedTimeMs;
+      ChartRedraw(0);
+   }
+   return imported;
+}
+
+int ImportReadyHistoryForAll()
+{
+   int total = 0;
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+      total += ImportReadyHistoryForSymbolIndex(i);
+   return total;
 }
 
 int ImportHistoricalRatesForSymbol(string sourceSymbol, string customSymbol, long &latestImportedTimeMs)
@@ -1114,17 +1159,7 @@ void ProcessTrackedSymbol(int idx)
       CheckForSignal();
    }
 
-   if(IsHistoryReady(sourceSymbol) && GetHistoricalRatesCount(sourceSymbol) > 0)
-   {
-      long latestImportedTimeMs = 0;
-      int imported = ImportHistoricalRatesForSymbol(sourceSymbol, customSymbol, latestImportedTimeMs);
-      if(imported > 0)
-      {
-         g_history_imported_by_symbol[idx] = true;
-         if(latestImportedTimeMs > g_last_timestamp_by_symbol[idx])
-            g_last_timestamp_by_symbol[idx] = latestImportedTimeMs;
-      }
-   }
+   ImportReadyHistoryForSymbolIndex(idx);
 }
 
 int OnInit()
@@ -1155,9 +1190,9 @@ int OnInit()
    g_recent_history_retry_after = 0;
    DrawManualTradePanel();
    EventSetMillisecondTimer(MathMax(50, InpTimerMs));
-   PrintFormat("DNSE bridge v1.17: EA started, source=%s, custom symbol=%s, trackedSymbols=%s, autoRecentHistoryDays=%d, historyTimeoutMs=%d, manualTradePanel=%s, manualAccounts=%s, manualOrderTimeoutMs=%d", InpSourceSymbol, InpCustomSymbol, GetConfiguredSymbolsSummary(), InpAutoRecentHistoryDays, InpHistoryTimeoutMs, InpEnableManualTradePanel ? "ON" : "OFF", InpManualAccountNos, InpManualOrderTimeoutMs);
+   PrintFormat("DNSE bridge v1.18: EA started, source=%s, custom symbol=%s, trackedSymbols=%s, autoRecentHistoryDays=%d, autoHistoryAllSymbols=%s, historyTimeoutMs=%d, manualTradePanel=%s, manualAccounts=%s, manualOrderTimeoutMs=%d", InpSourceSymbol, InpCustomSymbol, GetConfiguredSymbolsSummary(), InpAutoRecentHistoryDays, InpAutoRecentHistoryAllSymbols ? "ON" : "OFF", InpHistoryTimeoutMs, InpEnableManualTradePanel ? "ON" : "OFF", InpManualAccountNos, InpManualOrderTimeoutMs);
    if(InpAutoRecentHistoryDays <= 0)
-      Print("DNSE bridge v1.14: auto history backfill is disabled; realtime is priority, older history is manual.");
+      Print("DNSE bridge v1.18: auto history backfill is disabled; realtime is priority, older history is manual.");
    return INIT_SUCCEEDED;
 }
 
@@ -1193,6 +1228,12 @@ void OnTimer()
       UpdateRealtimeStatus(false, g_last_timestamp_ms, g_last_last);
       return;
    }
+
+   int importedOnTimer = 0;
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+      importedOnTimer += ImportReadyHistoryForSymbolIndex(i);
+   if(importedOnTimer > 0 && InpAutoRecentHistoryDays > 0)
+      g_recent_history_done = true;
 
    for(int i = 0; i < ArraySize(g_symbols); i++)
       ProcessTrackedSymbol(i);
