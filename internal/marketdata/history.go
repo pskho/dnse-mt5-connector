@@ -54,6 +54,22 @@ type SyncResult struct {
 	CandlesSynced int    `json:"candlesSynced"`
 }
 
+type MaxHistoryJobStatus struct {
+	ID             string    `json:"id"`
+	Symbol         string    `json:"symbol"`
+	MarketType     string    `json:"marketType"`
+	Resolution     int       `json:"resolution"`
+	Status         string    `json:"status"`
+	Message        string    `json:"message"`
+	StartedAt      time.Time `json:"startedAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+	Requests       int       `json:"requests"`
+	CandlesSynced  int       `json:"candlesSynced"`
+	EmptyBatches   int       `json:"emptyBatches"`
+	EarliestTimeMS int64     `json:"earliestTimeMs"`
+	LatestTimeMS   int64     `json:"latestTimeMs"`
+}
+
 type SyncOptions struct {
 	FirstTime    int64
 	LastTime     int64
@@ -83,6 +99,8 @@ type HistoryService struct {
 	snapshots map[string]historySnapshot
 	subs      map[chan HistoryKey]struct{}
 	reqGate   *historyRequestGate
+	bgMu      sync.Mutex
+	bgJobs    map[string]*MaxHistoryJobStatus
 }
 
 type historyRequestGate struct {
@@ -118,6 +136,7 @@ func NewHistoryService(cfg config.HistoryConfig, client HistoryClient, store His
 		snapshots: make(map[string]historySnapshot),
 		subs:      make(map[chan HistoryKey]struct{}),
 		reqGate:   &historyRequestGate{},
+		bgJobs:    make(map[string]*MaxHistoryJobStatus),
 	}
 }
 
@@ -187,6 +206,202 @@ func (s *HistoryService) BackfillBeforeToday(ctx context.Context, lookbackDays i
 func (s *HistoryService) SyncToday(ctx context.Context) (any, error) {
 	return s.SyncWithOptions(ctx, SyncOptions{
 		TodayOnly: true,
+	})
+}
+
+func (s *HistoryService) StartBackgroundMaxSync(opt SyncOptions) MaxHistoryJobStatus {
+	symbol, marketType, resolution := s.normalizeHistoryTarget(opt)
+	id := historyKeyString(HistoryKey{Symbol: symbol, MarketType: marketType, Resolution: resolution})
+	now := time.Now()
+
+	s.bgMu.Lock()
+	if existing, ok := s.bgJobs[id]; ok && existing.Status == "running" {
+		out := *existing
+		s.bgMu.Unlock()
+		return out
+	}
+	job := &MaxHistoryJobStatus{
+		ID:         id,
+		Symbol:     symbol,
+		MarketType: marketType,
+		Resolution: resolution,
+		Status:     "running",
+		Message:    "Background maximum history sync started",
+		StartedAt:  now,
+		UpdatedAt:  now,
+	}
+	s.bgJobs[id] = job
+	out := *job
+	s.bgMu.Unlock()
+
+	go s.runBackgroundMaxSync(context.Background(), id, opt)
+	return out
+}
+
+func (s *HistoryService) BackgroundMaxSyncStatuses() []MaxHistoryJobStatus {
+	s.bgMu.Lock()
+	defer s.bgMu.Unlock()
+	out := make([]MaxHistoryJobStatus, 0, len(s.bgJobs))
+	for _, job := range s.bgJobs {
+		out = append(out, *job)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	return out
+}
+
+func (s *HistoryService) runBackgroundMaxSync(ctx context.Context, id string, opt SyncOptions) {
+	symbol, marketType, resolution := s.normalizeHistoryTarget(opt)
+	fetchSymbol := s.resolveHistoryFetchSymbol(ctx, symbol)
+	batchDays := s.cfg.MaxBatchDays
+	if batchDays <= 0 {
+		batchDays = 30
+	}
+	batchSeconds := int64(batchDays * 24 * 3600)
+	currentTo := time.Now().Unix()
+	floor := time.Date(1990, 1, 1, 0, 0, 0, 0, vnLocation).Unix()
+	emptyBatches := 0
+	maxEmptyBatches := 12
+	totalSynced := 0
+	requests := 0
+	earliestMS := int64(0)
+	latestMS := int64(0)
+
+	s.logger.Info("history_background_max_started", map[string]any{
+		"symbol": symbol, "fetchSymbol": fetchSymbol, "marketType": marketType, "resolution": resolution,
+	})
+
+	for currentTo > floor {
+		currentFrom := currentTo - batchSeconds + 1
+		if currentFrom < floor {
+			currentFrom = floor
+		}
+
+		records := make([]storage.HistoryCandleRecord, 0)
+		pageFrom := currentFrom
+		for page := 0; page < 100 && pageFrom <= currentTo; page++ {
+			var raw map[string]any
+			var err error
+			for rateWaits := 0; rateWaits < 8; rateWaits++ {
+				raw, err = s.fetchOHLCWithRetry(ctx, fetchSymbol, marketType, resolution, pageFrom, currentTo)
+				if err == nil || !isRateLimitError(err) {
+					break
+				}
+				s.updateBackgroundJob(id, func(job *MaxHistoryJobStatus) {
+					job.Message = "Rate limited by DNSE; waiting before continuing"
+				})
+				select {
+				case <-ctx.Done():
+					s.finishBackgroundJob(id, "cancelled", ctx.Err().Error())
+					return
+				case <-time.After(time.Duration(rateWaits+1) * time.Minute):
+				}
+			}
+			if err != nil {
+				s.finishBackgroundJob(id, "failed", err.Error())
+				return
+			}
+			requests++
+			records = append(records, historyRecordsFromRaw(symbol, marketType, resolution, raw)...)
+			nextTime := parseFlexibleInt64(raw["nextTime"])
+			if nextTime <= 0 || nextTime > currentTo || nextTime <= pageFrom {
+				break
+			}
+			pageFrom = nextTime
+		}
+
+		if len(records) == 0 {
+			emptyBatches++
+		} else {
+			emptyBatches = 0
+			if s.cache != nil {
+				if err := s.cache.UpsertHistoryCandles(ctx, records); err != nil {
+					s.finishBackgroundJob(id, "failed", err.Error())
+					return
+				}
+			}
+			totalSynced += len(records)
+			for _, record := range records {
+				if earliestMS == 0 || record.TimeMS < earliestMS {
+					earliestMS = record.TimeMS
+				}
+				if record.TimeMS > latestMS {
+					latestMS = record.TimeMS
+				}
+			}
+		}
+
+		s.updateBackgroundJob(id, func(job *MaxHistoryJobStatus) {
+			job.Requests = requests
+			job.CandlesSynced = totalSynced
+			job.EmptyBatches = emptyBatches
+			job.EarliestTimeMS = earliestMS
+			job.LatestTimeMS = latestMS
+			job.Message = "Background maximum history sync is running"
+		})
+		if emptyBatches >= maxEmptyBatches {
+			break
+		}
+		currentTo = currentFrom - 1
+		select {
+		case <-ctx.Done():
+			s.finishBackgroundJob(id, "cancelled", ctx.Err().Error())
+			return
+		case <-time.After(3 * time.Second):
+		}
+	}
+
+	s.EnsureSnapshotFromCache(ctx, symbol)
+	s.finishBackgroundJob(id, "completed", "Background maximum history sync completed")
+	s.logger.Info("history_background_max_completed", map[string]any{
+		"symbol": symbol, "requests": requests, "candles": totalSynced, "earliestTimeMS": earliestMS,
+	})
+}
+
+func (s *HistoryService) normalizeHistoryTarget(opt SyncOptions) (string, string, int) {
+	symbol := strings.ToUpper(strings.TrimSpace(opt.Symbol))
+	if symbol == "" {
+		symbol = strings.ToUpper(strings.TrimSpace(s.cfg.Symbol))
+	}
+	marketType := strings.ToUpper(strings.TrimSpace(opt.MarketType))
+	resolution := opt.Resolution
+	if profile, ok := InferSymbolProfile(symbol, nil); ok {
+		if marketType == "" {
+			marketType = strings.ToUpper(strings.TrimSpace(profile.MarketType))
+		}
+		if resolution <= 0 {
+			resolution = profile.Resolution
+		}
+	}
+	if marketType == "" {
+		marketType = strings.ToUpper(strings.TrimSpace(s.cfg.MarketType))
+	}
+	if marketType == "" {
+		marketType = "DERIVATIVE"
+	}
+	if resolution <= 0 {
+		resolution = s.cfg.Resolution
+	}
+	if resolution <= 0 {
+		resolution = 1
+	}
+	return symbol, marketType, resolution
+}
+
+func (s *HistoryService) updateBackgroundJob(id string, update func(*MaxHistoryJobStatus)) {
+	s.bgMu.Lock()
+	defer s.bgMu.Unlock()
+	if job := s.bgJobs[id]; job != nil {
+		update(job)
+		job.UpdatedAt = time.Now()
+	}
+}
+
+func (s *HistoryService) finishBackgroundJob(id, status, message string) {
+	s.updateBackgroundJob(id, func(job *MaxHistoryJobStatus) {
+		job.Status = status
+		job.Message = message
 	})
 }
 
@@ -1271,6 +1486,44 @@ func recordsToCandles(records []storage.HistoryCandleRecord) []HistoryCandle {
 			Low:        record.Low,
 			Close:      record.Close,
 			TickVolume: record.TickVolume,
+		})
+	}
+	return out
+}
+
+func historyRecordsFromRaw(symbol, marketType string, resolution int, raw map[string]any) []storage.HistoryCandleRecord {
+	tList, _ := raw["t"].([]any)
+	oList, _ := raw["o"].([]any)
+	hList, _ := raw["h"].([]any)
+	lList, _ := raw["l"].([]any)
+	cList, _ := raw["c"].([]any)
+	vList, _ := raw["v"].([]any)
+	out := make([]storage.HistoryCandleRecord, 0, len(tList))
+	seen := make(map[int64]struct{}, len(tList))
+	now := time.Now().UTC()
+	for i := 0; i < len(tList); i++ {
+		t := parseInt64(tList, i)
+		if t <= 0 {
+			continue
+		}
+		if t < 100000000000 {
+			t *= 1000
+		}
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, storage.HistoryCandleRecord{
+			Symbol:     symbol,
+			MarketType: marketType,
+			Resolution: resolution,
+			TimeMS:     t,
+			Open:       parseFloat64(oList, i),
+			High:       parseFloat64(hList, i),
+			Low:        parseFloat64(lList, i),
+			Close:      parseFloat64(cList, i),
+			TickVolume: parseInt64(vList, i),
+			UpdatedAt:  now,
 		})
 	}
 	return out

@@ -95,6 +95,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/history/full-all", h.historyFullAll)
 	mux.HandleFunc("/history/backfill-all", h.historyBackfillAll)
 	mux.HandleFunc("/history/today-all", h.historyTodayAll)
+	mux.HandleFunc("/history/max-background", h.historyMaxBackground)
 	mux.HandleFunc("/otp/latest", h.getLatestOTP)
 	mux.HandleFunc("/accounts/orderable", h.orderableAccounts)
 	mux.HandleFunc("/api/dnse/orderable-accounts", h.dnseOrderableAccounts)
@@ -1378,6 +1379,52 @@ func (h *Handler) historyTodayAll(w http.ResponseWriter, r *http.Request) {
 	h.historySyncAll(w, r, "today")
 }
 
+func (h *Handler) historyMaxBackground(w http.ResponseWriter, r *http.Request) {
+	type backgroundMaxHistory interface {
+		StartBackgroundMaxSync(opt marketdata.SyncOptions) marketdata.MaxHistoryJobStatus
+		BackgroundMaxSyncStatuses() []marketdata.MaxHistoryJobStatus
+	}
+	svc, ok := h.history.(backgroundMaxHistory)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "background maximum history sync is not supported")
+		return
+	}
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true,
+			"jobs":    svc.BackgroundMaxSyncStatuses(),
+		})
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		Symbol     string `json:"symbol"`
+		MarketType string `json:"marketType"`
+		Resolution int    `json:"resolution"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(req.Symbol))
+	fetchSymbol := h.resolveHistoryFetchSymbol(r.Context(), symbol)
+	status := svc.StartBackgroundMaxSync(marketdata.SyncOptions{
+		Symbol:     symbol,
+		MarketType: req.MarketType,
+		Resolution: req.Resolution,
+	})
+	if !strings.EqualFold(symbol, fetchSymbol) {
+		status.Message = status.Message + "; using feed symbol " + fetchSymbol
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"success": true,
+		"job":     status,
+	})
+}
+
 func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode string) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1425,6 +1472,14 @@ func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode st
 				profiles = append(profiles, profile)
 			}
 		}
+	}
+	if mode != "today" && lookbackDays > 730 && len(profiles) > 5 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"error":   "lookbackDays qua lon cho dong bo nhieu ma; hay chay toi da theo tung ma hoac giam so ngay lay lui",
+			"hint":    "De tranh rate limit DNSE, dong bo nhieu ma nen de 365-730 ngay. Nut toi da chi nen dung cho mot ma.",
+		})
+		return
 	}
 	results := make([]item, 0, len(profiles))
 	successCount := 0

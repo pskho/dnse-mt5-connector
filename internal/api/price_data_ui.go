@@ -119,7 +119,7 @@ const priceDataHTML = layoutTop + `
           </div>
           <div class="form-group">
             <label>Số ngày lấy lùi</label>
-            <input id="historyLookbackDays" type="number" value="365" min="1">
+            <input id="historyLookbackDays" type="number" value="365" min="1" max="3650">
           </div>
           <div class="form-group">
             <label>Trạng thái danh sách</label>
@@ -128,10 +128,11 @@ const priceDataHTML = layoutTop + `
         </div>
         <div class="actions">
           <button class="btn" type="button" onclick="syncHistoricalPrices()">Đồng bộ giá lịch sử</button>
+          <button class="btn secondary" type="button" onclick="syncMaximumHistoricalPrices()">Đồng bộ tối đa có thể</button>
           <button class="btn secondary" type="button" onclick="syncTodayPrices()">Vá riêng hôm nay</button>
           <button class="btn secondary" type="button" onclick="saveSymbols()">Lưu danh sách mã</button>
         </div>
-        <div class="inline-note">Đồng bộ giá lịch sử sẽ lấy dữ liệu các ngày trước và cả phần hôm nay tới thời điểm hiện tại. Nếu MT5 đang mở, bridge sẽ nhận snapshot mới và import vào custom symbol.</div>
+        <div class="inline-note">Đồng bộ giá lịch sử sẽ lấy dữ liệu theo số ngày đã nhập. Nút tối đa có thể chạy ngầm cho một mã, đi lùi từng lớp nhỏ cho tới khi API không còn dữ liệu cũ hơn. Nếu MT5 đang mở, bridge sẽ nhận snapshot mới và import vào custom symbol.</div>
       </section>
 
       <section class="card">
@@ -343,9 +344,42 @@ const priceDataHTML = layoutTop + `
     }
 
     async function syncHistoricalPrices() {
-      const payload = historyPayload();
+      await syncHistoricalPricesWithLookback(historyPayload().lookbackDays, 'Đồng bộ giá lịch sử');
+    }
+
+    async function syncMaximumHistoricalPrices() {
       const all = $('historyScope').value === 'all';
-      printOutput('Đang chạy Đồng bộ giá lịch sử cho ' + (all ? Array.from(selectedSymbols).sort().length + ' mã đã chọn' : payload.symbol) + '...');
+      const target = all ? Array.from(selectedSymbols).sort().length + ' mã đã chọn' : (($('historySymbol').value || 'VN30F1M').trim().toUpperCase());
+      if (all) {
+        printOutput('Đồng bộ tối đa có thể chỉ nên chạy cho từng mã để tránh chạm rate limit DNSE. Hãy chọn phạm vi Một mã, hoặc dùng Đồng bộ giá lịch sử với số ngày cụ thể cho tất cả mã.', true);
+        return;
+      }
+      const ok = window.confirm('Đồng bộ tối đa có thể cho ' + target + '. Tác vụ sẽ chạy ngầm, tự nghỉ giữa các request và tự chờ khi DNSE rate limit. Tiếp tục?');
+      if (!ok) return;
+      const payload = historyPayload();
+      printOutput('Đã đưa ' + payload.symbol + ' vào hàng đợi đồng bộ tối đa. Có thể tiếp tục dùng realtime trong lúc hệ thống chạy nền...');
+      await requestJSON('/history/max-background', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      setTimeout(loadBackgroundHistoryJobs, 2000);
+    }
+
+    async function loadBackgroundHistoryJobs() {
+      try {
+        const data = await requestJSON('/history/max-background');
+        const jobs = data.jobs || [];
+        const running = jobs.some((job) => job.status === 'running');
+        if (running) setTimeout(loadBackgroundHistoryJobs, 10000);
+      } catch {}
+    }
+
+    async function syncHistoricalPricesWithLookback(lookbackDays, label) {
+      const payload = historyPayload();
+      payload.lookbackDays = Math.max(1, Number(lookbackDays) || 365);
+      const all = $('historyScope').value === 'all';
+      printOutput('Đang chạy ' + label + ' cho ' + (all ? Array.from(selectedSymbols).sort().length + ' mã đã chọn' : payload.symbol) + ', lookbackDays=' + payload.lookbackDays + '...');
       await requestJSON(all ? '/history/full-all' : '/history/full', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
