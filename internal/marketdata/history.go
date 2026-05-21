@@ -190,6 +190,105 @@ func (s *HistoryService) SyncToday(ctx context.Context) (any, error) {
 	})
 }
 
+func (s *HistoryService) EnsureSnapshotFromCache(ctx context.Context, symbol string) bool {
+	if s == nil || s.cache == nil {
+		return false
+	}
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		symbol = strings.ToUpper(strings.TrimSpace(s.cfg.Symbol))
+	}
+	if symbol == "" {
+		return false
+	}
+	marketType := strings.ToUpper(strings.TrimSpace(s.cfg.MarketType))
+	resolution := s.cfg.Resolution
+	if profile, ok := InferSymbolProfile(symbol, nil); ok {
+		if strings.TrimSpace(profile.MarketType) != "" {
+			marketType = strings.ToUpper(strings.TrimSpace(profile.MarketType))
+		}
+		if profile.Resolution > 0 {
+			resolution = profile.Resolution
+		}
+	}
+	if marketType == "" {
+		marketType = "DERIVATIVE"
+	}
+	if resolution <= 0 {
+		resolution = 1
+	}
+
+	lookbackDays := s.cfg.InitialLookbackDays
+	if lookbackDays <= 0 {
+		lookbackDays = 365
+	}
+	toMS := time.Now().UnixMilli()
+	fromMS := time.Now().Add(-time.Duration(lookbackDays) * 24 * time.Hour).UnixMilli()
+	if !s.snapshotNeedsCacheLoad(symbol, fromMS) {
+		return true
+	}
+
+	minMS, maxMS, count, err := s.cache.GetHistoryCoverage(ctx, symbol, marketType, resolution)
+	if err != nil {
+		s.logger.Error("history_cache_snapshot_coverage_failed", map[string]any{
+			"symbol": symbol, "marketType": marketType, "resolution": resolution, "error": err.Error(),
+		})
+		return false
+	}
+	if count == 0 || maxMS <= 0 {
+		return false
+	}
+	if minMS > fromMS {
+		fromMS = minMS
+	}
+	if maxMS < toMS {
+		toMS = maxMS
+	}
+	if toMS <= fromMS {
+		return false
+	}
+
+	records, err := s.cache.LoadHistoryCandles(ctx, symbol, marketType, resolution, fromMS, toMS)
+	if err != nil {
+		s.logger.Error("history_cache_snapshot_load_failed", map[string]any{
+			"symbol": symbol, "marketType": marketType, "resolution": resolution, "error": err.Error(),
+		})
+		return false
+	}
+	if len(records) == 0 {
+		return false
+	}
+	candles := recordsToCandles(records)
+	candles = fillTradingSessionGapsForRangeIfNeeded(symbol, marketType, resolution, fromMS, toMS, candles, s.sessionPolicy(ctx, symbol, marketType))
+	key := HistoryKey{Symbol: symbol, MarketType: marketType, Resolution: resolution}
+	s.replaceStagedCandles(key, candles)
+	s.cloneTickerAliasSnapshots(ctx, key)
+	s.logger.Info("history_cache_snapshot_loaded", map[string]any{
+		"symbol": symbol, "marketType": marketType, "resolution": resolution,
+		"fromMS": fromMS, "toMS": toMS, "candles": len(candles),
+	})
+	return true
+}
+
+func (s *HistoryService) snapshotNeedsCacheLoad(symbol string, requestedFromMS int64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	for _, snapshot := range s.snapshots {
+		if !strings.EqualFold(snapshot.key.Symbol, symbol) || len(snapshot.candles) == 0 {
+			continue
+		}
+		first := snapshot.candles[0].Time
+		for _, candle := range snapshot.candles[1:] {
+			if candle.Time < first {
+				first = candle.Time
+			}
+		}
+		return first > requestedFromMS+3*24*60*60*1000
+	}
+	return true
+}
+
 func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (any, error) {
 	if !s.cfg.Enabled {
 		return SyncResult{Success: false, Message: "History sync disabled"}, nil

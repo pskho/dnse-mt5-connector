@@ -87,7 +87,7 @@ func (p *Publisher) handle(ctx context.Context, conn net.Conn) {
 		return err == nil
 	}
 
-	if !p.writeHistorySnapshot(subscribedSymbol, writeLine) {
+	if !p.writeHistorySnapshot(ctx, subscribedSymbol, writeLine) {
 		return
 	}
 
@@ -106,7 +106,7 @@ func (p *Publisher) handle(ctx context.Context, conn net.Conn) {
 			if !strings.EqualFold(key.Symbol, subscribedSymbol) {
 				continue
 			}
-			if !p.writeHistorySnapshot(subscribedSymbol, writeLine) {
+			if !p.writeHistorySnapshot(ctx, subscribedSymbol, writeLine) {
 				return
 			}
 		case tick, ok := <-ticks:
@@ -146,7 +146,10 @@ func (p *Publisher) readSubscription(conn net.Conn) string {
 	return symbol
 }
 
-func (p *Publisher) writeHistorySnapshot(symbol string, writeLine func([]byte) bool) bool {
+func (p *Publisher) writeHistorySnapshot(ctx context.Context, symbol string, writeLine func([]byte) bool) bool {
+	if p.history != nil {
+		p.history.EnsureSnapshotFromCache(ctx, symbol)
+	}
 	key, candles, ok := p.history.SnapshotForSymbol(symbol)
 	if !ok {
 		key = HistoryKey{Symbol: symbol}
