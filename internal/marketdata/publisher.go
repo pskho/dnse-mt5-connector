@@ -81,37 +81,61 @@ func (p *Publisher) handle(ctx context.Context, conn net.Conn) {
 	defer unsubscribeHistory()
 
 	var writeMu sync.Mutex
+	var closeOnce sync.Once
+	done := make(chan struct{})
+	closeDone := func() {
+		closeOnce.Do(func() {
+			close(done)
+			_ = conn.Close()
+		})
+	}
 	writeLine := func(line []byte) bool {
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		_, err := conn.Write(line)
-		return err == nil
+		if err != nil {
+			closeDone()
+			return false
+		}
+		return true
 	}
 
 	lastHistorySignature := ""
-	if !p.writeHistorySnapshot(ctx, subscribedSymbol, writeLine, &lastHistorySignature) {
-		return
-	}
-
 	if tick, ok := p.store.Latest(subscribedSymbol); ok && !writeLine(tick.JSONLine()) {
 		return
 	}
+
+	go func() {
+		if !p.writeHistorySnapshot(ctx, subscribedSymbol, writeLine, &lastHistorySignature) {
+			return
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case key, ok := <-historyUpdates:
+				if !ok {
+					return
+				}
+				if !strings.EqualFold(key.Symbol, subscribedSymbol) {
+					continue
+				}
+				if !p.writeHistorySnapshot(ctx, subscribedSymbol, writeLine, &lastHistorySignature) {
+					return
+				}
+			}
+		}
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case key, ok := <-historyUpdates:
-			if !ok {
-				return
-			}
-			if !strings.EqualFold(key.Symbol, subscribedSymbol) {
-				continue
-			}
-			if !p.writeHistorySnapshot(ctx, subscribedSymbol, writeLine, &lastHistorySignature) {
-				return
-			}
+		case <-done:
+			return
 		case tick, ok := <-ticks:
 			if !ok || !writeLine(tick.JSONLine()) {
 				return
