@@ -3,7 +3,7 @@
 //| Updates custom symbol VN30F1M_DNSE from DNSEBridge.dll           |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.18"
+#property version   "1.20"
 
 struct MqlRateLite {
    long     time;
@@ -37,6 +37,9 @@ input int    InpHistoryTimeoutMs = 30000;
 input int    InpAutoRecentHistoryDays = 1;   // 0=manual only, 1=repair today on start, 7=last week
 input int    InpAutoRecentSyncDelaySec = 15; // wait for realtime before any history backfill
 input bool   InpAutoRecentHistoryAllSymbols = true;
+input bool   InpRealtimeOnlyDuringTradingSession = true;
+input int    InpRealtimeHardStopMinute = 900; // 900 = 15:00 VN time; 0 = disabled
+input int    InpClosedSessionLogSec = 60;
 input bool   InpEnableSignalBridge = false;
 input bool   InpEnableManualTradePanel = true;
 input string InpManualBridgeURL = "http://127.0.0.1:8080";
@@ -79,6 +82,8 @@ long     g_last_volume_by_symbol[];
 bool     g_history_imported_by_symbol[];
 datetime g_last_realtime_log_by_symbol[];
 datetime g_last_reconnect_by_symbol[];
+datetime g_last_closed_session_log_by_symbol[];
+datetime g_last_tick_reject_log_by_symbol[];
 
 struct PendingSignal {
    string id;
@@ -495,6 +500,8 @@ void AddTrackedSymbol(string sourceSymbol)
    ArrayResize(g_history_imported_by_symbol, idx + 1);
    ArrayResize(g_last_realtime_log_by_symbol, idx + 1);
    ArrayResize(g_last_reconnect_by_symbol, idx + 1);
+   ArrayResize(g_last_closed_session_log_by_symbol, idx + 1);
+   ArrayResize(g_last_tick_reject_log_by_symbol, idx + 1);
 
    g_symbols[idx] = sourceSymbol;
    g_custom_symbols[idx] = sourceSymbol + "_DNSE";
@@ -506,6 +513,8 @@ void AddTrackedSymbol(string sourceSymbol)
    g_history_imported_by_symbol[idx] = false;
    g_last_realtime_log_by_symbol[idx] = 0;
    g_last_reconnect_by_symbol[idx] = 0;
+   g_last_closed_session_log_by_symbol[idx] = 0;
+   g_last_tick_reject_log_by_symbol[idx] = 0;
 }
 
 int FindLayoutIndex(string symbol)
@@ -636,6 +645,8 @@ void EnsureConfiguredCustomSymbols()
    ArrayResize(g_history_imported_by_symbol, 0);
    ArrayResize(g_last_realtime_log_by_symbol, 0);
    ArrayResize(g_last_reconnect_by_symbol, 0);
+   ArrayResize(g_last_closed_session_log_by_symbol, 0);
+   ArrayResize(g_last_tick_reject_log_by_symbol, 0);
 
    AddTrackedSymbol(InpSourceSymbol);
    for(int i = 0; i < ArraySize(g_layout_symbols); i++)
@@ -895,6 +906,17 @@ int ImportHistoricalRatesForSymbol(string sourceSymbol, string customSymbol, lon
       return 0;
    }
 
+   datetime purgeFrom = StringToTime("1970.01.01 00:00");
+   datetime purgeTo = StringToTime("2037.12.31 23:59");
+   ResetLastError();
+   int purged = CustomRatesDelete(customSymbol, purgeFrom, purgeTo);
+   if(purged < 0)
+   {
+      int purgeErr = GetLastError();
+      PrintFormat("DNSE bridge: CustomRatesDelete full purge failed for %s, error=%d; continuing with chunk updates.", customSymbol, purgeErr);
+      ResetLastError();
+   }
+
    int imported = 0;
    for(int offset = 0; offset < total; offset += chunkSize)
    {
@@ -920,15 +942,6 @@ int ImportHistoricalRatesForSymbol(string sourceSymbol, string customSymbol, lon
          rates[i].spread = 0;
          rates[i].real_volume = 0;
       }
-
-      if(count > 0)
-      {
-         datetime deleteFrom = rates[0].time;
-         datetime deleteTo = rates[count - 1].time;
-         if(deleteTo >= deleteFrom)
-            CustomRatesDelete(customSymbol, deleteFrom, deleteTo);
-      }
-
       int updated = CustomRatesUpdate(customSymbol, rates, count);
       if(updated < 0)
       {
@@ -941,7 +954,7 @@ int ImportHistoricalRatesForSymbol(string sourceSymbol, string customSymbol, lon
    }
 
    ClearHistoricalRates(sourceSymbol);
-   PrintFormat("DNSE bridge: Imported %d/%d historical candles into %s.", imported, total, customSymbol);
+   PrintFormat("DNSE bridge: Imported %d/%d historical candles into %s after purging stale custom rates.", imported, total, customSymbol);
    return imported;
 }
 
@@ -1014,17 +1027,20 @@ bool IsHNXUPCOMRealtimeSymbol(string symbol)
    return symbol == "HNX" || symbol == "HNX30" || symbol == "UPCOM";
 }
 
-bool NormalizeKRXRealtimeTimestamp(string sourceSymbol, long &timestamp_ms)
+void RealtimeSessionConfig(string sourceSymbol,
+                           int &morningOpen,
+                           int &openingAuctionEnd,
+                           int &morningClose,
+                           int &afternoonOpen,
+                           int &closingAuction,
+                           int &afternoonClose)
 {
-   if(timestamp_ms <= 0)
-      return false;
-
-   int morningOpen = 8 * 60 + 45;
-   int openingAuctionEnd = 0;
-   int morningClose = 11 * 60 + 30;
-   int afternoonOpen = 13 * 60;
-   int closingAuction = 0;
-   int afternoonClose = 15 * 60;
+   morningOpen = 9 * 60;
+   openingAuctionEnd = 9 * 60 + 15;
+   morningClose = 11 * 60 + 30;
+   afternoonOpen = 13 * 60;
+   closingAuction = 14 * 60 + 30;
+   afternoonClose = 14 * 60 + 45;
 
    if(IsDerivativeRealtimeSymbol(sourceSymbol))
    {
@@ -1033,18 +1049,53 @@ bool NormalizeKRXRealtimeTimestamp(string sourceSymbol, long &timestamp_ms)
       closingAuction = 14 * 60 + 30;
       afternoonClose = 14 * 60 + 45;
    }
-   else if(IsHOSEIndexRealtimeSymbol(sourceSymbol))
-   {
-      morningOpen = 9 * 60;
-      openingAuctionEnd = 9 * 60 + 15;
-      closingAuction = 14 * 60 + 30;
-      afternoonClose = 14 * 60 + 45;
-   }
    else if(IsHNXUPCOMRealtimeSymbol(sourceSymbol))
    {
       morningOpen = 9 * 60;
+      openingAuctionEnd = 0;
+      closingAuction = 0;
       afternoonClose = 15 * 60;
    }
+}
+
+bool IsCurrentRealtimeSessionOpen(string sourceSymbol)
+{
+   int morningOpen = 0;
+   int openingAuctionEnd = 0;
+   int morningClose = 0;
+   int afternoonOpen = 0;
+   int closingAuction = 0;
+   int afternoonClose = 0;
+   RealtimeSessionConfig(sourceSymbol, morningOpen, openingAuctionEnd, morningClose, afternoonOpen, closingAuction, afternoonClose);
+
+   datetime vnNow = TimeGMT() + 7 * 3600;
+   MqlDateTime dt;
+   TimeToStruct(vnNow, dt);
+   if(dt.day_of_week == 0 || dt.day_of_week == 6)
+      return false;
+
+   int minute = dt.hour * 60 + dt.min;
+   if(InpRealtimeHardStopMinute > 0 && minute >= InpRealtimeHardStopMinute)
+      return false;
+   if(minute < morningOpen || minute > afternoonClose)
+      return false;
+   if(minute > morningClose && minute < afternoonOpen)
+      return false;
+   return true;
+}
+
+bool NormalizeKRXRealtimeTimestamp(string sourceSymbol, long &timestamp_ms)
+{
+   if(timestamp_ms <= 0)
+      return false;
+
+   int morningOpen = 0;
+   int openingAuctionEnd = 0;
+   int morningClose = 0;
+   int afternoonOpen = 0;
+   int closingAuction = 0;
+   int afternoonClose = 0;
+   RealtimeSessionConfig(sourceSymbol, morningOpen, openingAuctionEnd, morningClose, afternoonOpen, closingAuction, afternoonClose);
 
    datetime vnTime = (datetime)(timestamp_ms / 1000 + 7 * 3600);
    MqlDateTime dt;
@@ -1053,6 +1104,8 @@ bool NormalizeKRXRealtimeTimestamp(string sourceSymbol, long &timestamp_ms)
       return false;
 
    int minute = dt.hour * 60 + dt.min;
+   if(InpRealtimeHardStopMinute > 0 && minute >= InpRealtimeHardStopMinute)
+      return false;
    if(minute < morningOpen || minute > afternoonClose)
       return false;
    if(minute > morningClose && minute < afternoonOpen)
@@ -1078,6 +1131,20 @@ void ProcessTrackedSymbol(int idx)
 {
    string sourceSymbol = g_symbols[idx];
    string customSymbol = g_custom_symbols[idx];
+
+   if(InpRealtimeOnlyDuringTradingSession && !IsCurrentRealtimeSessionOpen(sourceSymbol))
+   {
+      datetime now = TimeCurrent();
+      int logEverySec = InpClosedSessionLogSec;
+      if(logEverySec < 10)
+         logEverySec = 10;
+      if(g_last_closed_session_log_by_symbol[idx] == 0 || (now - g_last_closed_session_log_by_symbol[idx]) >= logEverySec)
+      {
+         PrintFormat("DNSE bridge: realtime tick import paused for %s outside trading session.", sourceSymbol);
+         g_last_closed_session_log_by_symbol[idx] = now;
+      }
+      return;
+   }
 
    double bid = 0.0;
    double ask = 0.0;
@@ -1120,7 +1187,12 @@ void ProcessTrackedSymbol(int idx)
       int err = GetLastError();
       if(err == 5310)
       {
-         PrintFormat("DNSE bridge: CustomTicksAdd skipped for %s because MT5 rejected the incoming tick order/time (error=%d).", customSymbol, err);
+         datetime now = TimeCurrent();
+         if(g_last_tick_reject_log_by_symbol[idx] == 0 || (now - g_last_tick_reject_log_by_symbol[idx]) >= 30)
+         {
+            PrintFormat("DNSE bridge: CustomTicksAdd skipped for %s because MT5 rejected the incoming tick order/time (error=%d).", customSymbol, err);
+            g_last_tick_reject_log_by_symbol[idx] = now;
+         }
          ResetLastError();
          g_last_timestamp_by_symbol[idx] = timestamp_ms;
          g_last_bid_by_symbol[idx] = bid;
@@ -1190,9 +1262,9 @@ int OnInit()
    g_recent_history_retry_after = 0;
    DrawManualTradePanel();
    EventSetMillisecondTimer(MathMax(50, InpTimerMs));
-   PrintFormat("DNSE bridge v1.18: EA started, source=%s, custom symbol=%s, trackedSymbols=%s, autoRecentHistoryDays=%d, autoHistoryAllSymbols=%s, historyTimeoutMs=%d, manualTradePanel=%s, manualAccounts=%s, manualOrderTimeoutMs=%d", InpSourceSymbol, InpCustomSymbol, GetConfiguredSymbolsSummary(), InpAutoRecentHistoryDays, InpAutoRecentHistoryAllSymbols ? "ON" : "OFF", InpHistoryTimeoutMs, InpEnableManualTradePanel ? "ON" : "OFF", InpManualAccountNos, InpManualOrderTimeoutMs);
+   PrintFormat("DNSE bridge v1.20: EA started, source=%s, custom symbol=%s, trackedSymbols=%s, autoRecentHistoryDays=%d, autoHistoryAllSymbols=%s, realtimeSessionOnly=%s, historyTimeoutMs=%d, manualTradePanel=%s, manualAccounts=%s, manualOrderTimeoutMs=%d", InpSourceSymbol, InpCustomSymbol, GetConfiguredSymbolsSummary(), InpAutoRecentHistoryDays, InpAutoRecentHistoryAllSymbols ? "ON" : "OFF", InpRealtimeOnlyDuringTradingSession ? "ON" : "OFF", InpHistoryTimeoutMs, InpEnableManualTradePanel ? "ON" : "OFF", InpManualAccountNos, InpManualOrderTimeoutMs);
    if(InpAutoRecentHistoryDays <= 0)
-      Print("DNSE bridge v1.18: auto history backfill is disabled; realtime is priority, older history is manual.");
+      Print("DNSE bridge v1.20: auto history backfill is disabled; realtime is priority, older history is manual.");
    return INIT_SUCCEEDED;
 }
 

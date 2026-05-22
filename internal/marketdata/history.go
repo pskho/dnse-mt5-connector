@@ -70,6 +70,41 @@ type MaxHistoryJobStatus struct {
 	LatestTimeMS   int64     `json:"latestTimeMs"`
 }
 
+type CachedHistoryCoverage struct {
+	Symbol      string `json:"symbol"`
+	MarketType  string `json:"marketType"`
+	Resolution  int    `json:"resolution"`
+	Count       int    `json:"count"`
+	FirstTimeMS int64  `json:"firstTimeMs"`
+	LastTimeMS  int64  `json:"lastTimeMs"`
+	FirstTime   string `json:"firstTime"`
+	LastTime    string `json:"lastTime"`
+	UpdatedAt   string `json:"updatedAt"`
+}
+
+type CachedHistoryPoint struct {
+	TimeMS     int64   `json:"timeMs"`
+	Time       string  `json:"time"`
+	Open       float64 `json:"open"`
+	High       float64 `json:"high"`
+	Low        float64 `json:"low"`
+	Close      float64 `json:"close"`
+	TickVolume int64   `json:"tickVolume"`
+}
+
+type CachedHistoryData struct {
+	Success        bool                    `json:"success"`
+	Symbol         string                  `json:"symbol"`
+	MarketType     string                  `json:"marketType"`
+	Resolution     int                     `json:"resolution"`
+	Coverages      []CachedHistoryCoverage `json:"coverages"`
+	Candles        []CachedHistoryPoint    `json:"candles"`
+	TotalCandles   int                     `json:"totalCandles"`
+	SampledCandles int                     `json:"sampledCandles"`
+	Sampled        bool                    `json:"sampled"`
+	Message        string                  `json:"message,omitempty"`
+}
+
 type SyncOptions struct {
 	FirstTime    int64
 	LastTime     int64
@@ -87,6 +122,11 @@ type HistoryKey struct {
 	MarketType string
 	Resolution int
 }
+
+const (
+	stockDailyFallbackResolution  = 1440
+	stockWeeklyFallbackResolution = 10080
+)
 
 type HistoryService struct {
 	cfg       config.HistoryConfig
@@ -251,12 +291,197 @@ func (s *HistoryService) BackgroundMaxSyncStatuses() []MaxHistoryJobStatus {
 	return out
 }
 
+func (s *HistoryService) CachedHistory(ctx context.Context, symbol, marketType string, resolution, limit int) (CachedHistoryData, error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	marketType = strings.ToUpper(strings.TrimSpace(marketType))
+	if symbol == "" {
+		symbol = strings.ToUpper(strings.TrimSpace(s.cfg.Symbol))
+	}
+	if profile, ok := InferSymbolProfile(symbol, nil); ok && marketType == "" {
+		marketType = strings.ToUpper(strings.TrimSpace(profile.MarketType))
+	}
+	if marketType == "" {
+		marketType = strings.ToUpper(strings.TrimSpace(s.cfg.MarketType))
+	}
+	if marketType == "" {
+		marketType = "STOCK"
+	}
+	if resolution <= 0 {
+		resolution = 1
+	}
+	if limit <= 0 {
+		limit = 600
+	}
+	if limit > 2000 {
+		limit = 2000
+	}
+
+	out := CachedHistoryData{
+		Success:    true,
+		Symbol:     symbol,
+		MarketType: marketType,
+		Resolution: resolution,
+	}
+	if s.cache == nil {
+		out.Message = "Local history cache is not configured"
+		return out, nil
+	}
+
+	coverages, err := s.cachedHistoryCoverages(ctx, symbol, marketType, resolution)
+	if err != nil {
+		return CachedHistoryData{}, err
+	}
+	out.Coverages = coverages
+	if len(coverages) == 0 {
+		out.Message = "No cached history for " + symbol
+		return out, nil
+	}
+
+	selected := chooseCachedCoverage(coverages, resolution)
+	out.MarketType = selected.MarketType
+	out.Resolution = selected.Resolution
+	records, total, err := s.cachedHistorySample(ctx, selected.Symbol, selected.MarketType, selected.Resolution, selected.FirstTimeMS, selected.LastTimeMS, limit)
+	if err != nil {
+		return CachedHistoryData{}, err
+	}
+	out.Candles = cachedHistoryPoints(records)
+	out.TotalCandles = total
+	out.SampledCandles = len(out.Candles)
+	out.Sampled = total > len(out.Candles)
+	return out, nil
+}
+
+func (s *HistoryService) cachedHistoryCoverages(ctx context.Context, symbol, marketType string, resolution int) ([]CachedHistoryCoverage, error) {
+	type coverageLister interface {
+		ListHistoryCoverages(ctx context.Context, symbol, marketType string) ([]storage.HistoryCoverageRecord, error)
+	}
+	if lister, ok := s.cache.(coverageLister); ok {
+		records, err := lister.ListHistoryCoverages(ctx, symbol, marketType)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]CachedHistoryCoverage, 0, len(records))
+		for _, record := range records {
+			out = append(out, cachedHistoryCoverage(record))
+		}
+		return out, nil
+	}
+
+	minMS, maxMS, count, err := s.cache.GetHistoryCoverage(ctx, symbol, marketType, resolution)
+	if err != nil || count == 0 {
+		return nil, err
+	}
+	return []CachedHistoryCoverage{cachedHistoryCoverage(storage.HistoryCoverageRecord{
+		Symbol:      symbol,
+		MarketType:  marketType,
+		Resolution:  resolution,
+		FirstTimeMS: minMS,
+		LastTimeMS:  maxMS,
+		Count:       count,
+	})}, nil
+}
+
+func (s *HistoryService) cachedHistorySample(ctx context.Context, symbol, marketType string, resolution int, fromMS, toMS int64, limit int) ([]storage.HistoryCandleRecord, int, error) {
+	type candleSampler interface {
+		LoadHistoryCandlesSample(ctx context.Context, symbol, marketType string, resolution int, fromMS, toMS int64, limit int) ([]storage.HistoryCandleRecord, int, error)
+	}
+	if sampler, ok := s.cache.(candleSampler); ok {
+		return sampler.LoadHistoryCandlesSample(ctx, symbol, marketType, resolution, fromMS, toMS, limit)
+	}
+	records, err := s.cache.LoadHistoryCandles(ctx, symbol, marketType, resolution, fromMS, toMS)
+	if err != nil {
+		return nil, 0, err
+	}
+	total := len(records)
+	if total <= limit || limit <= 0 {
+		return records, total, nil
+	}
+	step := total / limit
+	if total%limit != 0 {
+		step++
+	}
+	sampled := make([]storage.HistoryCandleRecord, 0, limit+2)
+	for i, record := range records {
+		if i == 0 || i == total-1 || i%step == 0 {
+			sampled = append(sampled, record)
+		}
+	}
+	return sampled, total, nil
+}
+
+func chooseCachedCoverage(coverages []CachedHistoryCoverage, resolution int) CachedHistoryCoverage {
+	for _, coverage := range coverages {
+		if coverage.Resolution == resolution {
+			return coverage
+		}
+	}
+	for _, coverage := range coverages {
+		if coverage.Resolution == 1 {
+			return coverage
+		}
+	}
+	for _, coverage := range coverages {
+		if coverage.Resolution == stockDailyFallbackResolution {
+			return coverage
+		}
+	}
+	return coverages[0]
+}
+
+func cachedHistoryCoverage(record storage.HistoryCoverageRecord) CachedHistoryCoverage {
+	return CachedHistoryCoverage{
+		Symbol:      strings.ToUpper(strings.TrimSpace(record.Symbol)),
+		MarketType:  strings.ToUpper(strings.TrimSpace(record.MarketType)),
+		Resolution:  record.Resolution,
+		Count:       record.Count,
+		FirstTimeMS: record.FirstTimeMS,
+		LastTimeMS:  record.LastTimeMS,
+		FirstTime:   formatHistoryTime(record.FirstTimeMS),
+		LastTime:    formatHistoryTime(record.LastTimeMS),
+		UpdatedAt:   formatOptionalHistoryTime(record.UpdatedAt),
+	}
+}
+
+func cachedHistoryPoints(records []storage.HistoryCandleRecord) []CachedHistoryPoint {
+	out := make([]CachedHistoryPoint, 0, len(records))
+	for _, record := range records {
+		out = append(out, CachedHistoryPoint{
+			TimeMS:     record.TimeMS,
+			Time:       formatHistoryTime(record.TimeMS),
+			Open:       record.Open,
+			High:       record.High,
+			Low:        record.Low,
+			Close:      record.Close,
+			TickVolume: record.TickVolume,
+		})
+	}
+	return out
+}
+
+func formatHistoryTime(valueMS int64) string {
+	if valueMS <= 0 {
+		return ""
+	}
+	return time.UnixMilli(valueMS).In(vnLocation).Format("2006-01-02 15:04:05")
+}
+
+func formatOptionalHistoryTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.In(vnLocation).Format("2006-01-02 15:04:05")
+}
+
 func (s *HistoryService) runBackgroundMaxSync(ctx context.Context, id string, opt SyncOptions) {
 	symbol, marketType, resolution := s.normalizeHistoryTarget(opt)
 	fetchSymbol := s.resolveHistoryFetchSymbol(ctx, symbol)
+	fetchCandidates := s.historyFetchCandidates(ctx, symbol)
 	batchDays := s.cfg.MaxBatchDays
 	if batchDays <= 0 {
 		batchDays = 30
+	}
+	if resolution >= stockDailyFallbackResolution && batchDays < 365 {
+		batchDays = 365
 	}
 	batchSeconds := int64(batchDays * 24 * 3600)
 	currentTo := time.Now().Unix()
@@ -279,36 +504,45 @@ func (s *HistoryService) runBackgroundMaxSync(ctx context.Context, id string, op
 		}
 
 		records := make([]storage.HistoryCandleRecord, 0)
-		pageFrom := currentFrom
-		for page := 0; page < 100 && pageFrom <= currentTo; page++ {
-			var raw map[string]any
-			var err error
-			for rateWaits := 0; rateWaits < 8; rateWaits++ {
-				raw, err = s.fetchOHLCWithRetry(ctx, fetchSymbol, marketType, resolution, pageFrom, currentTo)
-				if err == nil || !isRateLimitError(err) {
+		fetchUsed := fetchCandidates[0]
+		for _, candidate := range fetchCandidates {
+			candidateRecords := make([]storage.HistoryCandleRecord, 0)
+			pageFrom := currentFrom
+			for page := 0; page < 100 && pageFrom <= currentTo; page++ {
+				var raw map[string]any
+				var err error
+				for rateWaits := 0; rateWaits < 8; rateWaits++ {
+					raw, err = s.fetchOHLCWithRetry(ctx, candidate, marketType, resolution, pageFrom, currentTo)
+					if err == nil || !isRateLimitError(err) {
+						break
+					}
+					s.updateBackgroundJob(id, func(job *MaxHistoryJobStatus) {
+						job.Message = "Rate limited by DNSE; waiting before continuing"
+					})
+					select {
+					case <-ctx.Done():
+						s.finishBackgroundJob(id, "cancelled", ctx.Err().Error())
+						return
+					case <-time.After(time.Duration(rateWaits+1) * time.Minute):
+					}
+				}
+				if err != nil {
+					s.finishBackgroundJob(id, "failed", err.Error())
+					return
+				}
+				requests++
+				candidateRecords = append(candidateRecords, historyRecordsFromRaw(symbol, marketType, resolution, raw)...)
+				nextTime := parseFlexibleInt64(raw["nextTime"])
+				if nextTime <= 0 || nextTime > currentTo || nextTime <= pageFrom {
 					break
 				}
-				s.updateBackgroundJob(id, func(job *MaxHistoryJobStatus) {
-					job.Message = "Rate limited by DNSE; waiting before continuing"
-				})
-				select {
-				case <-ctx.Done():
-					s.finishBackgroundJob(id, "cancelled", ctx.Err().Error())
-					return
-				case <-time.After(time.Duration(rateWaits+1) * time.Minute):
-				}
+				pageFrom = nextTime
 			}
-			if err != nil {
-				s.finishBackgroundJob(id, "failed", err.Error())
-				return
-			}
-			requests++
-			records = append(records, historyRecordsFromRaw(symbol, marketType, resolution, raw)...)
-			nextTime := parseFlexibleInt64(raw["nextTime"])
-			if nextTime <= 0 || nextTime > currentTo || nextTime <= pageFrom {
+			if len(candidateRecords) > 0 || len(fetchCandidates) == 1 {
+				records = candidateRecords
+				fetchUsed = candidate
 				break
 			}
-			pageFrom = nextTime
 		}
 
 		if len(records) == 0 {
@@ -338,7 +572,7 @@ func (s *HistoryService) runBackgroundMaxSync(ctx context.Context, id string, op
 			job.EmptyBatches = emptyBatches
 			job.EarliestTimeMS = earliestMS
 			job.LatestTimeMS = latestMS
-			job.Message = "Background maximum history sync is running"
+			job.Message = "Background maximum history sync is running via " + fetchUsed
 		})
 		if emptyBatches >= maxEmptyBatches {
 			break
@@ -352,11 +586,127 @@ func (s *HistoryService) runBackgroundMaxSync(ctx context.Context, id string, op
 		}
 	}
 
+	if strings.EqualFold(marketType, "STOCK") && resolution == 1 {
+		if err := s.runStockDailyFallbackSync(ctx, id, symbol, marketType, fetchCandidates, batchDays, &requests, &totalSynced, &earliestMS, &latestMS); err != nil {
+			s.finishBackgroundJob(id, "failed", err.Error())
+			return
+		}
+	}
+
 	s.EnsureSnapshotFromCache(ctx, symbol)
 	s.finishBackgroundJob(id, "completed", "Background maximum history sync completed")
 	s.logger.Info("history_background_max_completed", map[string]any{
 		"symbol": symbol, "requests": requests, "candles": totalSynced, "earliestTimeMS": earliestMS,
 	})
+}
+
+func (s *HistoryService) runStockDailyFallbackSync(ctx context.Context, id, symbol, marketType string, fetchCandidates []string, batchDays int, requests, totalSynced *int, earliestMS, latestMS *int64) error {
+	if len(fetchCandidates) == 0 {
+		fetchCandidates = []string{symbol}
+	}
+	dailyBatchDays := batchDays
+	if dailyBatchDays < 365 {
+		dailyBatchDays = 365
+	}
+	batchSeconds := int64(dailyBatchDays * 24 * 3600)
+	currentTo := time.Now().Unix()
+	floor := time.Date(1990, 1, 1, 0, 0, 0, 0, vnLocation).Unix()
+	emptyBatches := 0
+	maxEmptyBatches := 12
+
+	s.logger.Info("history_stock_daily_fallback_started", map[string]any{
+		"symbol": symbol, "marketType": marketType, "resolution": stockDailyFallbackResolution,
+	})
+
+	for currentTo > floor {
+		currentFrom := currentTo - batchSeconds + 1
+		if currentFrom < floor {
+			currentFrom = floor
+		}
+
+		records := make([]storage.HistoryCandleRecord, 0)
+		fetchUsed := fetchCandidates[0]
+		for _, candidate := range fetchCandidates {
+			candidateRecords := make([]storage.HistoryCandleRecord, 0)
+			pageFrom := currentFrom
+			for page := 0; page < 100 && pageFrom <= currentTo; page++ {
+				var raw map[string]any
+				var err error
+				for rateWaits := 0; rateWaits < 8; rateWaits++ {
+					raw, err = s.fetchOHLCWithRetry(ctx, candidate, marketType, stockDailyFallbackResolution, pageFrom, currentTo)
+					if err == nil || !isRateLimitError(err) {
+						break
+					}
+					s.updateBackgroundJob(id, func(job *MaxHistoryJobStatus) {
+						job.Message = "Rate limited by DNSE; waiting before continuing daily fallback"
+					})
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(time.Duration(rateWaits+1) * time.Minute):
+					}
+				}
+				if err != nil {
+					return err
+				}
+				(*requests)++
+				candidateRecords = append(candidateRecords, historyRecordsFromRaw(symbol, marketType, stockDailyFallbackResolution, raw)...)
+				nextTime := parseFlexibleInt64(raw["nextTime"])
+				if nextTime <= 0 || nextTime > currentTo || nextTime <= pageFrom {
+					break
+				}
+				pageFrom = nextTime
+			}
+			if len(candidateRecords) > 0 || len(fetchCandidates) == 1 {
+				records = candidateRecords
+				fetchUsed = candidate
+				break
+			}
+		}
+
+		if len(records) == 0 {
+			emptyBatches++
+		} else {
+			emptyBatches = 0
+			if s.cache != nil {
+				if err := s.cache.UpsertHistoryCandles(ctx, records); err != nil {
+					return err
+				}
+			}
+			*totalSynced += len(records)
+			for _, record := range records {
+				if *earliestMS == 0 || record.TimeMS < *earliestMS {
+					*earliestMS = record.TimeMS
+				}
+				if record.TimeMS > *latestMS {
+					*latestMS = record.TimeMS
+				}
+			}
+		}
+
+		s.updateBackgroundJob(id, func(job *MaxHistoryJobStatus) {
+			job.Requests = *requests
+			job.CandlesSynced = *totalSynced
+			job.EmptyBatches = emptyBatches
+			job.EarliestTimeMS = *earliestMS
+			job.LatestTimeMS = *latestMS
+			job.Message = "Background maximum history sync is running via " + fetchUsed + " daily fallback"
+		})
+		if emptyBatches >= maxEmptyBatches {
+			break
+		}
+		currentTo = currentFrom - 1
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+
+	s.logger.Info("history_stock_daily_fallback_completed", map[string]any{
+		"symbol": symbol, "requests": *requests, "candles": *totalSynced, "earliestTimeMS": *earliestMS,
+	})
+	return nil
 }
 
 func (s *HistoryService) normalizeHistoryTarget(opt SyncOptions) (string, string, int) {
@@ -433,16 +783,6 @@ func (s *HistoryService) EnsureSnapshotFromCache(ctx context.Context, symbol str
 		resolution = 1
 	}
 
-	lookbackDays := s.cfg.InitialLookbackDays
-	if lookbackDays <= 0 {
-		lookbackDays = 365
-	}
-	toMS := time.Now().UnixMilli()
-	fromMS := time.Now().Add(-time.Duration(lookbackDays) * 24 * time.Hour).UnixMilli()
-	if !s.snapshotNeedsCacheLoad(symbol, fromMS) {
-		return true
-	}
-
 	minMS, maxMS, count, err := s.cache.GetHistoryCoverage(ctx, symbol, marketType, resolution)
 	if err != nil {
 		s.logger.Error("history_cache_snapshot_coverage_failed", map[string]any{
@@ -450,17 +790,21 @@ func (s *HistoryService) EnsureSnapshotFromCache(ctx context.Context, symbol str
 		})
 		return false
 	}
+	if strings.EqualFold(marketType, "STOCK") && resolution == 1 {
+		if s.ensureStockDailyFallbackSnapshot(ctx, symbol, marketType, minMS, maxMS, count) {
+			return true
+		}
+	}
 	if count == 0 || maxMS <= 0 {
 		return false
 	}
-	if minMS > fromMS {
-		fromMS = minMS
-	}
-	if maxMS < toMS {
-		toMS = maxMS
-	}
+	fromMS := minMS
+	toMS := maxMS
 	if toMS <= fromMS {
 		return false
+	}
+	if s.snapshotCoversRange(symbol, marketType, resolution, fromMS, toMS) {
+		return true
 	}
 
 	records, err := s.cache.LoadHistoryCandles(ctx, symbol, marketType, resolution, fromMS, toMS)
@@ -485,23 +829,115 @@ func (s *HistoryService) EnsureSnapshotFromCache(ctx context.Context, symbol str
 	return true
 }
 
-func (s *HistoryService) snapshotNeedsCacheLoad(symbol string, requestedFromMS int64) bool {
+func (s *HistoryService) ensureStockDailyFallbackSnapshot(ctx context.Context, symbol, marketType string, m1MinMS, m1MaxMS int64, m1Count int) bool {
+	if s == nil || s.cache == nil {
+		return false
+	}
+	dailyMinMS, dailyMaxMS, dailyCount, err := s.cache.GetHistoryCoverage(ctx, symbol, marketType, stockDailyFallbackResolution)
+	if err != nil {
+		s.logger.Error("history_daily_fallback_coverage_failed", map[string]any{
+			"symbol": symbol, "marketType": marketType, "error": err.Error(),
+		})
+		return false
+	}
+	if dailyCount == 0 || dailyMaxMS <= 0 {
+		return false
+	}
+	if m1Count > 0 && dailyMinMS >= m1MinMS {
+		return false
+	}
+
+	fromMS := dailyMinMS
+	toMS := dailyMaxMS
+	if m1Count > 0 && m1MaxMS > toMS {
+		toMS = m1MaxMS
+	}
+	if toMS <= fromMS {
+		return false
+	}
+	if s.snapshotCoversRange(symbol, marketType, 1, fromMS, toMS) {
+		return true
+	}
+
+	records := make([]storage.HistoryCandleRecord, 0)
+	dailyToMS := dailyMaxMS
+	if m1Count > 0 {
+		dailyToMS = localTradingDayStartMS(m1MinMS) - 1
+		if dailyToMS > dailyMaxMS {
+			dailyToMS = dailyMaxMS
+		}
+	}
+	if dailyToMS >= dailyMinMS {
+		dailyRecords, loadErr := s.cache.LoadHistoryCandles(ctx, symbol, marketType, stockDailyFallbackResolution, dailyMinMS, dailyToMS)
+		if loadErr != nil {
+			s.logger.Error("history_daily_fallback_load_failed", map[string]any{
+				"symbol": symbol, "marketType": marketType, "error": loadErr.Error(),
+			})
+			return false
+		}
+		records = append(records, dailyRecords...)
+	}
+	if m1Count > 0 {
+		m1Records, loadErr := s.cache.LoadHistoryCandles(ctx, symbol, marketType, 1, m1MinMS, m1MaxMS)
+		if loadErr != nil {
+			s.logger.Error("history_m1_fallback_load_failed", map[string]any{
+				"symbol": symbol, "marketType": marketType, "error": loadErr.Error(),
+			})
+			return false
+		}
+		records = append(records, m1Records...)
+	}
+	if len(records) == 0 {
+		return false
+	}
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].TimeMS < records[j].TimeMS
+	})
+
+	candles := recordsToCandles(records)
+	key := HistoryKey{Symbol: symbol, MarketType: marketType, Resolution: 1}
+	s.replaceStagedCandles(key, candles)
+	s.cloneTickerAliasSnapshots(ctx, key)
+	s.logger.Info("history_cache_snapshot_loaded", map[string]any{
+		"symbol": symbol, "marketType": marketType, "resolution": 1,
+		"fromMS": fromMS, "toMS": toMS, "candles": len(candles), "dailyFallback": true,
+	})
+	return true
+}
+
+func localTradingDayStartMS(valueMS int64) int64 {
+	t := time.UnixMilli(valueMS).In(vnLocation)
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, vnLocation).UnixMilli()
+}
+
+func (s *HistoryService) snapshotCoversRange(symbol, marketType string, resolution int, fromMS, toMS int64) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	marketType = strings.ToUpper(strings.TrimSpace(marketType))
+	if resolution <= 0 {
+		resolution = 1
+	}
 	for _, snapshot := range s.snapshots {
-		if !strings.EqualFold(snapshot.key.Symbol, symbol) || len(snapshot.candles) == 0 {
+		if !strings.EqualFold(snapshot.key.Symbol, symbol) ||
+			!strings.EqualFold(snapshot.key.MarketType, marketType) ||
+			snapshot.key.Resolution != resolution ||
+			len(snapshot.candles) == 0 {
 			continue
 		}
 		first := snapshot.candles[0].Time
+		last := snapshot.candles[0].Time
 		for _, candle := range snapshot.candles[1:] {
 			if candle.Time < first {
 				first = candle.Time
 			}
+			if candle.Time > last {
+				last = candle.Time
+			}
 		}
-		return first > requestedFromMS+3*24*60*60*1000
+		return first <= fromMS+time.Hour.Milliseconds() && last >= toMS-time.Hour.Milliseconds()
 	}
-	return true
+	return false
 }
 
 func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (any, error) {
@@ -509,19 +945,9 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 		return SyncResult{Success: false, Message: "History sync disabled"}, nil
 	}
 
-	symbol := strings.ToUpper(strings.TrimSpace(opt.Symbol))
-	if symbol == "" {
-		symbol = strings.ToUpper(strings.TrimSpace(s.cfg.Symbol))
-	}
+	symbol, marketType, resolution := s.normalizeHistoryTarget(opt)
 	fetchSymbol := s.resolveHistoryFetchSymbol(ctx, symbol)
-	marketType := strings.ToUpper(strings.TrimSpace(opt.MarketType))
-	if marketType == "" {
-		marketType = strings.ToUpper(strings.TrimSpace(s.cfg.MarketType))
-	}
-	resolution := opt.Resolution
-	if resolution <= 0 {
-		resolution = s.cfg.Resolution
-	}
+	fetchCandidates := s.historyFetchCandidates(ctx, symbol)
 
 	var from, to int64
 	now := time.Now().Unix()
@@ -641,56 +1067,73 @@ func (s *HistoryService) SyncWithOptions(ctx context.Context, opt SyncOptions) (
 		}
 
 		batchAdded := 0
-		pageFrom := currentFrom
-		for page := 0; page < 100 && pageFrom <= currentTo; page++ {
-			raw, err := s.fetchOHLCWithRetry(ctx, fetchSymbol, marketType, resolution, pageFrom, currentTo)
-			if err != nil {
-				s.store.LogHistorySync(ctx, firstTime, lastTime, "failed", totalCandles)
-				return SyncResult{Success: false, Message: err.Error()}, err
+		fetchUsed := fetchCandidates[0]
+		for _, candidate := range fetchCandidates {
+			candidateCandles := make([]HistoryCandle, 0)
+			candidateSeen := make(map[int64]bool)
+			pageFrom := currentFrom
+			for page := 0; page < 100 && pageFrom <= currentTo; page++ {
+				raw, err := s.fetchOHLCWithRetry(ctx, candidate, marketType, resolution, pageFrom, currentTo)
+				if err != nil {
+					s.store.LogHistorySync(ctx, firstTime, lastTime, "failed", totalCandles)
+					return SyncResult{Success: false, Message: err.Error()}, err
+				}
+
+				tList, _ := raw["t"].([]any)
+				oList, _ := raw["o"].([]any)
+				hList, _ := raw["h"].([]any)
+				lList, _ := raw["l"].([]any)
+				cList, _ := raw["c"].([]any)
+				vList, _ := raw["v"].([]any)
+
+				count := len(tList)
+				for i := 0; i < count; i++ {
+					t := parseInt64(tList, i)
+					if t <= 0 {
+						continue
+					}
+					if t < 100000000000 {
+						t *= 1000
+					}
+					if candidateSeen[t] {
+						continue
+					}
+					candidateSeen[t] = true
+
+					candidateCandles = append(candidateCandles, HistoryCandle{
+						IsHistory:  1,
+						Time:       t,
+						Open:       parseFloat64(oList, i),
+						High:       parseFloat64(hList, i),
+						Low:        parseFloat64(lList, i),
+						Close:      parseFloat64(cList, i),
+						TickVolume: parseInt64(vList, i),
+					})
+				}
+
+				nextTime := parseFlexibleInt64(raw["nextTime"])
+				if nextTime <= 0 || nextTime > currentTo || nextTime <= pageFrom {
+					break
+				}
+				pageFrom = nextTime
 			}
-
-			tList, _ := raw["t"].([]any)
-			oList, _ := raw["o"].([]any)
-			hList, _ := raw["h"].([]any)
-			lList, _ := raw["l"].([]any)
-			cList, _ := raw["c"].([]any)
-			vList, _ := raw["v"].([]any)
-
-			count := len(tList)
-			for i := 0; i < count; i++ {
-				t := parseInt64(tList, i)
-				if t <= 0 {
+			if len(candidateCandles) == 0 && len(fetchCandidates) > 1 {
+				continue
+			}
+			fetchUsed = candidate
+			for _, candle := range candidateCandles {
+				if seen[candle.Time] {
 					continue
 				}
-				if t < 100000000000 {
-					t *= 1000
-				}
-				if seen[t] {
-					continue
-				}
-				seen[t] = true
-
-				stagedCandles = append(stagedCandles, HistoryCandle{
-					IsHistory:  1,
-					Time:       t,
-					Open:       parseFloat64(oList, i),
-					High:       parseFloat64(hList, i),
-					Low:        parseFloat64(lList, i),
-					Close:      parseFloat64(cList, i),
-					TickVolume: parseInt64(vList, i),
-				})
+				seen[candle.Time] = true
+				stagedCandles = append(stagedCandles, candle)
 				batchAdded++
 				totalCandles++
 			}
-
-			nextTime := parseFlexibleInt64(raw["nextTime"])
-			if nextTime <= 0 || nextTime > currentTo || nextTime <= pageFrom {
-				break
-			}
-			pageFrom = nextTime
+			break
 		}
 
-		s.logger.Info("history_sync_batch_completed", map[string]any{"currentFrom": currentFrom, "currentTo": currentTo, "added": batchAdded})
+		s.logger.Info("history_sync_batch_completed", map[string]any{"currentFrom": currentFrom, "currentTo": currentTo, "added": batchAdded, "fetchSymbol": fetchUsed})
 		currentFrom = currentTo + 1
 	}
 
@@ -785,6 +1228,29 @@ func (s *HistoryService) resolveHistoryFetchSymbol(ctx context.Context, symbol s
 		return symbol
 	}
 	return feed
+}
+
+func (s *HistoryService) historyFetchCandidates(ctx context.Context, symbol string) []string {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	seen := make(map[string]struct{}, 2)
+	out := make([]string, 0, 2)
+	add := func(value string) {
+		value = strings.ToUpper(strings.TrimSpace(value))
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	add(s.resolveHistoryFetchSymbol(ctx, symbol))
+	add(symbol)
+	if len(out) == 0 {
+		add(s.cfg.Symbol)
+	}
+	return out
 }
 
 func (s *HistoryService) Candles() []HistoryCandle {

@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"hash/fnv"
 	"net"
 	"strings"
 	"sync"
@@ -87,7 +89,8 @@ func (p *Publisher) handle(ctx context.Context, conn net.Conn) {
 		return err == nil
 	}
 
-	if !p.writeHistorySnapshot(ctx, subscribedSymbol, writeLine) {
+	lastHistorySignature := ""
+	if !p.writeHistorySnapshot(ctx, subscribedSymbol, writeLine, &lastHistorySignature) {
 		return
 	}
 
@@ -106,7 +109,7 @@ func (p *Publisher) handle(ctx context.Context, conn net.Conn) {
 			if !strings.EqualFold(key.Symbol, subscribedSymbol) {
 				continue
 			}
-			if !p.writeHistorySnapshot(ctx, subscribedSymbol, writeLine) {
+			if !p.writeHistorySnapshot(ctx, subscribedSymbol, writeLine, &lastHistorySignature) {
 				return
 			}
 		case tick, ok := <-ticks:
@@ -146,7 +149,7 @@ func (p *Publisher) readSubscription(conn net.Conn) string {
 	return symbol
 }
 
-func (p *Publisher) writeHistorySnapshot(ctx context.Context, symbol string, writeLine func([]byte) bool) bool {
+func (p *Publisher) writeHistorySnapshot(ctx context.Context, symbol string, writeLine func([]byte) bool, lastSignature *string) bool {
 	if p.history != nil {
 		p.history.EnsureSnapshotFromCache(ctx, symbol)
 	}
@@ -154,6 +157,13 @@ func (p *Publisher) writeHistorySnapshot(ctx context.Context, symbol string, wri
 	if !ok {
 		key = HistoryKey{Symbol: symbol}
 		candles = nil
+	}
+	signature := historySnapshotSignature(key, candles)
+	if lastSignature != nil && *lastSignature == signature {
+		return true
+	}
+	if lastSignature != nil {
+		*lastSignature = signature
 	}
 	startLine, _ := json.Marshal(map[string]any{
 		"type":   "history_start",
@@ -174,4 +184,18 @@ func (p *Publisher) writeHistorySnapshot(ctx context.Context, symbol string, wri
 		"count":  len(candles),
 	})
 	return writeLine(append(endLine, '\n'))
+}
+
+func historySnapshotSignature(key HistoryKey, candles []HistoryCandle) string {
+	h := fnv.New64a()
+	for _, candle := range candles {
+		_, _ = fmt.Fprintf(h, "%d|%.8f|%.8f|%.8f|%.8f|%d;", candle.Time, candle.Open, candle.High, candle.Low, candle.Close, candle.TickVolume)
+	}
+	return fmt.Sprintf("%s|%s|%d|%d|%x",
+		strings.ToUpper(strings.TrimSpace(key.Symbol)),
+		strings.ToUpper(strings.TrimSpace(key.MarketType)),
+		key.Resolution,
+		len(candles),
+		h.Sum64(),
+	)
 }

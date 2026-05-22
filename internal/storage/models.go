@@ -46,6 +46,16 @@ type HistoryCandleRecord struct {
 	UpdatedAt  time.Time
 }
 
+type HistoryCoverageRecord struct {
+	Symbol      string
+	MarketType  string
+	Resolution  int
+	FirstTimeMS int64
+	LastTimeMS  int64
+	Count       int
+	UpdatedAt   time.Time
+}
+
 type TickerMetadataRecord struct {
 	Symbol      string
 	FeedSymbol  string

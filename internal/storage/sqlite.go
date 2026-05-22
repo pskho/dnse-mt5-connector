@@ -307,6 +307,89 @@ func (s *SQLiteStore) GetHistoryCoverage(ctx context.Context, symbol, marketType
 	return
 }
 
+func (s *SQLiteStore) ListHistoryCoverages(ctx context.Context, symbol, marketType string) ([]HistoryCoverageRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT symbol, market_type, resolution,
+			COALESCE(MIN(time_ms), 0), COALESCE(MAX(time_ms), 0), COUNT(1), COALESCE(MAX(updated_at), '')
+		FROM history_candles
+		WHERE (? = '' OR symbol = ?) AND (? = '' OR market_type = ?)
+		GROUP BY symbol, market_type, resolution
+		ORDER BY symbol ASC, market_type ASC, resolution ASC`,
+		symbol, symbol, marketType, marketType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []HistoryCoverageRecord
+	for rows.Next() {
+		var record HistoryCoverageRecord
+		var updatedAt string
+		if err := rows.Scan(&record.Symbol, &record.MarketType, &record.Resolution, &record.FirstTimeMS, &record.LastTimeMS, &record.Count, &updatedAt); err != nil {
+			return nil, err
+		}
+		record.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+		out = append(out, record)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStore) LoadHistoryCandlesSample(ctx context.Context, symbol, marketType string, resolution int, fromMS, toMS int64, limit int) ([]HistoryCandleRecord, int, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1)
+		FROM history_candles
+		WHERE symbol = ? AND market_type = ? AND resolution = ? AND time_ms BETWEEN ? AND ?`,
+		symbol, marketType, resolution, fromMS, toMS).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	if total == 0 {
+		return nil, 0, nil
+	}
+	if total <= limit {
+		records, err := s.LoadHistoryCandles(ctx, symbol, marketType, resolution, fromMS, toMS)
+		return records, total, err
+	}
+
+	step := total / limit
+	if total%limit != 0 {
+		step++
+	}
+	if step <= 0 {
+		step = 1
+	}
+	rows, err := s.db.QueryContext(ctx, `WITH ordered AS (
+			SELECT symbol, market_type, resolution, time_ms, open, high, low, close, tick_volume, updated_at,
+				ROW_NUMBER() OVER (ORDER BY time_ms ASC) AS rn,
+				COUNT(1) OVER () AS total_rows
+			FROM history_candles
+			WHERE symbol = ? AND market_type = ? AND resolution = ? AND time_ms BETWEEN ? AND ?
+		)
+		SELECT symbol, market_type, resolution, time_ms, open, high, low, close, tick_volume, updated_at
+		FROM ordered
+		WHERE rn = 1 OR rn = total_rows OR ((rn - 1) % ? = 0)
+		ORDER BY time_ms ASC
+		LIMIT ?`,
+		symbol, marketType, resolution, fromMS, toMS, step, limit+2)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var out []HistoryCandleRecord
+	for rows.Next() {
+		var record HistoryCandleRecord
+		var updatedAt string
+		if err := rows.Scan(&record.Symbol, &record.MarketType, &record.Resolution, &record.TimeMS, &record.Open, &record.High, &record.Low, &record.Close, &record.TickVolume, &updatedAt); err != nil {
+			return nil, 0, err
+		}
+		record.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+		out = append(out, record)
+	}
+	return out, total, rows.Err()
+}
+
 func (s *SQLiteStore) UpsertTickerMetadata(ctx context.Context, records []TickerMetadataRecord) error {
 	if len(records) == 0 {
 		return nil

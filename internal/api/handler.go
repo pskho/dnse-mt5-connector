@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -96,6 +97,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/history/backfill-all", h.historyBackfillAll)
 	mux.HandleFunc("/history/today-all", h.historyTodayAll)
 	mux.HandleFunc("/history/max-background", h.historyMaxBackground)
+	mux.HandleFunc("/history/cache", h.historyCache)
 	mux.HandleFunc("/otp/latest", h.getLatestOTP)
 	mux.HandleFunc("/accounts/orderable", h.orderableAccounts)
 	mux.HandleFunc("/api/dnse/orderable-accounts", h.dnseOrderableAccounts)
@@ -1217,7 +1219,7 @@ func (h *Handler) historySync(w http.ResponseWriter, r *http.Request) {
 		result, err := svc.SyncWithOptions(r.Context(), marketdata.SyncOptions{
 			FirstTime:  req.FirstTime,
 			LastTime:   req.LastTime,
-			Symbol:     fetchSymbol,
+			Symbol:     symbol,
 			MarketType: req.MarketType,
 			Resolution: req.Resolution,
 		})
@@ -1264,7 +1266,7 @@ func (h *Handler) historyFull(w http.ResponseWriter, r *http.Request) {
 		result, err := svc.SyncWithOptions(r.Context(), marketdata.SyncOptions{
 			ForceFull:    true,
 			LookbackDays: req.LookbackDays,
-			Symbol:       fetchSymbol,
+			Symbol:       symbol,
 			MarketType:   req.MarketType,
 			Resolution:   req.Resolution,
 		})
@@ -1312,7 +1314,7 @@ func (h *Handler) historyBackfill(w http.ResponseWriter, r *http.Request) {
 			ForceFull:    true,
 			BeforeToday:  true,
 			LookbackDays: req.LookbackDays,
-			Symbol:       fetchSymbol,
+			Symbol:       symbol,
 			MarketType:   req.MarketType,
 			Resolution:   req.Resolution,
 		})
@@ -1350,7 +1352,7 @@ func (h *Handler) historyToday(w http.ResponseWriter, r *http.Request) {
 		fetchSymbol := h.resolveHistoryFetchSymbol(r.Context(), symbol)
 		result, err := svc.SyncWithOptions(r.Context(), marketdata.SyncOptions{
 			TodayOnly:  true,
-			Symbol:     fetchSymbol,
+			Symbol:     symbol,
 			MarketType: req.MarketType,
 			Resolution: req.Resolution,
 		})
@@ -1423,6 +1425,35 @@ func (h *Handler) historyMaxBackground(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"job":     status,
 	})
+}
+
+func (h *Handler) historyCache(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	type cachedHistoryProvider interface {
+		CachedHistory(ctx context.Context, symbol, marketType string, resolution, limit int) (marketdata.CachedHistoryData, error)
+	}
+	svc, ok := h.history.(cachedHistoryProvider)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "history cache lookup is not supported")
+		return
+	}
+	q := r.URL.Query()
+	symbol := strings.ToUpper(strings.TrimSpace(q.Get("symbol")))
+	if symbol == "" {
+		writeError(w, http.StatusBadRequest, "symbol is required")
+		return
+	}
+	resolution, _ := strconv.Atoi(q.Get("resolution"))
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	payload, err := svc.CachedHistory(r.Context(), symbol, q.Get("marketType"), resolution, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode string) {
@@ -1501,7 +1532,7 @@ func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode st
 			job = &syncJob{
 				fetchSymbol: canonical,
 				profile: marketdata.SymbolProfile{
-					Symbol:               canonical,
+					Symbol:               displaySymbol,
 					AssetClass:           profile.AssetClass,
 					MarketType:           profile.MarketType,
 					Channels:             profile.Channels,
@@ -1542,6 +1573,7 @@ func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode st
 			baseMessage = payload.Message
 		}
 		for _, member := range job.members {
+			sourceSymbol := job.profile.Symbol
 			entry := item{
 				Symbol:     member.Symbol,
 				MarketType: member.MarketType,
@@ -1551,12 +1583,12 @@ func (h *Handler) historySyncAll(w http.ResponseWriter, r *http.Request, mode st
 			if err != nil {
 				entry.Message = err.Error()
 			} else {
-				if !strings.EqualFold(member.Symbol, job.fetchSymbol) && cloner != nil {
-					cloner.CloneSnapshot(job.fetchSymbol, member.Symbol, member.MarketType, member.Resolution)
+				if !strings.EqualFold(member.Symbol, sourceSymbol) && cloner != nil {
+					cloner.CloneSnapshot(sourceSymbol, member.Symbol, member.MarketType, member.Resolution)
 				}
 				entry.Message = baseMessage
-				if !strings.EqualFold(member.Symbol, job.fetchSymbol) {
-					entry.Message = "Reused history from " + job.fetchSymbol
+				if !strings.EqualFold(member.Symbol, sourceSymbol) {
+					entry.Message = "Reused history from " + sourceSymbol
 				}
 				successCount++
 			}

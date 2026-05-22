@@ -372,10 +372,10 @@ func (c *DNSEClient) FetchOHLC(ctx context.Context, symbol, marketType string, r
 			"v": vList,
 		}, nil
 	}
-	path := fmt.Sprintf("/price/ohlc?symbol=%s&type=%s&resolution=%d&from=%d&to=%d",
+	path := fmt.Sprintf("/price/ohlc?symbol=%s&type=%s&resolution=%s&from=%d&to=%d",
 		url.QueryEscape(symbol),
 		url.QueryEscape(marketType),
-		resolution,
+		url.QueryEscape(ohlcResolutionParam(resolution)),
 		from,
 		to,
 	)
@@ -384,6 +384,20 @@ func (c *DNSEClient) FetchOHLC(ctx context.Context, symbol, marketType string, r
 		return nil, err
 	}
 	return raw, nil
+}
+
+func ohlcResolutionParam(resolution int) string {
+	switch resolution {
+	case 1440:
+		return "1D"
+	case 10080:
+		return "1W"
+	default:
+		if resolution <= 0 {
+			resolution = 1
+		}
+		return strconv.Itoa(resolution)
+	}
 }
 
 func (c *DNSEClient) GetSecurityDefinition(ctx context.Context, symbol string) ([]map[string]any, error) {
