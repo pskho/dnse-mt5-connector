@@ -18,16 +18,19 @@ import (
 const defaultDerivativeCatalogURL = "https://services-staging.entrade.com.vn/papertrade-entrade-api/derivatives"
 
 type SymbolCatalogService struct {
-	http        *http.Client
-	logger      *logger.FileLogger
-	url         string
-	instruments InstrumentCatalogClient
-	tickers     TickerCatalogClient
-	store       TickerMetadataStore
-	mu          sync.Mutex
-	cache       map[string][]InstrumentSymbolInfo
-	derivatives []DerivativeSymbolInfo
-	tickerCache []storage.TickerMetadataRecord
+	http                   *http.Client
+	logger                 *logger.FileLogger
+	url                    string
+	instruments            InstrumentCatalogClient
+	tickers                TickerCatalogClient
+	store                  TickerMetadataStore
+	mu                     sync.Mutex
+	cache                  map[string][]InstrumentSymbolInfo
+	derivatives            []DerivativeSymbolInfo
+	derivativesLoadedAt    time.Time
+	tickerCache            []storage.TickerMetadataRecord
+	tickerCacheLoadedAt    time.Time
+	tickerCacheFromNetwork bool
 }
 
 type InstrumentCatalogClient interface {
@@ -105,8 +108,12 @@ func NewSymbolCatalogService(appLog *logger.FileLogger, catalogURL string, instr
 }
 
 func (s *SymbolCatalogService) GetDerivativeSymbols(ctx context.Context) ([]DerivativeSymbolInfo, error) {
+	return s.getDerivativeSymbols(ctx, false)
+}
+
+func (s *SymbolCatalogService) getDerivativeSymbols(ctx context.Context, forceRefresh bool) ([]DerivativeSymbolInfo, error) {
 	s.mu.Lock()
-	if len(s.derivatives) > 0 {
+	if !forceRefresh && len(s.derivatives) > 0 && time.Since(s.derivativesLoadedAt) < 5*time.Minute {
 		cached := append([]DerivativeSymbolInfo(nil), s.derivatives...)
 		s.mu.Unlock()
 		return cached, nil
@@ -132,11 +139,14 @@ func (s *SymbolCatalogService) GetDerivativeSymbols(ctx context.Context) ([]Deri
 	payload.Data = mergeKnownDerivativeTargets(payload.Data)
 	s.mu.Lock()
 	s.derivatives = append([]DerivativeSymbolInfo(nil), payload.Data...)
+	s.derivativesLoadedAt = time.Now()
 	s.mu.Unlock()
-	s.logger.Info("derivative_catalog_loaded", map[string]any{
-		"url":   s.url,
-		"total": len(payload.Data),
-	})
+	if s.logger != nil {
+		s.logger.Info("derivative_catalog_loaded", map[string]any{
+			"url":   s.url,
+			"total": len(payload.Data),
+		})
+	}
 	return payload.Data, nil
 }
 
@@ -144,6 +154,19 @@ func (s *SymbolCatalogService) ResolveMarketFeedSymbol(ctx context.Context, disp
 	displaySymbol = strings.ToUpper(strings.TrimSpace(displaySymbol))
 	if displaySymbol == "" {
 		return "", false, nil
+	}
+
+	if isContinuousDerivativeAlias(displaySymbol) {
+		if code, ok, err := s.resolveDerivativeAlias(ctx, displaySymbol, true); err != nil {
+			return "", false, err
+		} else if ok {
+			return code, true, nil
+		}
+		if code, ok, err := s.resolveFreshTickerFeedSymbol(ctx, displaySymbol); err != nil {
+			return "", false, err
+		} else if ok {
+			return code, true, nil
+		}
 	}
 
 	if record, err := s.GetTickerMetadataBySymbol(ctx, displaySymbol); err == nil {
@@ -154,15 +177,41 @@ func (s *SymbolCatalogService) ResolveMarketFeedSymbol(ctx context.Context, disp
 		return "", false, err
 	}
 
-	items, err := s.GetDerivativeSymbols(ctx)
+	return s.resolveDerivativeAlias(ctx, displaySymbol, false)
+}
+
+func (s *SymbolCatalogService) resolveDerivativeAlias(ctx context.Context, displaySymbol string, forceRefresh bool) (string, bool, error) {
+	items, err := s.getDerivativeSymbols(ctx, forceRefresh)
 	if err != nil {
 		return "", false, err
 	}
 	for _, item := range items {
 		alias := strings.ToUpper(strings.TrimSpace(item.Type))
 		code := strings.ToUpper(strings.TrimSpace(item.Symbol))
-		if alias == displaySymbol && code != "" {
+		if alias == displaySymbol && code != "" && code != displaySymbol {
 			return code, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+func isContinuousDerivativeAlias(symbol string) bool {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	return strings.HasPrefix(symbol, "VN30F") || strings.HasPrefix(symbol, "V100F")
+}
+
+func (s *SymbolCatalogService) resolveFreshTickerFeedSymbol(ctx context.Context, displaySymbol string) (string, bool, error) {
+	items, err := s.getFreshTickerMetadata(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	for _, item := range items {
+		if !strings.EqualFold(item.Symbol, displaySymbol) {
+			continue
+		}
+		feed := strings.ToUpper(strings.TrimSpace(item.FeedSymbol))
+		if feed != "" && feed != displaySymbol {
+			return feed, true, nil
 		}
 	}
 	return "", false, nil
@@ -276,6 +325,8 @@ func (s *SymbolCatalogService) GetTickerMetadata(ctx context.Context, forceRefre
 		if err == nil && len(cached) > 0 {
 			s.mu.Lock()
 			s.tickerCache = append([]storage.TickerMetadataRecord(nil), cached...)
+			s.tickerCacheLoadedAt = time.Now()
+			s.tickerCacheFromNetwork = false
 			s.mu.Unlock()
 			return cached, nil
 		}
@@ -309,7 +360,7 @@ func (s *SymbolCatalogService) GetTickerMetadata(ctx context.Context, forceRefre
 		for _, item := range derivatives {
 			display := strings.ToUpper(strings.TrimSpace(item.Type))
 			feed := strings.ToUpper(strings.TrimSpace(item.Symbol))
-			if display == "" || feed == "" {
+			if display == "" || feed == "" || display == feed {
 				continue
 			}
 			records = append(records, storage.TickerMetadataRecord{
@@ -331,8 +382,21 @@ func (s *SymbolCatalogService) GetTickerMetadata(ctx context.Context, forceRefre
 	}
 	s.mu.Lock()
 	s.tickerCache = append([]storage.TickerMetadataRecord(nil), records...)
+	s.tickerCacheLoadedAt = time.Now()
+	s.tickerCacheFromNetwork = true
 	s.mu.Unlock()
 	return records, nil
+}
+
+func (s *SymbolCatalogService) getFreshTickerMetadata(ctx context.Context) ([]storage.TickerMetadataRecord, error) {
+	s.mu.Lock()
+	if len(s.tickerCache) > 0 && s.tickerCacheFromNetwork && time.Since(s.tickerCacheLoadedAt) < 5*time.Minute {
+		cached := append([]storage.TickerMetadataRecord(nil), s.tickerCache...)
+		s.mu.Unlock()
+		return cached, nil
+	}
+	s.mu.Unlock()
+	return s.GetTickerMetadata(ctx, true)
 }
 
 func (s *SymbolCatalogService) GetTickerMetadataBySymbol(ctx context.Context, symbol string) (storage.TickerMetadataRecord, error) {

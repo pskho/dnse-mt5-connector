@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ type symbolRuntimeState struct {
 	lastWSTickAt        time.Time
 	resolvedBoardID     string
 	resolvedFeedSymbol  string
+	resolvedAt          time.Time
 	nextRESTAttemptAt   time.Time
 	sampleRawRemaining  int
 	sampleTickRemaining int
@@ -386,8 +388,9 @@ func (e *Engine) resolveFeedSymbol(ctx context.Context, profile SymbolProfile) (
 	state.mu.RLock()
 	boardID := state.resolvedBoardID
 	feedSymbol := state.resolvedFeedSymbol
+	resolvedAt := state.resolvedAt
 	state.mu.RUnlock()
-	if boardID != "" && feedSymbol != "" {
+	if boardID != "" && feedSymbol != "" && !shouldRefreshResolvedFeed(profile.Symbol, resolvedAt) {
 		return feedSymbol, boardID
 	}
 	if feedSymbol == "" {
@@ -415,9 +418,23 @@ func (e *Engine) resolveFeedSymbol(ctx context.Context, profile SymbolProfile) (
 			feedSymbol = strings.ToUpper(strings.TrimSpace(resolved))
 		}
 	}
-	items, err := e.client.GetSecurityDefinition(ctx, profile.Symbol)
+	if activeFeed := e.resolveActiveContinuousDerivativeFeed(ctx, profile.Symbol, feedSymbol); activeFeed != "" && activeFeed != feedSymbol {
+		e.logger.Info("marketdata_continuous_derivative_rollover_resolved", map[string]any{
+			"symbol":       profile.Symbol,
+			"previousFeed": feedSymbol,
+			"activeFeed":   activeFeed,
+			"resolver":     "secdef_final_trade_date",
+		})
+		feedSymbol = activeFeed
+	}
+
+	secdefSymbol := profile.Symbol
+	if isContinuousDerivativeAlias(profile.Symbol) && feedSymbol != "" {
+		secdefSymbol = feedSymbol
+	}
+	items, err := e.client.GetSecurityDefinition(ctx, secdefSymbol)
 	if err != nil {
-		e.logger.Error("marketdata_board_resolve_failed", map[string]any{"symbol": profile.Symbol, "error": err.Error()})
+		e.logger.Error("marketdata_board_resolve_failed", map[string]any{"symbol": profile.Symbol, "feedSymbol": secdefSymbol, "error": err.Error()})
 		return feedSymbol, boardID
 	}
 	bestBoard := boardID
@@ -445,9 +462,170 @@ func (e *Engine) resolveFeedSymbol(ctx context.Context, profile SymbolProfile) (
 	if feedSymbol != "" {
 		state.resolvedFeedSymbol = feedSymbol
 	}
+	state.resolvedAt = time.Now()
 	state.mu.Unlock()
 	e.logger.Info("marketdata_board_resolved", map[string]any{"symbol": profile.Symbol, "feedSymbol": feedSymbol, "boardId": boardID})
 	return feedSymbol, boardID
+}
+
+type derivativeContractCandidate struct {
+	Symbol         string
+	FinalTradeDate time.Time
+}
+
+func (e *Engine) resolveActiveContinuousDerivativeFeed(ctx context.Context, displaySymbol, currentFeed string) string {
+	displaySymbol = strings.ToUpper(strings.TrimSpace(displaySymbol))
+	if !isContinuousDerivativeAlias(displaySymbol) || e == nil || e.client == nil {
+		return ""
+	}
+	ordinal := continuousDerivativeOrdinal(displaySymbol)
+	if ordinal < 0 {
+		return ""
+	}
+	family := derivativeFeedFamily(displaySymbol)
+	if family == "" {
+		family = derivativeFeedFamily(currentFeed)
+	}
+	if family == "" {
+		return ""
+	}
+	candidates := e.derivativeFeedCandidates(family, currentFeed)
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	nowVN := time.Now().In(vnLocation)
+	today := time.Date(nowVN.Year(), nowVN.Month(), nowVN.Day(), 0, 0, 0, 0, vnLocation)
+	active := make([]derivativeContractCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		items, err := e.client.GetSecurityDefinition(ctx, candidate)
+		if err != nil {
+			e.logger.Error("marketdata_derivative_secdef_candidate_failed", map[string]any{
+				"symbol": displaySymbol, "candidate": candidate, "error": err.Error(),
+			})
+			continue
+		}
+		finalDate, ok := derivativeFinalTradeDate(items)
+		if !ok || finalDate.Before(today) {
+			continue
+		}
+		active = append(active, derivativeContractCandidate{Symbol: candidate, FinalTradeDate: finalDate})
+	}
+	if len(active) == 0 {
+		return ""
+	}
+	sort.Slice(active, func(i, j int) bool {
+		if active[i].FinalTradeDate.Equal(active[j].FinalTradeDate) {
+			return active[i].Symbol < active[j].Symbol
+		}
+		return active[i].FinalTradeDate.Before(active[j].FinalTradeDate)
+	})
+	if ordinal >= len(active) {
+		ordinal = len(active) - 1
+	}
+	return active[ordinal].Symbol
+}
+
+func (e *Engine) derivativeFeedCandidates(family, currentFeed string) []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0, len(e.profiles)+1)
+	add := func(symbol string) {
+		symbol = strings.ToUpper(strings.TrimSpace(symbol))
+		if symbol == "" || !looksLikeDerivativeFeedCode(symbol) || !strings.HasPrefix(symbol, family) {
+			return
+		}
+		if _, ok := seen[symbol]; ok {
+			return
+		}
+		seen[symbol] = struct{}{}
+		out = append(out, symbol)
+	}
+	add(currentFeed)
+	for _, profile := range e.profiles {
+		add(profile.Symbol)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func continuousDerivativeOrdinal(symbol string) int {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	switch {
+	case strings.HasSuffix(symbol, "F1M"):
+		return 0
+	case strings.HasSuffix(symbol, "F2M"):
+		return 1
+	case strings.HasSuffix(symbol, "F1Q"):
+		return 2
+	case strings.HasSuffix(symbol, "F2Q"):
+		return 3
+	default:
+		return -1
+	}
+}
+
+func derivativeFeedFamily(symbol string) string {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	switch {
+	case strings.HasPrefix(symbol, "VN30F"):
+		return "41I1"
+	case strings.HasPrefix(symbol, "V100F"):
+		return "41I2"
+	case looksLikeDerivativeFeedCode(symbol) && len(symbol) >= 4:
+		return symbol[:4]
+	default:
+		return ""
+	}
+}
+
+func derivativeFinalTradeDate(items []map[string]any) (time.Time, bool) {
+	var best time.Time
+	for _, item := range items {
+		raw := firstStringFromMap(item, "finalTradeDate", "final_trade_date", "expirationDate", "expiration_date")
+		if raw == "" {
+			continue
+		}
+		parsed, ok := parseDerivativeDate(raw)
+		if !ok {
+			continue
+		}
+		if best.IsZero() || parsed.Before(best) {
+			best = parsed
+		}
+	}
+	if best.IsZero() {
+		return time.Time{}, false
+	}
+	return best, true
+}
+
+func parseDerivativeDate(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	layouts := []string{time.RFC3339, "2006-01-02T15:04:05Z", "2006-01-02 15:04:05", "2006-01-02"}
+	for _, layout := range layouts {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed.In(vnLocation), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func shouldRefreshResolvedFeed(symbol string, resolvedAt time.Time) bool {
+	if resolvedAt.IsZero() {
+		return true
+	}
+	if isDerivativeSymbol(symbol) && isContinuousDerivativeAlias(symbol) {
+		return time.Since(resolvedAt) > 2*time.Minute
+	}
+	return false
+}
+
+func isContinuousDerivativeAlias(symbol string) bool {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	return strings.HasPrefix(symbol, "VN30F") || strings.HasPrefix(symbol, "V100F")
 }
 
 func preferredBoardID(items []map[string]any) string {
