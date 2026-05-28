@@ -820,15 +820,6 @@ func normalizeTradingConfig(in TradingConfig, dnseAccount string, entradeDefault
 		}
 		out = append(out, group)
 	}
-	if _, ok := seen["entrade-demo"]; !ok && hasEntradeDemo(entradeDefaults) {
-		group := ExecutionGroupConfig{
-			ID: "entrade-demo", Name: "Entrade Demo", Enabled: true, AccountNos: []string{"ENTRADE_DEMO"},
-			DefaultQuantity: 1, MaxQuantity: 1, OrderType: "MTL", MarketType: "DERIVATIVE", OrderCategory: "NORMAL", AllowBuy: true, AllowSell: true,
-			Symbols: []string{"VN30F1M"},
-		}
-		seen[group.ID] = struct{}{}
-		out = append([]ExecutionGroupConfig{group}, out...)
-	}
 	in.Groups = out
 	if len(in.Groups) == 0 {
 		in = defaultTradingConfig(dnseAccount, entradeDefaults)

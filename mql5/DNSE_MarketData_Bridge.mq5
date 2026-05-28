@@ -3,7 +3,7 @@
 //| Updates custom symbol VN30F1M_DNSE from DNSEBridge.dll           |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.20"
+#property version   "1.21"
 
 struct MqlRateLite {
    long     time;
@@ -364,13 +364,18 @@ bool SendManualOrder(string side)
       orderType = "MTL";
 
    string orderSymbol = ChartTradingSymbol();
-   double price = InpManualLimitPrice;
-   if(price <= 0.0)
-      price = LatestManualOrderPrice(orderSymbol, side);
-   if(price <= 0.0)
+   bool priceRequired = (orderType == "LO" || orderType == "MTL");
+   double price = 0.0;
+   if(priceRequired)
    {
-      PrintFormat("DNSE manual order %s skipped: realtime price is not available yet. Wait for the first tick or set InpManualLimitPrice.", side);
-      return false;
+      price = InpManualLimitPrice;
+      if(price <= 0.0)
+         price = LatestManualOrderPrice(orderSymbol, side);
+      if(price <= 0.0)
+      {
+         PrintFormat("DNSE manual order %s skipped: realtime price is not available yet. Wait for the first tick or set InpManualLimitPrice.", side);
+         return false;
+      }
    }
 
    string clientOrderId = StringFormat("mt5-manual-%s-%I64d", side, GetTickCount64());
@@ -384,7 +389,8 @@ bool SendManualOrder(string side)
    payload += ",\"side\":\"" + side + "\"";
    if(InpManualQuantity > 0)
       payload += ",\"quantity\":" + IntegerToString(InpManualQuantity);
-   payload += ",\"price\":" + DoubleToString(MathMax(0.0, price), LookupDigits(orderSymbol));
+   if(priceRequired)
+      payload += ",\"price\":" + DoubleToString(MathMax(0.0, price), LookupDigits(orderSymbol));
    payload += ",\"orderType\":\"" + JSONEscape(orderType) + "\"";
    payload += ",\"marketType\":\"" + JSONEscape(InpManualMarketType) + "\"";
    payload += ",\"orderCategory\":\"" + JSONEscape(InpManualOrderCategory) + "\"";
@@ -1262,9 +1268,9 @@ int OnInit()
    g_recent_history_retry_after = 0;
    DrawManualTradePanel();
    EventSetMillisecondTimer(MathMax(50, InpTimerMs));
-   PrintFormat("DNSE bridge v1.20: EA started, source=%s, custom symbol=%s, trackedSymbols=%s, autoRecentHistoryDays=%d, autoHistoryAllSymbols=%s, realtimeSessionOnly=%s, historyTimeoutMs=%d, manualTradePanel=%s, manualAccounts=%s, manualOrderTimeoutMs=%d", InpSourceSymbol, InpCustomSymbol, GetConfiguredSymbolsSummary(), InpAutoRecentHistoryDays, InpAutoRecentHistoryAllSymbols ? "ON" : "OFF", InpRealtimeOnlyDuringTradingSession ? "ON" : "OFF", InpHistoryTimeoutMs, InpEnableManualTradePanel ? "ON" : "OFF", InpManualAccountNos, InpManualOrderTimeoutMs);
+   PrintFormat("DNSE bridge v1.21: EA started, source=%s, custom symbol=%s, trackedSymbols=%s, autoRecentHistoryDays=%d, autoHistoryAllSymbols=%s, realtimeSessionOnly=%s, historyTimeoutMs=%d, manualTradePanel=%s, manualAccounts=%s, manualOrderTimeoutMs=%d", InpSourceSymbol, InpCustomSymbol, GetConfiguredSymbolsSummary(), InpAutoRecentHistoryDays, InpAutoRecentHistoryAllSymbols ? "ON" : "OFF", InpRealtimeOnlyDuringTradingSession ? "ON" : "OFF", InpHistoryTimeoutMs, InpEnableManualTradePanel ? "ON" : "OFF", InpManualAccountNos, InpManualOrderTimeoutMs);
    if(InpAutoRecentHistoryDays <= 0)
-      Print("DNSE bridge v1.20: auto history backfill is disabled; realtime is priority, older history is manual.");
+      Print("DNSE bridge v1.21: auto history backfill is disabled; realtime is priority, older history is manual.");
    return INIT_SUCCEEDED;
 }
 

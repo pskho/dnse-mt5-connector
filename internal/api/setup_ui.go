@@ -193,6 +193,156 @@ input, select, textarea {
   align-items: center;
   gap: 16px;
 }
+.settings-shell {
+  display: grid;
+  gap: 18px;
+  margin-top: 22px;
+}
+.summary-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+.summary-item {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 8px;
+  padding: 14px;
+  min-height: 78px;
+}
+.summary-label {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.summary-value {
+  font-size: 17px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.tabbar {
+  display: flex;
+  gap: 8px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+.tab-button {
+  background: transparent;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 12px 14px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.tab-button.active {
+  color: var(--text);
+  border-bottom-color: var(--primary);
+}
+.tab-panel { display: none; }
+.tab-panel.active {
+  display: grid;
+  gap: 18px;
+}
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  margin-bottom: 16px;
+}
+.panel-head p { margin: 6px 0 0; }
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.data-table th,
+.data-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 12px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.data-table th {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.data-table td {
+  font-size: 13px;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 8px;
+  margin: 0 6px 6px 0;
+  background: #171717;
+  font-size: 12px;
+  color: var(--text);
+}
+.badge.ok { border-color: rgba(56, 142, 60, 0.55); color: #9bd79e; }
+.badge.warn { border-color: rgba(245, 124, 0, 0.65); color: #ffc47f; }
+.badge.off { color: var(--text-muted); }
+.checkbox-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.checkbox-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 5px 9px;
+  background: #171717;
+  color: var(--text);
+  font-size: 12px;
+}
+.checkbox-pill input { width: auto; margin: 0; }
+.route-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+.save-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  background: rgba(18, 18, 18, 0.96);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: rgba(0, 0, 0, 0.68);
+  display: grid;
+  place-items: center;
+  padding: 18px;
+}
+.modal.hidden { display: none; }
+.dialog {
+  width: min(720px, 100%);
+  max-height: calc(100vh - 36px);
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+}
+.form-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
 pre {
   white-space: pre-wrap;
   word-wrap: break-word;
@@ -204,7 +354,9 @@ code {
   body { display: block; }
   nav { width: 100%; }
   main { padding: 24px; }
-  .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  .grid-2, .grid-3, .summary-strip, .route-grid, .form-row { grid-template-columns: 1fr; }
+  .panel-head { display: block; }
+  .data-table { table-layout: auto; }
 }
 `
 
@@ -338,131 +490,225 @@ const settingsHTML = layoutTop + `
     </div>
   </div>
 
-  <div class="grid-2">
-    <section class="card">
-      <h2>Thông tin DNSE</h2>
-      <div class="form-group">
-        <label>Khóa API DNSE</label>
-        <input type="text" id="apiKey" placeholder="Để trống nếu không muốn thay đổi">
+  <div class="settings-shell">
+    <div class="summary-strip">
+      <div class="summary-item"><div class="summary-label">Tài khoản đặt lệnh</div><div id="accountSummary" class="summary-value">...</div></div>
+      <div class="summary-item"><div class="summary-label">Nhóm đang bật</div><div id="groupSummary" class="summary-value">...</div></div>
+      <div class="summary-item"><div class="summary-label">Nút BUY/SELL MT5</div><div id="mt5RouteSummary" class="summary-value">...</div></div>
+      <div class="summary-item"><div class="summary-label">Mã theo dõi</div><div id="symbolSummary" class="summary-value">...</div></div>
+    </div>
+
+    <div class="tabbar" role="tablist" aria-label="Cấu hình">
+      <button class="tab-button active" type="button" data-tab="accounts" onclick="showSettingsTab('accounts')">Tài khoản</button>
+      <button class="tab-button" type="button" data-tab="groups" onclick="showSettingsTab('groups')">Nhóm đặt lệnh</button>
+      <button class="tab-button" type="button" data-tab="routes" onclick="showSettingsTab('routes')">Luồng sử dụng</button>
+      <button class="tab-button" type="button" data-tab="symbols" onclick="showSettingsTab('symbols')">Danh sách mã</button>
+    </div>
+
+    <section id="tab-accounts" class="tab-panel active">
+      <div class="grid-2">
+        <section class="card">
+          <div class="panel-head">
+            <div>
+              <h2>DNSE</h2>
+              <p class="muted">Tài khoản chính dùng cho dữ liệu, trạng thái và đặt lệnh DNSE.</p>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Khóa API DNSE</label>
+            <input type="text" id="apiKey" placeholder="Để trống nếu không muốn thay đổi">
+          </div>
+          <div class="form-group">
+            <label>Mã bí mật API DNSE</label>
+            <input type="password" id="apiSecret" placeholder="Để trống nếu không muốn thay đổi">
+          </div>
+          <div class="form-group">
+            <label>Số tài khoản DNSE</label>
+            <input type="text" id="accountNo" placeholder="Ví dụ: 0001007412" oninput="renderExecutionGroups(); refreshSettingsSummary();">
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Chế độ mô phỏng DNSE</label>
+              <select id="mockMode">
+                <option value="false">Tắt (API thật)</option>
+                <option value="true">Bật (kiểm thử offline)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Phạm vi đặt lệnh</label>
+              <select id="tradingProvider" onchange="renderTradingProviderHint(); refreshSettingsSummary();">
+                <option value="dnse">Chỉ dùng DNSE</option>
+                <option value="entrade">Cho phép DNSE + Entrade</option>
+              </select>
+            </div>
+          </div>
+          <p id="tradingProviderHint" class="muted"></p>
+          <h3 style="font-size:16px;">Tài khoản DNSE khả dụng</h3>
+          <div id="dnseAccountsList" class="account-list"></div>
+        </section>
+
+        <section class="card">
+          <div class="panel-head">
+            <div>
+              <h2>Entrade</h2>
+              <p class="muted">Liên kết Real/Demo một lần, sau đó chọn tài khoản ở từng nhóm đặt lệnh.</p>
+            </div>
+          </div>
+          <div id="entradeLinkStatus" class="muted" style="margin-bottom:16px;">Chưa liên kết tài khoản Entrade.</div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Username Entrade</label>
+              <input type="text" id="entradeUsername" autocomplete="username" placeholder="Ví dụ: 1000000001">
+            </div>
+            <div class="form-group">
+              <label>Password Entrade</label>
+              <input type="password" id="entradePassword" autocomplete="current-password" placeholder="Nhập password Entrade">
+            </div>
+          </div>
+          <div class="inline-actions">
+            <button class="btn" type="button" onclick="linkEntradeAccount()">Liên kết tài khoản</button>
+          </div>
+          <p id="entradeLinkResult" class="muted" style="margin-top:16px;"></p>
+          <h3 style="font-size:16px;">Tài khoản đã liên kết</h3>
+          <div id="entradeAccountsList" class="account-list"></div>
+        </section>
       </div>
-      <div class="form-group">
-        <label>Mã bí mật API DNSE</label>
-        <input type="password" id="apiSecret" placeholder="Để trống nếu không muốn thay đổi">
-      </div>
-      <div class="form-group">
-        <label>Số tài khoản DNSE</label>
-        <input type="text" id="accountNo" placeholder="Ví dụ: 0001007412">
-      </div>
-      <div class="form-group">
-        <label>Chế độ mô phỏng</label>
-        <select id="mockMode">
-          <option value="false">Tắt (API thật)</option>
-          <option value="true">Bật (kiểm thử offline)</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label>Kết nối đặt lệnh</label>
-        <select id="tradingProvider" onchange="renderTradingProviderHint()">
-          <option value="dnse">Chỉ DNSE</option>
-          <option value="entrade">DNSE + Entrade</option>
-        </select>
-        <p id="tradingProviderHint" class="muted" style="margin-top:10px;"></p>
-      </div>
-      <div style="margin-top:22px;">
-        <h3 style="font-size:16px;">Tài khoản DNSE có thể đặt lệnh</h3>
-        <div id="dnseAccountsList" class="account-list"></div>
-      </div>
-      <p class="muted">Nếu bật DNSE + Entrade, server có thể route lệnh tới cả hai loại tài khoản theo nhóm đặt lệnh ở phần bên dưới.</p>
     </section>
 
-    <section class="card">
-      <h2>Li&ecirc;n k&#7871;t t&agrave;i kho&#7843;n Entrade</h2>
-      <p class="muted">Kh&aacute;ch h&agrave;ng ch&#7881; c&#7847;n nh&#7853;p username/password Entrade. H&#7879; th&#7889;ng s&#7869; t&#7921; &#273;&#259;ng nh&#7853;p, l&#7845;y th&ocirc;ng tin t&agrave;i kho&#7843;n master v&agrave; g&oacute;i vay ph&aacute;i sinh.</p>
-      <div id="entradeLinkStatus" class="muted" style="margin-bottom:16px;">Ch&#432;a li&ecirc;n k&#7871;t t&agrave;i kho&#7843;n Entrade.</div>
-      <div class="form-group">
-        <label>Username Entrade</label>
-        <input type="text" id="entradeUsername" autocomplete="username" placeholder="V&iacute; d&#7909;: 1000000001">
-      </div>
-      <div class="form-group">
-        <label>Password Entrade</label>
-        <input type="password" id="entradePassword" autocomplete="current-password" placeholder="Nh&#7853;p password Entrade">
-      </div>
-      <div class="inline-actions">
-        <button class="btn" type="button" onclick="linkEntradeAccount()">Li&ecirc;n k&#7871;t t&agrave;i kho&#7843;n</button>
-      </div>
-      <p id="entradeLinkResult" class="muted" style="margin-top:16px;"></p>
-      <div style="margin-top:22px;">
-        <h3 style="font-size:16px;">Tài khoản đã liên kết</h3>
-        <p class="muted">Chọn các tài khoản trong nhóm đặt lệnh. Khi bot gửi tín hiệu không chỉ rõ tài khoản, bridge sẽ gửi lệnh tới toàn bộ nhóm này.</p>
-        <div id="entradeAccountsList" class="account-list"></div>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>Quản lý đặt lệnh</h2>
-      <p class="muted">Tạo nhóm đặt lệnh rồi gán từng luồng sử dụng vào nhóm phù hợp. MT5 và bot có thể để trống tài khoản; server sẽ tự chọn theo cấu hình này.</p>
-      <div class="notice" style="margin:14px 0; padding:14px; border:1px solid var(--border); border-radius:8px;">
-        <strong>Hướng dẫn nhanh cho khách hàng</strong>
-        <div class="muted" style="margin-top:8px; line-height:1.7;">
-          1. Chọn tài khoản DNSE/Entrade vào từng nhóm.<br>
-          2. Bấm <strong>Sửa</strong> trong nhóm để đặt loại lệnh, khối lượng mặc định, trần khối lượng và danh sách mã được phép. Để trống danh sách mã nếu muốn nhận mã từ chart/bot.<br>
-          3. Gán Dashboard, nút BUY/SELL MT5, SuperTrend Bot hoặc API vào nhóm cần dùng.<br>
-          4. Nếu code bot riêng, gửi POST <code>/signal</code> với <code>symbol</code> là mã trên chart, <code>source</code> là <code>supertrend</code>, <code>mt5_manual</code>, <code>dashboard</code> hoặc <code>signal_api</code>. Có thể bỏ <code>quantity</code> để dùng khối lượng mặc định của nhóm, hoặc gửi thêm <code>routeGroupId</code> để chỉ định nhóm cụ thể.<br>
-          5. Muốn test an toàn, tạo nhóm chỉ gồm tài khoản Entrade Demo/giấy rồi gán bot vào nhóm đó.
+    <section id="tab-groups" class="tab-panel">
+      <section class="card">
+        <div class="panel-head">
+          <div>
+            <h2>Nhóm đặt lệnh</h2>
+            <p class="muted">Mỗi nhóm là một đích nhận lệnh: tài khoản nào nhận, khối lượng mặc định, mã được phép và chiều mua/bán.</p>
+          </div>
+          <button class="btn" type="button" onclick="addExecutionGroup()">Thêm nhóm</button>
         </div>
-      </div>
-      <div id="executionGroupsList" class="account-list"></div>
-      <div class="inline-actions" style="margin:14px 0;">
-        <button class="btn secondary" type="button" onclick="addExecutionGroup()">Thêm nhóm đặt lệnh</button>
-      </div>
-      <h3 style="font-size:16px;">Gán luồng sử dụng</h3>
-      <div class="grid-2" style="grid-template-columns:1fr 1fr; gap:14px;">
-        <div class="form-group"><label>Dashboard đặt lệnh</label><select id="routeDashboard"></select></div>
-        <div class="form-group"><label>Nút BUY/SELL trên MT5</label><select id="routeMT5Manual"></select></div>
-        <div class="form-group"><label>SuperTrend Bot</label><select id="routeSuperTrend"></select></div>
-        <div class="form-group"><label>API /signal mặc định</label><select id="routeSignalApi"></select></div>
-        <div class="form-group"><label>API /order mặc định</label><select id="routeOrderApi"></select></div>
-      </div>
+        <div id="executionGroupsList" class="account-list"></div>
+      </section>
     </section>
 
-    <section class="card">
-      <h2>Danh sách mã</h2>
-      <div class="form-group">
-        <label>Mã chính dùng để ưu tiên hiển thị và nạp dữ liệu đầu tiên</label>
-        <select id="primarySymbol"></select>
-      </div>
-      <div class="form-group">
-        <label>Tải danh sách mã theo sàn khi cần</label>
-        <div class="inline-actions" style="margin-top:0">
-          <button class="btn secondary" type="button" onclick="loadInstrumentSymbols()">Tải toàn bộ danh sách mã từ DNSE</button>
-          <button class="btn secondary" type="button" onclick="toggleExchange('HOSE')">HOSE</button>
-          <button class="btn secondary" type="button" onclick="toggleExchange('HNX')">HNX</button>
-          <button class="btn secondary" type="button" onclick="toggleExchange('UPCOM')">UPCOM</button>
-          <button class="btn secondary" type="button" onclick="toggleExchange('INDEX')">Chỉ số</button>
-          <button class="btn secondary" type="button" onclick="toggleExchange('DERIVATIVE')">Phái sinh</button>
+    <section id="tab-routes" class="tab-panel">
+      <section class="card">
+        <div class="panel-head">
+          <div>
+            <h2>Luồng sử dụng</h2>
+            <p class="muted">Chọn nhóm mặc định cho từng nguồn lệnh. Khi lệnh không chỉ định nhóm, bridge sẽ dùng cấu hình ở đây.</p>
+          </div>
         </div>
-        <p id="instrument-load-res" class="muted" style="margin-top:10px;">Danh sách mã được tải một lần từ ticker API của DNSE, lưu lại để dùng tiếp cho bridge và MT5.</p>
-      </div>
-      <div class="form-group">
-        <label>Tìm nhanh mã</label>
-        <input type="text" id="symbolSearch" placeholder="Ví dụ: HPG, FPT, VN30..." oninput="renderSymbolChoices()">
-      </div>
-      <div class="form-group">
-        <label>Chọn các mã cần theo dõi</label>
-        <div id="symbolChoices" class="chip-list" style="max-height:320px; overflow:auto; align-content:flex-start;"></div>
-      </div>
-      <div class="muted">MT5 sẽ tạo custom symbol cho toàn bộ danh sách này. Các mã phái sinh hiện dùng chuẩn <code>V100F*</code> cho bộ VN100.</div>
+        <div class="route-grid">
+          <div class="form-group"><label>Dashboard đặt lệnh</label><select id="routeDashboard"></select></div>
+          <div class="form-group"><label>Nút BUY/SELL trên MT5</label><select id="routeMT5Manual"></select></div>
+          <div class="form-group"><label>SuperTrend Bot</label><select id="routeSuperTrend"></select></div>
+          <div class="form-group"><label>API /signal mặc định</label><select id="routeSignalApi"></select></div>
+          <div class="form-group"><label>API /order mặc định</label><select id="routeOrderApi"></select></div>
+        </div>
+      </section>
+    </section>
+
+    <section id="tab-symbols" class="tab-panel">
+      <section class="card">
+        <div class="panel-head">
+          <div>
+            <h2>Danh sách mã</h2>
+            <p class="muted">Mã theo dõi dùng cho dữ liệu realtime, custom symbol MT5 và danh sách mã ưu tiên.</p>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Mã chính dùng để ưu tiên hiển thị và nạp dữ liệu đầu tiên</label>
+          <select id="primarySymbol"></select>
+        </div>
+        <div class="form-group">
+          <label>Tải danh sách mã theo sàn khi cần</label>
+          <div class="inline-actions" style="margin-top:0">
+            <button class="btn secondary" type="button" onclick="loadInstrumentSymbols()">Tải toàn bộ danh sách mã từ DNSE</button>
+            <button class="btn secondary" type="button" onclick="toggleExchange('HOSE')">HOSE</button>
+            <button class="btn secondary" type="button" onclick="toggleExchange('HNX')">HNX</button>
+            <button class="btn secondary" type="button" onclick="toggleExchange('UPCOM')">UPCOM</button>
+            <button class="btn secondary" type="button" onclick="toggleExchange('INDEX')">Chỉ số</button>
+            <button class="btn secondary" type="button" onclick="toggleExchange('DERIVATIVE')">Phái sinh</button>
+          </div>
+          <p id="instrument-load-res" class="muted" style="margin-top:10px;">Danh sách mã được tải một lần từ ticker API của DNSE, lưu lại để dùng tiếp cho bridge và MT5.</p>
+        </div>
+        <div class="form-group">
+          <label>Tìm nhanh mã</label>
+          <input type="text" id="symbolSearch" placeholder="Ví dụ: HPG, FPT, VN30..." oninput="renderSymbolChoices()">
+        </div>
+        <div class="form-group">
+          <label>Chọn các mã cần theo dõi</label>
+          <div id="symbolChoices" class="chip-list" style="max-height:320px; overflow:auto; align-content:flex-start;"></div>
+        </div>
+        <div class="muted">MT5 sẽ tạo custom symbol cho toàn bộ danh sách này. Các mã phái sinh hiện dùng chuẩn <code>V100F*</code> cho bộ VN100.</div>
+      </section>
     </section>
   </div>
 
-  <div class="card">
+  <div class="save-bar" style="margin-top:18px;">
     <div class="inline-actions">
       <button class="btn" onclick="saveSettings()">Lưu cấu hình</button>
-      <button class="btn secondary" onclick="selectDefaultSet()">Chọn bộ mặc định</button>
-      <button class="btn secondary" onclick="selectAllSymbols()">Chọn tất cả</button>
-      <button class="btn secondary" onclick="clearSymbols()">Bỏ chọn tất cả</button>
+      <button class="btn secondary" onclick="selectDefaultSet()">Chọn bộ mã mặc định</button>
+      <button class="btn secondary" onclick="selectAllSymbols()">Chọn tất cả mã</button>
+      <button class="btn secondary" onclick="clearSymbols()">Bỏ chọn mã</button>
     </div>
     <p id="save-res" class="muted" style="margin-top:16px;"></p>
+  </div>
+
+  <div id="groupEditor" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="groupEditorTitle">
+    <div class="dialog">
+      <div class="panel-head">
+        <div>
+          <h2 id="groupEditorTitle">Nhóm đặt lệnh</h2>
+          <p class="muted">Các thay đổi sẽ nằm trên màn hình cho đến khi bấm Lưu cấu hình.</p>
+        </div>
+        <button class="btn secondary mini-btn" type="button" onclick="closeGroupEditor()">Đóng</button>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Mã nhóm</label>
+          <input type="text" id="groupIdInput" placeholder="Ví dụ: mt5-demo">
+        </div>
+        <div class="form-group">
+          <label>Tên hiển thị</label>
+          <input type="text" id="groupNameInput" placeholder="Ví dụ: MT5 Demo">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Khối lượng mặc định</label>
+          <input type="number" id="groupDefaultQtyInput" min="0" step="1">
+        </div>
+        <div class="form-group">
+          <label>Khối lượng tối đa mỗi lệnh</label>
+          <input type="number" id="groupMaxQtyInput" min="0" step="1">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Loại lệnh mặc định</label>
+          <select id="groupOrderTypeInput">
+            <option value="MTL">MTL</option>
+            <option value="LO">LO</option>
+            <option value="MAK">MAK</option>
+            <option value="MOK">MOK</option>
+            <option value="ATO">ATO</option>
+            <option value="ATC">ATC</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Mã được phép</label>
+          <input type="text" id="groupSymbolsInput" placeholder="Để trống = tất cả; ví dụ: VN30F1M,41I1G6000">
+        </div>
+      </div>
+      <div class="checkbox-grid" style="margin:4px 0 16px;">
+        <label class="checkbox-pill"><input type="checkbox" id="groupEnabledInput"><span>Bật nhóm</span></label>
+        <label class="checkbox-pill"><input type="checkbox" id="groupAllowBuyInput"><span>Cho phép BUY</span></label>
+        <label class="checkbox-pill"><input type="checkbox" id="groupAllowSellInput"><span>Cho phép SELL</span></label>
+      </div>
+      <div class="inline-actions">
+        <button class="btn" type="button" onclick="saveGroupEditor()">Lưu nhóm</button>
+        <button class="btn secondary" type="button" onclick="closeGroupEditor()">Hủy</button>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -472,6 +718,39 @@ const settingsHTML = layoutTop + `
     let selectedSymbolsState = new Set(defaultSymbols);
     let currentEntrade = {};
     let currentTrading = { groups: [], routes: {} };
+    let editingGroupIndex = -1;
+
+    function showSettingsTab(tab) {
+      document.querySelectorAll('.tab-button').forEach((button) => {
+        button.classList.toggle('active', button.dataset.tab === tab);
+      });
+      document.querySelectorAll('.tab-panel').forEach((panel) => {
+        panel.classList.toggle('active', panel.id === 'tab-' + tab);
+      });
+    }
+
+    function setText(id, value) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = value;
+    }
+
+    function refreshSettingsSummary() {
+      const provider = document.getElementById('tradingProvider')?.value === 'entrade' ? 'DNSE + Entrade' : 'DNSE';
+      const dnseAccount = document.getElementById('accountNo')?.value.trim();
+      const entradeCount = entradeAccounts().length;
+      const groups = (currentTrading && Array.isArray(currentTrading.groups)) ? currentTrading.groups : [];
+      const enabledGroups = groups.filter((group) => group.enabled !== false);
+      const mt5RouteID = currentTrading?.routes?.mt5Manual || '';
+      const mt5Group = groups.find((group) => String(group.id || '') === mt5RouteID);
+      setText('accountSummary', provider + (dnseAccount ? ' · ' + dnseAccount : '') + (entradeCount ? ' · ' + entradeCount + ' Entrade' : ''));
+      setText('groupSummary', enabledGroups.length + ' / ' + groups.length);
+      setText('mt5RouteSummary', mt5Group ? (mt5Group.name || mt5Group.id) : 'Chưa chọn');
+      setText('symbolSummary', getSelectedSymbols().length + ' mã');
+    }
+
+    function slugifyID(value) {
+      return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    }
 
     function mergeSymbols(symbols) {
       const seen = new Set(availableSymbols);
@@ -547,6 +826,7 @@ const settingsHTML = layoutTop + `
           if (input.checked) selectedSymbolsState.add(symbol);
           else selectedSymbolsState.delete(symbol);
           syncPrimaryOptions();
+          refreshSettingsSummary();
         });
 
         const option = document.createElement('option');
@@ -573,6 +853,7 @@ const settingsHTML = layoutTop + `
 
       if (!selected.length) {
         primary.value = '';
+        refreshSettingsSummary();
         return;
       }
       if (selected.indexOf(current) >= 0) {
@@ -580,6 +861,7 @@ const settingsHTML = layoutTop + `
       } else {
         primary.value = selected[0];
       }
+      refreshSettingsSummary();
     }
 
     function selectDefaultSet() {
@@ -699,6 +981,7 @@ const settingsHTML = layoutTop + `
       const defaults = entradeDefaultSet();
       if (!accounts.length) {
         box.innerHTML = '<div class="muted">Chưa có tài khoản Entrade nào.</div>';
+        refreshSettingsSummary();
         return;
       }
       box.innerHTML = accounts.map((account, index) => {
@@ -731,6 +1014,7 @@ const settingsHTML = layoutTop + `
           '</label>' +
         '</div>';
       }).join('');
+      refreshSettingsSummary();
     }
 
     function renderTradingProviderHint() {
@@ -747,9 +1031,11 @@ const settingsHTML = layoutTop + `
         } else {
           hint.innerHTML = '<span class="status-indicator status-ok"></span>MT5 có thể để trống account. Server sẽ route theo nhóm đặt lệnh, bao gồm cả DNSE và Entrade nếu nhóm có cả hai.';
         }
+        refreshSettingsSummary();
         return;
       }
       hint.innerHTML = '<span class="status-indicator status-ok"></span>MT5 có thể để trống account. Server chỉ dùng các nhóm có tài khoản DNSE.';
+      refreshSettingsSummary();
     }
 
     function allOrderAccounts() {
@@ -802,7 +1088,7 @@ const settingsHTML = layoutTop + `
       if (!currentTrading.routes) currentTrading.routes = {};
       const first = currentTrading.groups[0]?.id || '';
       ['dashboard', 'mt5Manual', 'superTrend', 'signalApi', 'orderApi'].forEach((key) => {
-        if (!currentTrading.routes[key]) currentTrading.routes[key] = first;
+        if (!currentTrading.routes[key] || !currentTrading.groups.some((group) => group.id === currentTrading.routes[key])) currentTrading.routes[key] = first;
       });
     }
 
@@ -811,26 +1097,40 @@ const settingsHTML = layoutTop + `
       const box = document.getElementById('executionGroupsList');
       if (!box) return;
       const accounts = allOrderAccounts();
+      if (!currentTrading.groups.length) {
+        box.innerHTML = '<div class="muted">Chưa có nhóm đặt lệnh.</div>';
+        renderRouteSelectors();
+        refreshSettingsSummary();
+        return;
+      }
       box.innerHTML = currentTrading.groups.map((group, index) => {
         const selected = new Set((group.accountNos || []).map((value) => String(value || '').toUpperCase()));
         const accountChecks = accounts.map((account) => {
           const checked = selected.has(account.id.toUpperCase()) ? 'checked' : '';
-          return '<label class="chip"><input type="checkbox" ' + checked + ' onchange="toggleGroupAccount(' + index + ', \'' + escapeHtml(account.id) + '\', this.checked)"><span>' + escapeHtml(account.label) + '</span></label>';
+          return '<label class="checkbox-pill"><input type="checkbox" ' + checked + ' onchange="toggleGroupAccount(' + index + ', \'' + escapeHtml(account.id) + '\', this.checked)"><span>' + escapeHtml(account.label) + '</span></label>';
         }).join('');
+        const sides = [group.allowBuy !== false ? 'BUY' : '', group.allowSell !== false ? 'SELL' : ''].filter(Boolean).join(' / ') || 'Đang tắt';
         return '<div class="account-row">' +
           '<div class="account-head">' +
             '<div><strong>' + escapeHtml(group.name || group.id) + '</strong><div class="account-meta"><code>' + escapeHtml(group.id) + '</code></div></div>' +
-            '<div class="inline-actions" style="margin-top:0; justify-content:flex-end;">' +
-              '<button class="btn secondary mini-btn" type="button" onclick="editExecutionGroup(' + index + ')">Sửa</button>' +
-              '<button class="btn secondary mini-btn" type="button" onclick="removeExecutionGroup(' + index + ')">Xóa</button>' +
-            '</div>' +
+            '<span class="badge ' + (group.enabled === false ? 'off' : 'ok') + '">' + (group.enabled === false ? 'Đang tắt' : 'Đang bật') + '</span>' +
           '</div>' +
-          '<label class="chip" style="margin-top:10px; width:max-content;"><input type="checkbox" ' + (group.enabled === false ? '' : 'checked') + ' onchange="currentTrading.groups[' + index + '].enabled=this.checked"><span>Bật nhóm</span></label>' +
-          '<div class="chip-list" style="margin-top:10px;">' + (accountChecks || '<span class="muted">Chưa có tài khoản để chọn.</span>') + '</div>' +
-          '<div class="account-meta" style="margin-top:10px;">Loại lệnh: <code>' + escapeHtml(group.orderType || 'MTL') + '</code>, thị trường: <code>' + escapeHtml(group.marketType || 'DERIVATIVE') + '</code>, default qty: <code>' + escapeHtml(group.defaultQuantity || 0) + '</code>, max qty: <code>' + escapeHtml(group.maxQuantity || 0) + '</code>, mã giới hạn: <code>' + escapeHtml((group.symbols || []).join(', ') || 'tất cả') + '</code></div>' +
+          '<div class="checkbox-grid" style="margin-top:12px;">' + (accountChecks || '<span class="muted">Chưa có tài khoản để chọn.</span>') + '</div>' +
+          '<div class="account-meta" style="margin-top:10px;">' +
+            'Lệnh <code>' + escapeHtml(group.orderType || 'MTL') + '</code> · ' +
+            'Chiều <code>' + escapeHtml(sides) + '</code> · ' +
+            'Mặc định <code>' + escapeHtml(group.defaultQuantity || 0) + '</code> · ' +
+            'Tối đa <code>' + escapeHtml(group.maxQuantity || 0) + '</code> · ' +
+            'Mã <code>' + escapeHtml((group.symbols || []).join(', ') || 'tất cả') + '</code>' +
+          '</div>' +
+          '<div class="inline-actions" style="margin-top:12px;">' +
+            '<button class="btn secondary mini-btn" type="button" onclick="editExecutionGroup(' + index + ')">Sửa</button>' +
+            '<button class="btn secondary mini-btn" type="button" onclick="removeExecutionGroup(' + index + ')">Xóa</button>' +
+          '</div>' +
         '</div>';
       }).join('');
       renderRouteSelectors();
+      refreshSettingsSummary();
     }
 
     function renderRouteSelectors() {
@@ -848,8 +1148,9 @@ const settingsHTML = layoutTop + `
         if (!select) return;
         select.innerHTML = options;
         select.value = currentTrading.routes[key] || currentTrading.groups[0]?.id || '';
-        select.onchange = () => { currentTrading.routes[key] = select.value; };
+        select.onchange = () => { currentTrading.routes[key] = select.value; refreshSettingsSummary(); };
       });
+      refreshSettingsSummary();
     }
 
     function toggleGroupAccount(index, accountId, checked) {
@@ -862,35 +1163,81 @@ const settingsHTML = layoutTop + `
       renderExecutionGroups();
     }
 
+    function removeAccountFromTradingGroups(accountId) {
+      accountId = String(accountId || '').toUpperCase();
+      if (!accountId || !currentTrading || !Array.isArray(currentTrading.groups)) return;
+      currentTrading.groups.forEach((group) => {
+        group.accountNos = (group.accountNos || []).filter((value) => String(value || '').toUpperCase() !== accountId);
+      });
+    }
+
     function addExecutionGroup() {
       ensureTradingConfig();
-      const id = window.prompt('Mã nhóm, ví dụ: bot-demo, copy-all');
-      if (!id) return;
-      const name = window.prompt('Tên nhóm hiển thị', id) || id;
-      currentTrading.groups.push({ id: id.trim().toLowerCase().replaceAll('_', '-').replaceAll(' ', '-'), name, enabled: true, accountNos: [], defaultQuantity: 1, maxQuantity: 1, orderType: 'MTL', marketType: 'DERIVATIVE', orderCategory: 'NORMAL', allowBuy: true, allowSell: true, symbols: [] });
-      renderExecutionGroups();
+      openGroupEditor(-1);
     }
 
     function editExecutionGroup(index) {
-      const group = currentTrading.groups[index];
-      if (!group) return;
-      const name = window.prompt('Tên nhóm', group.name || group.id);
-      if (name === null) return;
-      const defaultQuantity = window.prompt('Khối lượng mặc định khi bot/MT5 không truyền quantity. 0 = bắt buộc bot truyền.', group.defaultQuantity || 0);
-      if (defaultQuantity === null) return;
-      const maxQuantity = window.prompt('Khối lượng tối đa mỗi lệnh. 0 = không giới hạn riêng.', group.maxQuantity || 0);
-      if (maxQuantity === null) return;
-      const orderType = window.prompt('Loại lệnh mặc định', group.orderType || 'MTL');
-      if (orderType === null) return;
-      const symbols = window.prompt('Mã được phép, phân tách bằng dấu phẩy. Để trống = tất cả.', (group.symbols || []).join(','));
-      if (symbols === null) return;
-      group.name = name.trim() || group.id;
-      group.defaultQuantity = Number(defaultQuantity || 0);
-      group.maxQuantity = Number(maxQuantity || 0);
-      group.orderType = (orderType || 'MTL').trim().toUpperCase();
+      openGroupEditor(index);
+    }
+
+    function openGroupEditor(index) {
+      ensureTradingConfig();
+      editingGroupIndex = Number.isInteger(index) ? index : -1;
+      const group = editingGroupIndex >= 0 ? currentTrading.groups[editingGroupIndex] : {
+        id: '', name: '', enabled: true, accountNos: [], defaultQuantity: 1, maxQuantity: 1,
+        orderType: 'MTL', marketType: 'DERIVATIVE', orderCategory: 'NORMAL', allowBuy: true, allowSell: true, symbols: []
+      };
+      document.getElementById('groupEditorTitle').textContent = editingGroupIndex >= 0 ? 'Sửa nhóm đặt lệnh' : 'Thêm nhóm đặt lệnh';
+      document.getElementById('groupIdInput').value = group.id || '';
+      document.getElementById('groupIdInput').disabled = editingGroupIndex >= 0;
+      document.getElementById('groupNameInput').value = group.name || '';
+      document.getElementById('groupDefaultQtyInput').value = Number(group.defaultQuantity || 0);
+      document.getElementById('groupMaxQtyInput').value = Number(group.maxQuantity || 0);
+      document.getElementById('groupOrderTypeInput').value = (group.orderType || 'MTL').toUpperCase();
+      document.getElementById('groupSymbolsInput').value = (group.symbols || []).join(', ');
+      document.getElementById('groupEnabledInput').checked = group.enabled !== false;
+      document.getElementById('groupAllowBuyInput').checked = group.allowBuy !== false;
+      document.getElementById('groupAllowSellInput').checked = group.allowSell !== false;
+      document.getElementById('groupEditor').classList.remove('hidden');
+    }
+
+    function closeGroupEditor() {
+      document.getElementById('groupEditor').classList.add('hidden');
+      editingGroupIndex = -1;
+    }
+
+    function saveGroupEditor() {
+      ensureTradingConfig();
+      const rawID = document.getElementById('groupIdInput').value;
+      const id = slugifyID(rawID);
+      if (!id) {
+        window.alert('Hãy nhập mã nhóm.');
+        return;
+      }
+      if (editingGroupIndex < 0 && currentTrading.groups.some((group) => String(group.id || '') === id)) {
+        window.alert('Mã nhóm đã tồn tại.');
+        return;
+      }
+      const name = document.getElementById('groupNameInput').value.trim() || id;
+      const group = editingGroupIndex >= 0 ? currentTrading.groups[editingGroupIndex] : { accountNos: [] };
+      group.id = editingGroupIndex >= 0 ? group.id : id;
+      group.name = name;
+      group.enabled = document.getElementById('groupEnabledInput').checked;
+      group.defaultQuantity = Number(document.getElementById('groupDefaultQtyInput').value || 0);
+      group.maxQuantity = Number(document.getElementById('groupMaxQtyInput').value || 0);
+      group.orderType = (document.getElementById('groupOrderTypeInput').value || 'MTL').trim().toUpperCase();
       group.marketType = (group.marketType || 'DERIVATIVE').toUpperCase();
       group.orderCategory = (group.orderCategory || 'NORMAL').toUpperCase();
-      group.symbols = symbols.split(',').map((value) => value.trim().toUpperCase()).filter(Boolean);
+      group.allowBuy = document.getElementById('groupAllowBuyInput').checked;
+      group.allowSell = document.getElementById('groupAllowSellInput').checked;
+      group.symbols = document.getElementById('groupSymbolsInput').value.split(',').map((value) => value.trim().toUpperCase()).filter(Boolean);
+      if (!group.allowBuy && !group.allowSell) {
+        window.alert('Hãy cho phép ít nhất BUY hoặc SELL.');
+        return;
+      }
+      if (editingGroupIndex >= 0) currentTrading.groups[editingGroupIndex] = group;
+      else currentTrading.groups.push(group);
+      closeGroupEditor();
       renderExecutionGroups();
     }
 
@@ -906,44 +1253,6 @@ const settingsHTML = layoutTop + `
       Object.keys(currentTrading.routes || {}).forEach((key) => {
         if (currentTrading.routes[key] === group.id) currentTrading.routes[key] = fallback;
       });
-      renderExecutionGroups();
-    }
-
-    function editEntradeAccount(index) {
-      const account = entradeAccounts()[index];
-      if (!account) return;
-      const accountNo = window.prompt('Master account / investorAccountId', account.accountNo || '');
-      if (accountNo === null) return;
-      const loanPackageId = window.prompt('Loan package ID / bankMarginPortfolioId. Để trống nếu muốn tự lấy gói đầu tiên.', account.loanPackageId || '');
-      if (loanPackageId === null) return;
-      account.accountNo = accountNo.trim();
-      account.loanPackageId = Number(loanPackageId || 0);
-      renderEntradeAccounts();
-      renderExecutionGroups();
-    }
-
-    function deleteEntradeAccount(index) {
-      const account = entradeAccounts()[index];
-      if (!account) return;
-      if (!window.confirm('Xóa tài khoản ' + account.id + ' khỏi danh sách liên kết?')) return;
-      currentEntrade.accounts.splice(index, 1);
-      const removedID = String(account.id || '').toUpperCase();
-      currentEntrade.defaultAccountNos = ((currentEntrade.defaultAccountNos || []).filter((id) => String(id || '').toUpperCase() !== removedID));
-      if (!currentEntrade.accounts.length) currentEntrade.enabled = false;
-      renderEntradeStatus();
-      renderEntradeAccounts();
-      renderExecutionGroups();
-    }
-
-    function toggleEntradeDefault(index, checked) {
-      const account = entradeAccounts()[index];
-      if (!account) return;
-      const id = String(account.id || '').toUpperCase();
-      const defaults = entradeDefaultSet();
-      if (checked) defaults.add(id);
-      else defaults.delete(id);
-      currentEntrade.defaultAccountNos = Array.from(defaults);
-      renderEntradeAccounts();
       renderExecutionGroups();
     }
 
@@ -1001,44 +1310,7 @@ const settingsHTML = layoutTop + `
       renderSymbolChoices(selectedSymbols);
       document.getElementById('primarySymbol').value = (data.marketData && data.marketData.symbol) || selectedSymbols[0] || '';
       syncPrimaryOptions();
-    }
-
-    async function saveSettings() {
-      const selectedSymbols = getSelectedSymbols();
-      const saveRes = document.getElementById('save-res');
-      if (!selectedSymbols.length) {
-        saveRes.textContent = 'Hãy chọn ít nhất một mã để theo dõi.';
-        return;
-      }
-
-      const body = {
-        apiKey: document.getElementById('apiKey').value,
-        apiSecret: document.getElementById('apiSecret').value,
-        accountNo: document.getElementById('accountNo').value,
-        mock: document.getElementById('mockMode').value === 'true',
-        symbols: selectedSymbols,
-        primarySymbol: document.getElementById('primarySymbol').value,
-        entradeEnabled: document.getElementById('tradingProvider').value === 'entrade' && entradeAccounts().length > 0,
-        entradeMock: currentEntrade.mock === true,
-        entradeEnvironment: currentEntrade.environment || 'real',
-        entradeDefaultAccountNos: currentEntrade.defaultAccountNos || [],
-        entradeAccounts: currentEntrade.accounts || [],
-        tradingGroups: currentTrading.groups || [],
-        tradingRoutes: currentTrading.routes || {}
-      };
-
-      const res = await fetch('/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-
-      if (res.ok) {
-        saveRes.textContent = 'Đã lưu thành công. Hãy khởi động lại bridge để áp dụng toàn bộ danh sách mã và mã chính.';
-      } else {
-        const data = await res.json();
-        saveRes.textContent = data.error || 'Không thể lưu cấu hình.';
-      }
+      refreshSettingsSummary();
     }
 
     function buildSettingsPayload() {
@@ -1096,6 +1368,7 @@ const settingsHTML = layoutTop + `
       account.accountNo = accountNo.trim();
       account.loanPackageId = Number(loanPackageId || 0);
       renderEntradeAccounts();
+      renderExecutionGroups();
       await persistSettings('Đã lưu thay đổi tài khoản Entrade.');
     }
 
@@ -1103,9 +1376,10 @@ const settingsHTML = layoutTop + `
       const account = entradeAccounts()[index];
       if (!account) return;
       if (!window.confirm('Xóa tài khoản ' + account.id + ' khỏi danh sách liên kết?')) return;
-      currentEntrade.accounts.splice(index, 1);
       const removedID = String(account.id || '').toUpperCase();
+      currentEntrade.accounts = ((currentEntrade.accounts || []).filter((item) => String(item.id || '').toUpperCase() !== removedID));
       currentEntrade.defaultAccountNos = ((currentEntrade.defaultAccountNos || []).filter((id) => String(id || '').toUpperCase() !== removedID));
+      removeAccountFromTradingGroups(removedID);
       if (!currentEntrade.accounts.length) currentEntrade.enabled = false;
       renderEntradeStatus();
       renderEntradeAccounts();

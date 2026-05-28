@@ -45,19 +45,20 @@ type RiskEngine interface {
 }
 
 type OrderService struct {
-	store             Store
-	dnse              DNSEClient
-	risk              RiskEngine
-	logger            *logger.FileLogger
-	defaultAccountNo  string
-	defaultAccountNos []string
-	positions         *PositionService
-	maxOpenPosition   int
-	systemEnabled     bool
-	idempotency       map[string]idempotencyEntry
-	routes            *TradingRouteManager
-	priceResolver     func(symbol, side string) (float64, bool)
-	mu                sync.Mutex
+	store               Store
+	dnse                DNSEClient
+	risk                RiskEngine
+	logger              *logger.FileLogger
+	defaultAccountNo    string
+	defaultAccountNos   []string
+	positions           *PositionService
+	maxOpenPosition     int
+	systemEnabled       bool
+	idempotency         map[string]idempotencyEntry
+	routes              *TradingRouteManager
+	priceResolver       func(symbol, side string) (float64, bool)
+	orderSymbolResolver func(ctx context.Context, symbol, marketType string) (string, bool, error)
+	mu                  sync.Mutex
 }
 
 type idempotencyEntry struct {
@@ -98,6 +99,12 @@ func (s *OrderService) SetPriceResolver(resolve func(symbol, side string) (float
 	s.mu.Unlock()
 }
 
+func (s *OrderService) SetOrderSymbolResolver(resolve func(ctx context.Context, symbol, marketType string) (string, bool, error)) {
+	s.mu.Lock()
+	s.orderSymbolResolver = resolve
+	s.mu.Unlock()
+}
+
 func (s *OrderService) PlaceOrder(ctx context.Context, req OrderRequest) (OrderResponse, error) {
 	s.log(ctx, "info", "order_received", map[string]any{"request": req})
 
@@ -115,6 +122,12 @@ func (s *OrderService) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 	s.log(ctx, "info", "validation_passed", map[string]any{"symbol": normalized.Symbol, "side": normalized.Side})
 
 	s.fillPriceFromRealtime(ctx, &normalized)
+	normalized = stripNonLimitOrderPrice(normalized)
+	normalized = s.normalizeManualMTLAsLimit(ctx, normalized)
+	if err := s.resolveOrderSymbol(ctx, &normalized); err != nil {
+		s.log(ctx, "error", "order_symbol_resolve_failed", map[string]any{"error": err.Error(), "request": normalized})
+		return OrderResponse{}, err
+	}
 
 	idempotencyKey := orderIdempotencyKey(normalized)
 	if !s.reserveOrder(idempotencyKey, 3*time.Second) {
@@ -153,35 +166,46 @@ func (s *OrderService) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 		return OrderResponse{}, err
 	}
 
-	rawRequest, _ := json.Marshal(normalized)
-	apiResp, err := s.dnse.PlaceOrder(ctx, dnsemodel.PlaceOrderRequest{
-		ClientOrderID: normalized.ClientOrderID,
-		AccountNo:     normalized.AccountNo,
-		Symbol:        normalized.Symbol,
-		Side:          dnseSide,
-		Quantity:      normalized.Quantity,
-		Price:         normalized.Price,
-		OrderType:     normalized.OrderType,
-		LoanPackageID: normalized.LoanPackageID,
-		MarketType:    normalized.MarketType,
-		OrderCategory: normalized.OrderCategory,
-	})
+	submitted := normalized
+	apiResp, err := s.submitDNSEOrder(ctx, submitted, dnseSide)
+	if shouldFallbackMTLAsLO(submitted, err) {
+		fallback := submitted
+		fallback.OrderType = "LO"
+		if bandErr := s.checkPriceBand(ctx, fallback); bandErr != nil {
+			s.log(ctx, "error", "mtl_to_lo_fallback_rejected_price_band", map[string]any{"error": bandErr.Error(), "request": fallback})
+		} else {
+			s.log(ctx, "info", "mtl_to_lo_fallback_started", map[string]any{
+				"clientOrderId": fallback.ClientOrderID,
+				"symbol":        fallback.Symbol,
+				"side":          fallback.Side,
+				"price":         fallback.Price,
+			})
+			if retryResp, retryErr := s.submitDNSEOrder(ctx, fallback, dnseSide); retryErr == nil {
+				apiResp = retryResp
+				submitted = fallback
+				err = nil
+			} else {
+				s.log(ctx, "error", "mtl_to_lo_fallback_failed", map[string]any{"error": retryErr.Error(), "request": fallback})
+			}
+		}
+	}
 	if err != nil {
 		s.log(ctx, "error", "order_submit_failed", map[string]any{"error": err.Error(), "request": normalized})
 		return OrderResponse{}, err
 	}
 
+	rawRequest, _ := json.Marshal(submitted)
 	now := time.Now().UTC()
 	order := storage.Order{
 		ID:            apiResp.OrderID,
-		ClientOrderID: normalized.ClientOrderID,
-		AccountNo:     normalized.AccountNo,
-		Symbol:        normalized.Symbol,
-		Side:          normalized.Side,
+		ClientOrderID: submitted.ClientOrderID,
+		AccountNo:     submitted.AccountNo,
+		Symbol:        submitted.Symbol,
+		Side:          submitted.Side,
 		DNSESide:      dnseSide,
-		Quantity:      normalized.Quantity,
-		Price:         normalized.Price,
-		OrderType:     normalized.OrderType,
+		Quantity:      submitted.Quantity,
+		Price:         submitted.Price,
+		OrderType:     submitted.OrderType,
 		Status:        apiResp.Status,
 		RawRequest:    string(rawRequest),
 		RawResponse:   apiResp.RawResponse,
@@ -199,7 +223,22 @@ func (s *OrderService) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 	}
 
 	s.log(ctx, "info", "order_accepted", map[string]any{"orderId": apiResp.OrderID, "status": apiResp.Status})
-	return OrderResponse{Success: true, OrderID: apiResp.OrderID, Status: apiResp.Status, AccountNo: normalized.AccountNo}, nil
+	return OrderResponse{Success: true, OrderID: apiResp.OrderID, Status: apiResp.Status, AccountNo: submitted.AccountNo}, nil
+}
+
+func (s *OrderService) submitDNSEOrder(ctx context.Context, req OrderRequest, dnseSide string) (dnsemodel.PlaceOrderResponse, error) {
+	return s.dnse.PlaceOrder(ctx, dnsemodel.PlaceOrderRequest{
+		ClientOrderID: req.ClientOrderID,
+		AccountNo:     req.AccountNo,
+		Symbol:        req.Symbol,
+		Side:          dnseSide,
+		Quantity:      req.Quantity,
+		Price:         req.Price,
+		OrderType:     req.OrderType,
+		LoanPackageID: req.LoanPackageID,
+		MarketType:    req.MarketType,
+		OrderCategory: req.OrderCategory,
+	})
 }
 
 func (s *OrderService) PlaceOrders(ctx context.Context, req OrderRequest) ([]OrderResponse, error) {
@@ -531,6 +570,7 @@ func (s *OrderService) validateOrder(req OrderRequest) (OrderRequest, string, er
 	if req.OrderType == "LO" && req.Price <= 0 {
 		return req, "", errors.New("price must be greater than zero for LO orders")
 	}
+	req = stripNonLimitOrderPrice(req)
 	switch req.Side {
 	case "BUY":
 		return req, "NB", nil
@@ -616,7 +656,7 @@ func isVirtualEntradeAccount(accountNo string) bool {
 }
 
 func (s *OrderService) fillPriceFromRealtime(ctx context.Context, req *OrderRequest) {
-	if req == nil || req.Price > 0 {
+	if req == nil || req.Price > 0 || !orderTypeUsesReferencePrice(req.OrderType) {
 		return
 	}
 	s.mu.Lock()
@@ -636,6 +676,74 @@ func (s *OrderService) fillPriceFromRealtime(ctx context.Context, req *OrderRequ
 		"price":  price,
 		"source": req.Source,
 	})
+}
+
+func (s *OrderService) normalizeManualMTLAsLimit(ctx context.Context, req OrderRequest) OrderRequest {
+	if req.Source != SourceMT5Manual || strings.ToUpper(strings.TrimSpace(req.OrderType)) != "MTL" || req.Price <= 0 {
+		return req
+	}
+	req.OrderType = "LO"
+	s.log(ctx, "info", "mt5_manual_mtl_converted_to_lo", map[string]any{
+		"clientOrderId": req.ClientOrderID,
+		"symbol":        req.Symbol,
+		"side":          req.Side,
+		"price":         req.Price,
+	})
+	return req
+}
+
+func (s *OrderService) resolveOrderSymbol(ctx context.Context, req *OrderRequest) error {
+	if req == nil || req.Symbol == "" {
+		return nil
+	}
+	s.mu.Lock()
+	resolve := s.orderSymbolResolver
+	s.mu.Unlock()
+	if resolve == nil {
+		return nil
+	}
+	resolved, ok, err := resolve(ctx, req.Symbol, req.MarketType)
+	if err != nil {
+		return err
+	}
+	resolved = strings.ToUpper(strings.TrimSpace(resolved))
+	if !ok || resolved == "" || resolved == req.Symbol {
+		return nil
+	}
+	original := req.Symbol
+	req.Symbol = resolved
+	s.log(ctx, "info", "order_symbol_resolved", map[string]any{
+		"clientOrderId": req.ClientOrderID,
+		"from":          original,
+		"to":            resolved,
+		"marketType":    req.MarketType,
+		"source":        req.Source,
+	})
+	return nil
+}
+
+func stripNonLimitOrderPrice(req OrderRequest) OrderRequest {
+	if !orderTypeUsesReferencePrice(req.OrderType) {
+		req.Price = 0
+	}
+	return req
+}
+
+func orderTypeUsesReferencePrice(orderType string) bool {
+	switch strings.ToUpper(strings.TrimSpace(orderType)) {
+	case "LO", "MTL":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldFallbackMTLAsLO(req OrderRequest, err error) bool {
+	if err == nil || strings.ToUpper(strings.TrimSpace(req.OrderType)) != "MTL" || req.Price <= 0 {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "stock_price_undefined") || strings.Contains(text, "cannot determine stock price")
 }
 
 func (s *OrderService) checkPositionLimit(ctx context.Context, req OrderRequest) error {

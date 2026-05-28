@@ -234,6 +234,9 @@ func (c *DNSEClient) PlaceOrder(ctx context.Context, req dnsemodel.PlaceOrderReq
 	}
 
 	var raw map[string]any
+	if !dnseOrderTypeUsesReferencePrice(req.OrderType) {
+		req.Price = 0
+	}
 	marketType := defaultString(req.MarketType, "STOCK")
 	orderCategory := defaultString(req.OrderCategory, "NORMAL")
 	path := fmt.Sprintf("/accounts/orders?marketType=%s&orderCategory=%s", url.QueryEscape(marketType), url.QueryEscape(orderCategory))
@@ -250,6 +253,15 @@ func (c *DNSEClient) PlaceOrder(ctx context.Context, req dnsemodel.PlaceOrderReq
 		Status:      defaultString(firstString(raw, "status", "orderStatus"), "ACCEPTED"),
 		RawResponse: string(rawBody),
 	}, nil
+}
+
+func dnseOrderTypeUsesReferencePrice(orderType string) bool {
+	switch strings.ToUpper(strings.TrimSpace(orderType)) {
+	case "LO", "MTL":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *DNSEClient) GetOrderStatus(ctx context.Context, accountNo, orderID, marketType, orderCategory string) (dnsemodel.OrderStatus, error) {

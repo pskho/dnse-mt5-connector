@@ -185,6 +185,12 @@ func main() {
 		}
 		return 0, false
 	})
+	orderService.SetOrderSymbolResolver(func(ctx context.Context, symbol, marketType string) (string, bool, error) {
+		if strings.ToUpper(strings.TrimSpace(marketType)) != "DERIVATIVE" {
+			return "", false, nil
+		}
+		return symbolCatalogService.ResolveMarketFeedSymbol(ctx, symbol)
+	})
 	handler := api.NewHandler(orderService, positionService, signalService, symbolCatalogService, marketDataEngine.Profiles(), marketDataEngine, dnseClient, historyService, otpService, appLog, telemetryClient)
 	marketDataEngine.Start(appCtx)
 

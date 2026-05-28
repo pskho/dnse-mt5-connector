@@ -425,6 +425,9 @@ func (h *Handler) fillOrderRealtimePrice(req *service.OrderRequest) {
 	if req == nil || req.Price > 0 {
 		return
 	}
+	if strings.ToUpper(strings.TrimSpace(req.OrderType)) != "LO" {
+		return
+	}
 	price, ok := h.latestOrderPrice(req.Symbol, req.Side)
 	if !ok {
 		return
@@ -437,6 +440,9 @@ func (h *Handler) fillOrderRealtimePrice(req *service.OrderRequest) {
 
 func (h *Handler) fillSignalRealtimePrice(req *service.SignalRequest) {
 	if req == nil || req.Price > 0 {
+		return
+	}
+	if strings.ToUpper(strings.TrimSpace(req.OrderType)) != "LO" {
 		return
 	}
 	price, ok := h.latestOrderPrice(req.Symbol, req.Side)
@@ -1162,7 +1168,7 @@ func orderErrorHint(err error, responses []service.OrderResponse) string {
 	case strings.Contains(text, "account_purchase_power_not_enough") || strings.Contains(text, "purchase power is not enough"):
 		return "Tai khoan trong nhom dat lenh khong du suc mua. Hay chon nhom Entrade Demo, giam khoi luong, hoac bo tai khoan that khoi nhom dang gan cho luong nay."
 	case strings.Contains(text, "stock_price_undefined") || strings.Contains(text, "cannot determine stock price"):
-		return "He thong chua xac dinh duoc gia dat lenh. Hay dung MTL khong gui gia, hoac cap nhat gia realtime truoc khi gui lenh."
+		return "He thong chua xac dinh duoc gia dat lenh. Hay cap nhat gia realtime truoc khi gui lenh, hoac dat LO voi gia cu the."
 	case strings.Contains(text, "account not found"):
 		return "Tai khoan chua dung voi moi truong dang ket noi. Hay lien ket lai tai khoan Entrade/DNSE hoac chon dung nhom Demo/That."
 	default:
