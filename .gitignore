@@ -10,3 +10,5 @@ bridge_out.txt
 config/config.yaml
 config/credentials.json
 config/token.json
+tmp_installer_test/
+tmp_package_test/
